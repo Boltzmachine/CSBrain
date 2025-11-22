@@ -1,5 +1,11 @@
 # [NeurIPS2025 Spotlight] CSBrain: Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding 🧠⚡
 
+This repository contain the official code and dataset for the paper:
+
+"CSBrain: Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding"
+
+We are actively building this repository. Stay tuned!
+
 ## Overview 🌟
 CSBrain is a cutting-edge **Cross-scale Spatiotemporal Brain Foundation Model** designed for EEG decoding. By incorporating innovative techniques like **Cross-scale Spatiotemporal Tokenization (CST)** and **Structured Sparse Attention (SSA)**, CSBrain captures multi-scale dependencies in EEG signals. This enables better generalization across a wide range of EEG decoding tasks.
 

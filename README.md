@@ -46,13 +46,11 @@ You can also download the pre-trained weights of CSBrain and the weights for dow
 ### References 📚
 If you find our paper/code useful, please consider citing our work:
 ```bash
-@inproceedings{
-zhou2025csbrain,
-title={CSBrain: A Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding},
-author={Yuchen Zhou and Jiamin Wu and Zichen Ren and Zhouheng Yao and Weiheng Lu and Kunyu Peng and Qihao Zheng and Chunfeng Song and Wanli Ouyang and Chao Gou},
-booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
-year={2025},
-url={https://openreview.net/forum?id=agcXjEHmyW}
+@article{zhou2025csbrain,
+  title={CSBrain: A Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding},
+  author={Zhou, Yuchen and Wu, Jiamin and Ren, Zichen and Yao, Zhouheng and Lu, Weiheng and Peng, Kunyu and Zheng, Qihao and Song, Chunfeng and Ouyang, Wanli and Gou, Chao},
+  journal={arXiv preprint arXiv:2506.23075},
+  year={2025}
 }
 ```
 

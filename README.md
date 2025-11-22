@@ -1,4 +1,4 @@
-# CSBrain: Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding 🧠⚡
+# [NeurIPS2025 Spotlight] CSBrain: Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding 🧠⚡
 
 ## Overview 🌟
 CSBrain is a cutting-edge **Cross-scale Spatiotemporal Brain Foundation Model** designed for EEG decoding. By incorporating innovative techniques like **Cross-scale Spatiotemporal Tokenization (CST)** and **Structured Sparse Attention (SSA)**, CSBrain captures multi-scale dependencies in EEG signals. This enables better generalization across a wide range of EEG decoding tasks.
@@ -35,16 +35,18 @@ We have provided fine-tuning scripts for 16 datasets used in this work in the `s
 ```bash
 bash sh/finetune_CSBrain_BCIC.sh
 ```
-
+You can also download the pre-trained weights of CSBrain and the weights for downstream tasks we provided from [Google Drive]([link](https://drive.google.com/drive/folders/1-GsVVewRM0B93H08yts5m53yU2whxYvj?usp=sharing)).
 
 ### References 📚
 If you find our paper/code useful, please consider citing our work:
 ```bash
-@article{zhou2025csbrain,
-  title={CSBrain: A Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding},
-  author={Zhou, Yuchen and Wu, Jiamin and Ren, Zichen and Yao, Zhouheng and Lu, Weiheng and Peng, Kunyu and Zheng, Qihao and Song, Chunfeng and Ouyang, Wanli and Gou, Chao},
-  journal={arXiv preprint arXiv:2506.23075},
-  year={2025}
+@inproceedings{
+zhou2025csbrain,
+title={CSBrain: A Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding},
+author={Yuchen Zhou and Jiamin Wu and Zichen Ren and Zhouheng Yao and Weiheng Lu and Kunyu Peng and Qihao Zheng and Chunfeng Song and Wanli Ouyang and Chao Gou},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+url={https://openreview.net/forum?id=agcXjEHmyW}
 }
 ```
 

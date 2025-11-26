@@ -41,7 +41,7 @@ We have provided fine-tuning scripts for 16 datasets used in this work in the `s
 ```bash
 bash sh/finetune_CSBrain_BCIC.sh
 ```
-You can also download the pre-trained weights of CSBrain and the weights for downstream tasks we provided from [Google Drive](https://drive.google.com/drive/folders/1-GsVVewRM0B93H08yts5m53yU2whxYvj?usp=sharing).
+You can also download the pre-trained weights of CSBrain and the weights for downstream tasks we provided from [Google Drive](https://drive.google.com/drive/folders/1-GsVVewRM0B93H08yts5m53yU2whxYvj?usp=sharing). The pre-trained weight of CSBrain is in the pth folder, and the weights on downstream datasets can be found in the pth_downtasks folder.
 
 ### References 📚
 If you find our paper/code useful, please consider citing our work:

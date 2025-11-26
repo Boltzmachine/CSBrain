@@ -1,6 +1,6 @@
 # [NeurIPS2025 Spotlight] CSBrain: Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding 🧠⚡
 
-This repository contain the official code and dataset for the paper:
+This repository contain the official code for the paper:
 
 "CSBrain: Cross-scale Spatiotemporal Brain Foundation Model for EEG Decoding"
 

@@ -41,7 +41,8 @@ class CSBrain(nn.Module):
         self.features_by_layer = []
         self.input_features = []
 
-    def forward(self, x, mask=None):
+    def forward(self, batch, mask=None):
+        x = batch['timeseries']
         x = x[:, self.sorted_indices, :, :]
 
         patch_emb = self.patch_embedding(x, mask)
@@ -54,7 +55,10 @@ class CSBrain(nn.Module):
 
         out = self.proj_out(patch_emb)
 
-        return out
+        return out, {}
+    
+    def training_step(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
 
 
 class PatchEmbedding(nn.Module):

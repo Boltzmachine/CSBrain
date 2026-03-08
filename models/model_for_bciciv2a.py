@@ -2,9 +2,11 @@ import torch
 import torch.nn as nn
 from functools import partial
 from .CSBrain import *
+from models import get_model
 
 class Model(nn.Module):
     def __init__(self, param):
+        self.param = param
         super(Model, self).__init__()
 
         # Brain region encoding: Frontal lobe (0) | Parietal lobe (1) | Temporal lobe (2) | Occipital lobe (3) | Central region (4)
@@ -66,15 +68,8 @@ class Model(nn.Module):
 
         print("Sorted Indices:", bci42a_sorted_indices)
 
-        if param.model == 'CSBrain':
-            self.backbone = CSBrain(
-                in_dim=200, out_dim=200, d_model=200,
-                dim_feedforward=800, seq_len=30,
-                n_layer=param.n_layer, nhead=8,
-                brain_regions=bci42a_brain_regions,
-                sorted_indices=bci42a_sorted_indices
-            )
-
+        self.backbone = get_model(param, bci42a_brain_regions, bci42a_sorted_indices)
+            
         if param.use_pretrained_weights:
             map_location = torch.device(f'cuda:{param.cuda}')
             state_dict = torch.load(param.foundation_dir, map_location=map_location)
@@ -89,7 +84,7 @@ class Model(nn.Module):
             matching_dict = {k: v for k, v in new_state_dict.items() if k in model_state_dict and v.size() == model_state_dict[k].size()}
 
             model_state_dict.update(matching_dict)
-            self.backbone.load_state_dict(model_state_dict)
+            self.backbone.load_state_dict(model_state_dict, strict=True)
 
         self.backbone.proj_out = nn.Identity()
         self.feed_forward = nn.Sequential(
@@ -101,10 +96,15 @@ class Model(nn.Module):
             nn.Dropout(param.dropout),
             nn.Linear(200, param.num_of_classes),
         )
-        
-    def forward(self, x):
+
+    def forward(self, batch):
+        x = batch.pop('x')
         bz, ch_num, seq_len, patch_size = x.shape
-        feats = self.backbone(x)
+
+        batch['timeseries'] = x
+        feats = self.backbone(batch)
+        if isinstance(feats, tuple):
+            feats = feats[0]
         feats = feats.contiguous().view(bz, ch_num*seq_len*patch_size)
         out = self.feed_forward(feats)
         return out

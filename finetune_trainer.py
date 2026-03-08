@@ -14,7 +14,19 @@ import umap
 from sklearn.decomposition import PCA
 import copy
 import os
+import wandb
 
+def to_device(x, device):
+    if isinstance(x, dict):
+        return {k: to_device(v, device) for k, v in x.items()}
+    elif isinstance(x, list):
+        return [to_device(v, device) for v in x]
+    elif isinstance(x, tuple):
+        return tuple(to_device(v, device) for v in x)
+    elif isinstance(x, torch.Tensor):
+        return x.to(device)
+    else:
+        return x
 
 class Trainer(object):
     def __init__(self, params, data_loader, model):
@@ -82,17 +94,19 @@ class Trainer(object):
             self.model.train()
             start_time = timer()
             losses = []
-            for x, y in tqdm(self.data_loader['train'], mininterval=10):
+            for batch in tqdm(self.data_loader['train'], mininterval=10):
                 self.optimizer.zero_grad()
-                x = x.cuda()
-                y = y.cuda()
-                pred = self.model(x)
+                batch = to_device(batch, "cuda")
+                x = batch['x']
+                y = batch['y']
+                pred = self.model(batch)
                 if self.params.downstream_dataset == 'ISRUC':
                     loss = self.criterion(pred.transpose(1, 2), y)
                 else:
                     loss = self.criterion(pred, y)
 
                 loss.backward()
+                wandb.log({"train/loss": loss.item()})
                 losses.append(loss.data.cpu().numpy())
                 if self.params.clip_value > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
@@ -122,6 +136,7 @@ class Trainer(object):
                     )
                 )
                 print(cm)
+                wandb.log({"val/acc": acc, "val/kappa": kappa, "val/f1": f1})
                 if acc > acc_best: # zhouyc
                     print("kappa increasing....saving weights !! ")
                     print("Val Evaluation: acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
@@ -169,6 +184,8 @@ class Trainer(object):
                 x = x.cuda()
                 y = y.cuda()
                 pred = self.model(x)
+                if isinstance(pred, tuple):
+                    pred = pred[0]
 
                 loss = self.criterion(pred, y)
 

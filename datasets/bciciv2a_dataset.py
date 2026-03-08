@@ -6,6 +6,7 @@ import os
 import random
 import lmdb
 import pickle
+from .cached_dataset import _to_spherical
 
 class CustomDataset(Dataset):
     def __init__(
@@ -31,12 +32,26 @@ class CustomDataset(Dataset):
         label = pair['label']
         if self.use_SmallerToken:
             data = data.reshape(22, 8, 100)
-        return data/100, label # data.shape (22,4,200)
+
+        ch_coords = _to_spherical(pair["ch_coords"])
+        ch_names = pair["ch_names"]
+        return {
+            'x': data/100,
+            'y': label,
+            'ch_coords': ch_coords,
+            'ch_names': ch_names,
+        }
 
     def collate(self, batch):
-        x_data = np.array([x[0] for x in batch])
-        y_label = np.array([x[1] for x in batch])
-        return to_tensor(x_data), to_tensor(y_label).long()
+        x_data = np.array([x['x'] for x in batch])
+        y_label = np.array([x['y'] for x in batch])
+        ch_coords = np.array([x['ch_coords'] for x in batch])
+        return {
+            'x': to_tensor(x_data),
+            'y': to_tensor(y_label).long(),
+            'ch_coords': to_tensor(ch_coords),
+        }
+
 
 class LoadDataset(object):
     def __init__(self, params):

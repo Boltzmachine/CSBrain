@@ -2,12 +2,13 @@ import torch
 import torch.nn as nn
 from functools import partial
 from .CSBrain import *
+from models import get_model
 
 
 class Model(nn.Module):
     def __init__(self, param):
         super(Model, self).__init__()
-
+        self.param = param
         selected_channels = [
             'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 
             'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6',
@@ -40,11 +41,12 @@ class Model(nn.Module):
             0: ['AF7', 'AF3', 'AFZ', 'AF4', 'AF8',
                 'FP1', 'FPZ', 'FP2',
                 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8',
-                'FT7', 'FT8',
                 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6'],
             4: ['C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6',
                 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6'],
-            2: ['T7', 'T8', 'T9', 'T10', 'TP7', 'TP8'],
+            2: ['T7', 'T8', 'T9', 'T10', 'TP7', 'TP8',
+                'FT7', 'FT8',
+                ],
             1: ['P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8'],
             3: ['PO7', 'PO3', 'POZ', 'PO4', 'PO8',
                 'O1', 'OZ', 'O2', 'IZ']
@@ -66,16 +68,7 @@ class Model(nn.Module):
 
         print("Sorted Indices:", sorted_indices)
 
-        if param.model == 'CSBrain':
-            self.backbone = CSBrain(
-                in_dim=200, out_dim=200, d_model=200,
-                dim_feedforward=800, seq_len=30,
-                n_layer=param.n_layer, nhead=8,
-                brain_regions=brain_regions,
-                sorted_indices=sorted_indices
-            )
-        else:
-            return 0
+        self.backbone = get_model(param, brain_regions, sorted_indices)
 
         if param.use_pretrained_weights:
             map_location = torch.device(f'cuda:{param.cuda}')
@@ -86,15 +79,16 @@ class Model(nn.Module):
             model_state_dict = self.backbone.state_dict()
 
             # Filter matching weights by shape
-            matching_dict = {k: v for k, v in new_state_dict.items() if k in model_state_dict and v.size() == model_state_dict[k].size()}
+            matching_dict = new_state_dict#{k: v for k, v in new_state_dict.items() if k in model_state_dict and v.size() == model_state_dict[k].size()}
 
             model_state_dict.update(matching_dict)
-            self.backbone.load_state_dict(model_state_dict)
+            self.backbone.load_state_dict(model_state_dict, strict=True)
 
         self.backbone.proj_out = nn.Identity()
 
+        num_chs = 16
         self.classifier = nn.Sequential(
-            nn.Linear(64 * 4 * 200, 4 * 200),
+            nn.Linear(num_chs * 4 * 200, 4 * 200),
             nn.ELU(),
             nn.Dropout(param.dropout),
             nn.Linear(4 * 200, 200),
@@ -103,9 +97,13 @@ class Model(nn.Module):
             nn.Linear(200, param.num_of_classes)
         )
 
-    def forward(self, x):
+    def forward(self, batch):
+        x = batch.pop('x')
         bz, ch_num, seq_len, patch_size = x.shape
-        feats = self.backbone(x)
-        out = feats.contiguous().view(bz, ch_num * seq_len * 200)
+        batch['timeseries'] = x
+        feats = self.backbone(batch)
+        if isinstance(feats, tuple):
+            feats = feats[0]
+        out = feats.contiguous().view(bz, -1)
         out = self.classifier(out)
         return out

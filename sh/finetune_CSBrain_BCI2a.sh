@@ -1,5 +1,14 @@
 #!/bin/bash
 
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --cpus-per-gpu=6
+#SBATCH --mem=32G
+#SBATCH --gres=gpu:a40:1
+#SBATCH --time=1-00:00:00
+#SBATCH --job-name=csbrain-finetune
+#SBATCH --output=outputs/slurms/%j.out
+#SBATCH --qos=qos_ying_rex
 # Get the script directory
 SCRIPT_DIR=$(dirname "$0")
 
@@ -17,13 +26,13 @@ LOG_FILE="${LOG_DIR}/${LOG_FILE_NAME}.log"
 echo "Job started at $(date)" | tee -a "$LOG_FILE"
 
 # Set CUDA device and run the Python fine-tuning script
-CUDA_VISIBLE_DEVICES=1 python finetune_main.py  \
+python finetune_main.py  \
     --downstream_dataset BCIC-IV-2a \
-    --datasets_dir <path_to_datasets> \
+    --datasets_dir data/preprocessed/BCICIV2a \
     --num_of_classes 4 \
-    --model_dir <path_to_model_dir>/finetune_CSBrain_BCI2a \
-    --foundation_dir <path_to_model_dir>/CSBrain.pth \
-    --model CSBrain \
+    --model_dir outputs/CSBrain/finetune_CSBrain_BCICIV2a \
+    --foundation_dir outputs/llm_vq/epoch21_loss0.03721848130226135.pth \
+    --model LLMVQ \
     --use_pretrained_weights \
     --dropout 0.3 \
     --weight_decay  0.01 \

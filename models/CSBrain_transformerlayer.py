@@ -78,34 +78,38 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
     def _inter_region_attention_static(self, x: torch.Tensor,
                                        attn_mask: Optional[torch.Tensor] = None,
                                        key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.region_attn_mask is None or self.region_indices_dict is None:
-            raise ValueError("no initialized region attention mask or region indices dictionary")
+        # if self.region_attn_mask is None or self.region_indices_dict is None:
+        #     raise ValueError("no initialized region attention mask or region indices dictionary")
 
         batch, chans, T, F = x.shape
 
         x_reshaped = x.permute(0, 2, 1, 3)
         x_flat = x_reshaped.reshape(batch * T, chans, F)
 
-        region_global_features = {}
-        for region_name, region_indices in self.region_indices_dict.items():
-            region_x = x[:, region_indices, :, :]
-            region_global = region_x.mean(dim=1, keepdim=True)
-            region_global_features[region_name] = region_global
+        if self.region_attn_mask is None or self.region_indices_dict is None:
+            x_enhanced = x_flat
+            region_attn_mask = None
+        else:
+            region_global_features = {}
+            for region_name, region_indices in self.region_indices_dict.items():
+                region_x = x[:, region_indices, :, :]
+                region_global = region_x.mean(dim=1, keepdim=True)
+                region_global_features[region_name] = region_global
 
-        global_features = torch.zeros_like(x_flat)
+            global_features = torch.zeros_like(x_flat)
 
-        for region_name, region_indices in self.region_indices_dict.items():
-            region_global = region_global_features[region_name]
-            region_global = region_global.permute(0, 2, 1, 3)
-            region_global = region_global.reshape(batch * T, 1, F)
+            for region_name, region_indices in self.region_indices_dict.items():
+                region_global = region_global_features[region_name]
+                region_global = region_global.permute(0, 2, 1, 3)
+                region_global = region_global.reshape(batch * T, 1, F)
 
-            for idx in region_indices:
-                global_features[:, idx:idx + 1, :] = region_global
+                for idx in region_indices:
+                    global_features[:, idx:idx + 1, :] = region_global
 
-        global_features = self.global_fc(global_features)
-        x_enhanced = x_flat + global_features
+            global_features = self.global_fc(global_features)
+            x_enhanced = x_flat + global_features
 
-        region_attn_mask = self.region_attn_mask.to(x.device)
+            region_attn_mask = self.region_attn_mask.to(x.device)
 
         attn_output = self.inter_region_attn(
             x_enhanced, x_enhanced, x_enhanced,

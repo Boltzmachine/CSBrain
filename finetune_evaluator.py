@@ -4,6 +4,17 @@ from sklearn.metrics import balanced_accuracy_score, f1_score, confusion_matrix,
     precision_recall_curve, auc, r2_score, mean_squared_error
 from tqdm import tqdm
 
+def to_device(x, device):
+    if isinstance(x, dict):
+        return {k: to_device(v, device) for k, v in x.items()}
+    elif isinstance(x, list):
+        return [to_device(v, device) for v in x]
+    elif isinstance(x, tuple):
+        return tuple(to_device(v, device) for v in x)
+    elif isinstance(x, torch.Tensor):
+        return x.to(device)
+    else:
+        return x
 
 class Evaluator:
     def __init__(self, params, data_loader):
@@ -15,11 +26,12 @@ class Evaluator:
 
         truths = []
         preds = []
-        for x, y in tqdm(self.data_loader, mininterval=1):
-            x = x.cuda()
-            y = y.cuda()
+        for batch in tqdm(self.data_loader, mininterval=1):
+            batch = to_device(batch, "cuda")
+            x = batch['x']
+            y = batch['y']
 
-            pred = model(x)
+            pred = model(batch)
             pred_y = torch.max(pred, dim=-1)[1]
 
             truths += y.cpu().squeeze().numpy().tolist()

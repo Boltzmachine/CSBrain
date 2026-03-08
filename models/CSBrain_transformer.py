@@ -136,20 +136,14 @@ class BrainEmbedEEGLayer(nn.Module):
 
         output = torch.zeros((batch, chans, T, self.dim_out), device=device)
 
-        for region_key, region_info in area_config.items():
-            if region_key not in self.region_blocks:
-                continue
-
-            channel_slice = region_info['slice']
-            n_electrodes = region_info['channels']
-
-            x_region = x[:, channel_slice, :, :]
-
+        if area_config is None:
+            n_electrodes = chans
+            x_region = x
             x_trans = x_region.permute(0, 2, 1, 3).reshape(-1, n_electrodes, F)
             x_trans = x_trans.permute(0, 2, 1).unsqueeze(-1)
 
             fmap_outputs = []
-            for conv, k in zip(self.region_blocks[region_key], [1, 3, 5]):
+            for conv, k in zip(self.region_blocks["region_0"], [1, 3, 5]):
                 pad_size = (k - 1) // 2
 
                 if n_electrodes == 1:
@@ -162,8 +156,34 @@ class BrainEmbedEEGLayer(nn.Module):
             fmap_cat = torch.cat(fmap_outputs, dim=1)
             fmap_out = fmap_cat.squeeze(-1).permute(0, 2, 1).reshape(batch, T, n_electrodes, self.dim_out)
             fmap_out = fmap_out.permute(0, 2, 1, 3)
+        else:
+            for region_key, region_info in area_config.items():
+                if region_key not in self.region_blocks:
+                    continue
 
-            output[:, channel_slice, :, :] = fmap_out
+                channel_slice = region_info['slice']
+                n_electrodes = region_info['channels']
+                x_region = x[:, channel_slice, :, :]
+
+                x_trans = x_region.permute(0, 2, 1, 3).reshape(-1, n_electrodes, F)
+                x_trans = x_trans.permute(0, 2, 1).unsqueeze(-1)
+
+                fmap_outputs = []
+                for conv, k in zip(self.region_blocks[region_key], [1, 3, 5]):
+                    pad_size = (k - 1) // 2
+
+                    if n_electrodes == 1:
+                        x_padded = Fun.pad(x_trans, (0, 0, pad_size, pad_size), mode='constant', value=0)
+                    else:
+                        x_padded = Fun.pad(x_trans, (0, 0, pad_size, pad_size), mode='circular')
+
+                    fmap_outputs.append(conv(x_padded))
+
+                fmap_cat = torch.cat(fmap_outputs, dim=1)
+                fmap_out = fmap_cat.squeeze(-1).permute(0, 2, 1).reshape(batch, T, n_electrodes, self.dim_out)
+                fmap_out = fmap_out.permute(0, 2, 1, 3)
+
+                output[:, channel_slice, :, :] = fmap_out
 
         return output
 

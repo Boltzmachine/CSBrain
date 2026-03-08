@@ -6,6 +6,7 @@ import os
 import random
 import lmdb
 import pickle
+from .cached_dataset import _to_spherical
 
 class CustomDataset(Dataset):
     def __init__(
@@ -27,15 +28,28 @@ class CustomDataset(Dataset):
             pair = pickle.loads(txn.get(key.encode()))
         data = pair['sample']
         label = pair['label']
+
+        ch_coords = _to_spherical(pair["ch_coords"])
+        ch_names = pair["ch_names"]
         # print(key)
         # print(data)
         # print(label)
-        return data/100, label
+        return {
+            'x': data/100,
+            'y': label,
+            'ch_coords': ch_coords,
+            'ch_names': ch_names,
+        }
 
     def collate(self, batch):
-        x_data = np.array([x[0] for x in batch])
-        y_label = np.array([x[1] for x in batch])
-        return to_tensor(x_data), to_tensor(y_label).long()
+        x_data = np.array([x['x'] for x in batch])
+        y_label = np.array([x['y'] for x in batch])
+        ch_coords = np.array([x['ch_coords'] for x in batch])
+        return {
+            'x': to_tensor(x_data),
+            'y': to_tensor(y_label).long(),
+            'ch_coords': to_tensor(ch_coords),
+        }
 
 
 class LoadDataset(object):
@@ -54,18 +68,21 @@ class LoadDataset(object):
                 train_set,
                 batch_size=self.params.batch_size,
                 collate_fn=train_set.collate,
+                num_workers=4,
                 shuffle=True,
             ),
             'val': DataLoader(
                 val_set,
                 batch_size=self.params.batch_size,
                 collate_fn=val_set.collate,
+                num_workers=4,
                 shuffle=False,
             ),
             'test': DataLoader(
                 test_set,
                 batch_size=self.params.batch_size,
                 collate_fn=test_set.collate,
+                num_workers=4,
                 shuffle=False,
             ),
         }

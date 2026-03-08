@@ -4,6 +4,20 @@ from torch.nn import MSELoss
 from tqdm import tqdm
 from utils.util import generate_mask
 import os
+import wandb
+import time
+
+def to_device(x, device):
+    if isinstance(x, dict):
+        return {k: to_device(v, device) for k, v in x.items()}
+    elif isinstance(x, list):
+        return [to_device(v, device) for v in x]
+    elif isinstance(x, tuple):
+        return tuple(to_device(v, device) for v in x)
+    elif isinstance(x, torch.Tensor):
+        return x.to(device)
+    else:
+        return x
 
 class Trainer(object):
     def __init__(self, params, data_loader, model):
@@ -52,29 +66,77 @@ class Trainer(object):
             losses = []
             for x in tqdm(self.data_loader, mininterval=10):
                 self.optimizer.zero_grad()
-                x = x.to(self.device) / 100
-                if self.params.need_mask:
-                    bz, ch_num, patch_num, patch_size = x.shape
-                    mask = generate_mask(
-                        bz, ch_num, patch_num, mask_ratio=self.params.mask_ratio, device=self.device,
-                    )
-                    y = self.model(x, mask=mask)
-                    masked_x = x[mask == 1]
-                    masked_y = y[mask == 1]
-                    loss = self.criterion(masked_y, masked_x)
+                if True:#self.params.model != 'CSBrain':
+                    if isinstance(x, dict):
+                        batch = x
+                        batch = to_device(batch, self.device)
+                        x = batch['timeseries']
+                        x = x / 100
+                        batch['timeseries'] = x
+                    else:
+                        batch = {'timeseries': x.to(self.device) / 100}
+                    if self.params.need_mask:
+                        bz, ch_num, patch_num, patch_size = x.shape
+                        mask = generate_mask(
+                            bz, ch_num, patch_num, mask_ratio=self.params.mask_ratio, device=self.device,
+                        )
+                        out = self.model.training_step(batch, mask=mask)
+
+                        loss_dict = {}
+                        logs = {}
+                        if isinstance(out, tuple):
+                            y, info = out
+                            for key, value in info.items():
+                                if 'loss' in key:
+                                    coef, lss = value
+                                    loss_dict[key] = coef * lss
+                                    logs[key] = lss.data.cpu().numpy()
+                                elif 'acc' in key:
+                                    logs[key] = value.data.cpu().numpy()
+
+                        masked_x = x[mask == 1]
+                        masked_y = y[mask == 1]
+                        mask_loss = self.criterion(masked_y, masked_x)
+                        # recon_loss = self.criterion(y, x)
+                        loss = mask_loss + sum(loss_dict.values())
+                        logs["mask_loss"] = mask_loss.data.cpu().numpy()
+                    else:
+                        raise NotImplementedError("Currently only support masked training for dict input")
                 else:
-                    y = self.model(x)
-                    loss = self.criterion(y, x)
+                    if isinstance(x, dict):
+                        x = x['timeseries']
+                    x = x.to(self.device) / 100
+                    if self.params.need_mask:
+                        bz, ch_num, patch_num, patch_size = x.shape
+                        mask = generate_mask(
+                            bz, ch_num, patch_num, mask_ratio=self.params.mask_ratio, device=self.device,
+                        )
+                        y = self.model(x, mask=mask)
+                        masked_x = x[mask == 1]
+                        masked_y = y[mask == 1]
+                        loss = self.criterion(masked_y, masked_x)
+                    else:
+                        y = self.model(x)
+                        loss = self.criterion(y, x)
+                    logs = {
+                        "mask_loss": loss.data.cpu().numpy(),
+                    }
                 loss.backward()
                 if self.params.clip_value > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
                 self.optimizer.step()
                 self.optimizer_scheduler.step()
                 losses.append(loss.data.cpu().numpy())
+                wandb.log({
+                    **logs,
+                    "epoch": epoch + 1,
+                    "lr": self.optimizer_scheduler.get_last_lr()[0]
+                })
             mean_loss = np.mean(losses)
             learning_rate = self.optimizer.state_dict()['param_groups'][0]['lr']
             print(f'Epoch {epoch+1}: Training Loss: {mean_loss:.6f}, Learning Rate: {learning_rate:.6f}')
             if mean_loss < best_loss:
+                # if self.params.model != 'OurModel' or (self.params.model == 'OurModel' and epoch % 10 == 0):
                 model_path = rf'{self.params.model_dir}/epoch{epoch+1}_loss{mean_loss}.pth'
                 os.makedirs(os.path.dirname(model_path), exist_ok=True)
                 torch.save(self.model.state_dict(), model_path)

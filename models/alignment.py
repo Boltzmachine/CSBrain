@@ -12,7 +12,7 @@ from transformers import Dinov2Model
 
 
 class CNNSemanticReadout(nn.Module):
-    def __init__(self, n_ch: int, out_dim: int, seq_len: int = 240, hidden_dim: int = 256, dropout: float = 0.1):
+    def __init__(self, n_ch: int, out_dim: int, seq_len: int = 200, hidden_dim: int = 256, dropout: float = 0.1):
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
@@ -61,13 +61,6 @@ class CNNSemanticReadout(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, n_ch, seq_len)
-        if x.dim() != 3:
-            raise ValueError(f"Expected input shape (B, n_ch, seq_len), got {tuple(x.shape)}")
-
-        if x.size(-1) != self.seq_len:
-            raise ValueError(f"Expected seq_len={self.seq_len}, got {x.size(-1)}")
-
         h = self.input_proj(x)              # (B, hidden_dim, seq_len)
         h = h + self.pos_embed              # 加绝对位置编码
 
@@ -83,8 +76,8 @@ class MLPSemanticReadout(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(32 * 240, 1024),
             nn.GELU(),
-            nn.Linear(1024, 1024),
-            nn.GELU(),
+            # nn.Linear(1024, 1024),
+            # nn.GELU(),
             nn.Linear(1024, out_dim),
         )
 
@@ -104,6 +97,156 @@ class MLPSemanticReadout(nn.Module):
 
 
 class CSBrainAlign(nn.Module):
+    def __init__(self, in_dim=200, out_dim=200, d_model=200, dim_feedforward=800, seq_len=30, n_layer=12,
+                 nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[]):
+        super().__init__()
+        self.patch_embedding = PatchEmbedding(in_dim, out_dim, d_model, seq_len)
+
+        self.TemEmbed_kernel_sizes = TemEmbed_kernel_sizes
+        kernel_sizes = self.TemEmbed_kernel_sizes
+        self.TemEmbedEEGLayer = TemEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim, kernel_sizes=kernel_sizes, stride=1)
+
+        self.brain_regions = brain_regions
+        self.area_config = None #generate_area_config(sorted(brain_regions))
+        self.BrainEmbedEEGLayer = BrainEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim)
+        self.sorted_indices = sorted_indices
+
+        self.pretrained_image_encoder = Dinov2Model.from_pretrained("facebook/dinov2-base").eval()
+        encoder_layer = CSBrain_TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, area_config=self.area_config, sorted_indices=self.sorted_indices, batch_first=True,
+            activation=F.gelu
+        )
+        self.encoder = CSBrain_TransformerEncoder(encoder_layer, num_layers=n_layer, enable_nested_tensor=False)
+
+        self.proj_out = nn.Sequential(
+            nn.Linear(d_model, out_dim),
+        )
+        self.apply(_weights_init)
+
+        self.features_by_layer = []
+        self.input_features = []
+
+        self.num_visual_levels = 10
+        max_freq_bins = seq_len * in_dim // 2 + 1
+        self.freq_mask_logits = nn.Parameter(torch.zeros(self.num_visual_levels, max_freq_bins))
+
+        hidden_ch_dim = 64
+        semantic_arch = 'mlp'
+        self.event_window_len = 240
+
+        if semantic_arch == 'mlp':
+            self.semantic_readout = MLPSemanticReadout(n_ch=32, out_dim=d_model, hidden_dim=hidden_ch_dim)
+        elif semantic_arch == 'cnn':
+            self.semantic_readout = CNNSemanticReadout(n_ch=32, out_dim=d_model, hidden_dim=hidden_ch_dim, seq_len=self.event_window_len)
+
+        self.contrastive_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 768),
+        )
+
+        self.apply(_weights_init)
+
+        self.features_by_layer = []
+        self.input_features = []
+
+    def _spectral_branches(self, patch_emb, image_hidden_states):
+        time_emb = patch_emb.view(patch_emb.size(0), patch_emb.size(1), -1)
+        spectral = torch.fft.rfft(time_emb, dim=-1, norm='forward')
+
+        masks = torch.sigmoid(self.freq_mask_logits[: image_hidden_states.size(-2), :]) # (num_visual_levels, n_freq_bins)
+        branch_spectral = spectral.unsqueeze(0) * masks.unsqueeze(1).unsqueeze(1) # (n_branch, B, n_ch, n_freq_bins)
+        branch_time = torch.fft.irfft(branch_spectral, norm='forward') # (n_branch, B, n_ch, seq_len)
+
+        branch_embeds = []
+        for i_branch in range(branch_time.size(0)):
+            branch_embed = branch_time[i_branch].view(*patch_emb.size())
+            for layer_idx in range(self.encoder_alignment.num_layers):
+                branch_embed = self.TemEmbedEEGLayer(branch_embed) + branch_embed
+                branch_embed = self.BrainEmbedEEGLayer(branch_embed, self.area_config) + branch_embed
+                branch_embed = self.encoder_alignment.layers[layer_idx](branch_embed, self.area_config)
+            branch_embeds.append(branch_embed)
+        branch_embeds = torch.stack(branch_embeds, dim=1)
+
+        return branch_embeds
+    
+    @torch.inference_mode()
+    def get_image_hidden_states(self, **image_encoder_inputs):
+        outputs = self.pretrained_image_encoder(**image_encoder_inputs, output_hidden_states=True)
+        hidden_states = outputs.hidden_states
+        selected_hidden_states = []
+        # for layer_idx in [1, 6, 12]:
+        for layer_idx in [12]:
+            selected_hidden_states.append(hidden_states[layer_idx][:, 0])
+        selected_hidden_states = torch.stack(selected_hidden_states, dim=1) # (B, n_branch, d_model)
+        return selected_hidden_states
+
+
+    def forward(self, batch, mask=None):
+        x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
+
+        # x = x[:, self.sorted_indices, :, :]
+        patch_emb = self.patch_embedding(x, mask)
+
+        contrastive_loss = dict()
+
+        for layer_idx in range(self.encoder.num_layers):
+            patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
+            patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
+
+            patch_emb = self.encoder.layers[layer_idx](patch_emb, self.area_config)
+
+            if layer_idx == self.encoder.num_layers - 3:
+                branch_embs = patch_emb
+                i_branch = 0
+
+                if 'image_encoder_inputs' in batch:
+                    # pred_flatten = self.contrastive_proj(self.semantic_readout(x.view(branch_embs.size(0), branch_embs.size(1), -1))) # (B, n_events, d_model) <- work
+                    semantic_emb = self.semantic_readout(patch_emb.view(branch_embs.size(0), branch_embs.size(1), -1))
+                    pred_flatten = self.contrastive_proj(semantic_emb) # (B, n_events, d_model) <- does not work
+
+                    image_hidden_states = self.get_image_hidden_states(**batch['image_encoder_inputs']) # (B, n_events, n_branch, d_model)
+                    image_hidden_states_branch = image_hidden_states[:, i_branch] # (B, n_events, d_model)
+                    image_flatten = image_hidden_states_branch.reshape(-1, image_hidden_states_branch.size(-1))
+
+                    # contrastive learning
+                    temperature = 0.07
+                    pred_norm = F.normalize(pred_flatten, dim=-1)
+                    image_norm = F.normalize(image_flatten, dim=-1)
+
+                    # Pairwise similarity: positives are on the diagonal
+                    logits = torch.matmul(pred_norm, image_norm.t()) / temperature
+                    targets = torch.arange(logits.size(0), device=logits.device)
+
+                    # Symmetric InfoNCE
+                    loss_p2i = F.cross_entropy(logits, targets)
+                    loss_i2p = F.cross_entropy(logits.t(), targets)
+                    branch_loss = 0.5 * (loss_p2i + loss_i2p)
+
+                    contrastive_loss[f"contrastive_loss_{i_branch}"] = (1.0, branch_loss)
+                    with torch.no_grad():
+                        pred_to_img = logits.argmax(dim=1)
+                        img_to_pred = logits.argmax(dim=0)
+
+                        acc_p2i = (pred_to_img == targets).float().mean()
+                        acc_i2p = (img_to_pred == targets).float().mean()
+                        acc = 0.5 * (acc_p2i + acc_i2p)
+
+                    contrastive_loss[f"contrastive_acc_{i_branch}"] = acc
+
+        out = self.proj_out(patch_emb)
+
+        return out, {
+            "rep": branch_embs,
+            **contrastive_loss,
+        }
+    
+    def training_step(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+
+
+class CSBrainAlignDeprecated(nn.Module):
     def __init__(self, in_dim=200, out_dim=200, d_model=200, dim_feedforward=800, seq_len=30, n_layer=12,
                  nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[]):
         super().__init__()
@@ -146,11 +289,12 @@ class CSBrainAlign(nn.Module):
 
         hidden_ch_dim = 64
         semantic_arch = 'cnn'
+        self.event_window_len = 240
 
         if semantic_arch == 'mlp':
             self.semantic_readout = MLPSemanticReadout(n_ch=32, out_dim=d_model, hidden_dim=hidden_ch_dim)
         elif semantic_arch == 'cnn':
-            self.semantic_readout = CNNSemanticReadout(n_ch=32, out_dim=d_model, hidden_dim=hidden_ch_dim)
+            self.semantic_readout = CNNSemanticReadout(n_ch=32, out_dim=d_model, hidden_dim=hidden_ch_dim, seq_len=self.event_window_len)
 
         self.contrastive_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -204,7 +348,8 @@ class CSBrainAlign(nn.Module):
     def forward(self, batch, mask=None):
         x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
         # x = x[:, self.sorted_indices, :, :]
-        patch_emb = self.patch_embedding(x, mask)
+        # patch_emb = self.patch_embedding(x, mask)
+        patch_emb = x
 
         for layer_idx in range(self.encoder.num_layers):
             patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
@@ -220,14 +365,14 @@ class CSBrainAlign(nn.Module):
             T = patch_emb.size(-2) * patch_emb.size(-1)  # use x.shape[2] * x.shape[3] if events are in raw-sample indices
 
             start = events - 40
-            branch_embs = self._spectral_branches(patch_emb, image_hidden_states) #(B, n_branch, n_ch, seq_len, d_model)
+            branch_embs = patch_emb.unsqueeze(1).expand(-1, 3, -1, -1, -1) #self._spectral_branches(patch_emb, image_hidden_states) #(B, n_branch, n_ch, seq_len, d_model)
             branch_time = branch_embs.view(branch_embs.size(0), branch_embs.size(1), branch_embs.size(2), -1) # (B, n_branch, n_ch, seq_len * d_model)
-            window_len = 240
+            window_len = self.event_window_len # number of raw samples in each event window
 
             B, n_branch, n_ch, total_len = branch_time.shape
             n_events = events.size(1)
 
-            starts = start.long()  # (B, n_events)
+            starts = (torch.round(start.float() / x.size(-1)) * x.size(-1)).long()  # (B, n_events), rounded to nearest multiple of 200
             offsets = torch.arange(window_len, device=branch_time.device).view(1, 1, -1)
             idx = starts.unsqueeze(-1) + offsets  # (B, n_events, window_len)
 
@@ -307,16 +452,16 @@ class PatchEmbedding(nn.Module):
         self.mask_encoding = nn.Parameter(torch.zeros(in_dim), requires_grad=False)
 
         self.proj_in = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=25, kernel_size=(1, 49), stride=(1, 25), padding=(0, 24)),
-            nn.GroupNorm(5, 25),
+            nn.Conv2d(in_channels=1, out_channels=20, kernel_size=(1, 20), stride=(1, 1), padding=(0, 0)),
+            nn.GroupNorm(5, 20),
             nn.GELU(),
 
-            nn.Conv2d(in_channels=25, out_channels=25, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1)),
-            nn.GroupNorm(5, 25),
+            nn.Conv2d(in_channels=20, out_channels=20, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
+            nn.GroupNorm(5, 20),
             nn.GELU(),
 
-            nn.Conv2d(in_channels=25, out_channels=25, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1)),
-            nn.GroupNorm(5, 25),
+            nn.Conv2d(in_channels=20, out_channels=20, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
+            nn.GroupNorm(5, 20),
             nn.GELU(),
         )
         self.spectral_proj = nn.Sequential(

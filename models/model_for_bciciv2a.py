@@ -81,20 +81,22 @@ class Model(nn.Module):
             model_state_dict = self.backbone.state_dict()
 
             # Filter matching weights by shape
-            matching_dict = {k: v for k, v in new_state_dict.items() if k in model_state_dict and v.size() == model_state_dict[k].size()}
+            # matching_dict = {k: v for k, v in new_state_dict.items() if k in model_state_dict and v.size() == model_state_dict[k].size()}
 
-            model_state_dict.update(matching_dict)
+            model_state_dict.update(state_dict)
             self.backbone.load_state_dict(model_state_dict, strict=True)
 
         self.backbone.proj_out = nn.Identity()
+
+        num_chs = 16
         self.feed_forward = nn.Sequential(
-            nn.Linear(22*4*200, 4*200),
+            nn.Linear(num_chs*200, 128),
             nn.ELU(),
             nn.Dropout(param.dropout),
-            nn.Linear(4*200, 200),
+            nn.Linear(128, 128),
             nn.ELU(),
             nn.Dropout(param.dropout),
-            nn.Linear(200, param.num_of_classes),
+            nn.Linear(128, param.num_of_classes),
         )
 
     def forward(self, batch):
@@ -105,6 +107,6 @@ class Model(nn.Module):
         feats = self.backbone(batch)
         if isinstance(feats, tuple):
             feats = feats[0]
-        feats = feats.contiguous().view(bz, ch_num*seq_len*patch_size)
+        feats = feats[:, :, 0].contiguous().view(bz, -1)
         out = self.feed_forward(feats)
         return out

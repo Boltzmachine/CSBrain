@@ -55,7 +55,7 @@ class CSBrain(nn.Module):
 
         out = self.proj_out(patch_emb)
 
-        return out, {}
+        return out, { "rep": out }
     
     def training_step(self, *args, **kwargs):
         return self.forward(*args, **kwargs)

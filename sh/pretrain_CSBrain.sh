@@ -17,7 +17,8 @@
 #     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
 #     --model_dir outputs/ \
 #     --dataset_dir mix \
-#     --run_name CSBrain2
+#     --n_layer 24 \
+#     --run_name CSBrain-deep
 
 # python pretrain_main.py \
 #     --model OurModel \
@@ -31,7 +32,14 @@ python pretrain_main.py \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --model_dir outputs/ \
     --dataset_dir mix \
-    --run_name align
+    --batch_size 128 \
+    --n_layer 24 \
+    --in_dim 40 \
+    --out_dim 40 \
+    --d_model 40 \
+    --seq_len 300 \
+    --nhead 4 \
+    --run_name Align-alljoined-tueg
 
 # python pretrain_main.py \
 #     --model LLMVQ \

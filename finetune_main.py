@@ -3,6 +3,7 @@ import random
 
 import numpy as np
 import torch
+import os
 
 from datasets import faced_dataset, seedv_dataset, physio_dataset, shu_dataset, isruc_dataset, chb_dataset, \
     speech_dataset, mumtaz_dataset, seedvig_dataset, stress_dataset, tuev_dataset, tuab_dataset, bciciv2a_dataset, tusl_dataset
@@ -62,8 +63,11 @@ def main():
     parser.add_argument('--use_IntraBraEmbed', action='store_true', default=False, help='use_IntraBraEmbed')
     parser.add_argument('--use_finetune_weights', type=bool,default=False, help='use_finetune_weights')
 
+        
 
     params = parser.parse_args()
+    if os.environ.get("DEBUG", "0") == "1":
+        params.batch_size = 2
     print(params)
 
     setup_seed(params.seed)

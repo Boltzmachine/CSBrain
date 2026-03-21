@@ -55,11 +55,14 @@ def main():
     setup_seed(params.seed)
     params.model_dir = os.path.join(params.model_dir, params.run_name)
 
+    if os.environ.get('DEBUG', '0') == '1':
+        params.batch_size = 4
+
     if params.dataset_dir == 'mix':
         from datasets.cached_dataset import get_webdataset, collate_cached
         from torch.utils.data import ConcatDataset
         dataset_names = [
-            # 'tueg/*.tar',
+            'tueg/*.tar',
             # 'siena_scalp/*.tar',
             # 'physionet_2018/*.tar',
             # 'raw_eeg/*.tar',
@@ -73,10 +76,14 @@ def main():
             # 'ds006480/*.tar', 
             # 'ds006525/*.tar', 
             # 'ds006547/*.tar',
-            "Alljoined-1.6M/*.tar"
+            "Alljoined-1.6M/*.tar",
+            # "things_eeg2/*.tar",
         ]
         n_samples_per_epoch = 1109545
-        pretrained_dataset = get_webdataset(dataset_names) #resampled=True
+        pretrained_dataset = get_webdataset(
+            dataset_names,
+            params
+        ) #resampled=True
 
         n_batches_per_epoch = (n_samples_per_epoch + params.batch_size - 1) // params.batch_size
         num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
@@ -153,6 +160,7 @@ def main():
     model = get_model(params, brain_regions, sorted_indices)
   
     wandb.init(project="EEG", name=params.run_name, config=vars(params))
+    wandb.watch(model, log="all", log_freq=500)
     trainer = Trainer(params, data_loader, model)
     trainer.train()
 

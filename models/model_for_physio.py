@@ -86,9 +86,8 @@ class Model(nn.Module):
 
         self.backbone.proj_out = nn.Identity()
 
-        num_chs = 16
         self.classifier = nn.Sequential(
-            nn.Linear(num_chs * 4 * 200, 4 * 200),
+            nn.LazyLinear(4 * 200),
             nn.ELU(),
             nn.Dropout(param.dropout),
             nn.Linear(4 * 200, 200),
@@ -99,11 +98,14 @@ class Model(nn.Module):
 
     def forward(self, batch):
         x = batch.pop('x')
+        x = x.reshape(x.size(0), x.size(1), -1, self.param.in_dim)
         bz, ch_num, seq_len, patch_size = x.shape
         batch['timeseries'] = x
         feats = self.backbone(batch)
         if isinstance(feats, tuple):
-            feats = feats[0]
+            feats = feats[1]["rep"]
+        else:
+            raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
         out = feats.contiguous().view(bz, -1)
         out = self.classifier(out)
         return out

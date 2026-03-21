@@ -6,6 +6,7 @@ from utils.util import generate_mask
 import os
 import wandb
 import time
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 def to_device(x, device):
     if isinstance(x, dict):
@@ -57,7 +58,7 @@ class Trainer(object):
                 self.optimizer, base_lr=1e-6, max_lr=0.001, step_size_up=self.data_length*5,
                 step_size_down=self.data_length*2, mode='exp_range', gamma=0.9, cycle_momentum=False
             )
-        
+
         print(self.model)
 
     def train(self):
@@ -99,6 +100,7 @@ class Trainer(object):
                         mask_loss = self.criterion(masked_y, masked_x)
                         # recon_loss = self.criterion(y, x)
                         loss = mask_loss + sum(loss_dict.values())
+                        # loss = sum(loss_dict.values())
                         logs["mask_loss"] = mask_loss.data.cpu().numpy()
                     else:
                         raise NotImplementedError("Currently only support masked training for dict input")

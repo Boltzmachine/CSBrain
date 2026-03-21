@@ -175,9 +175,10 @@ if __name__ == "__main__":
 
     shard_pattern = "data/cache/tueg/tueg-%06d.tar"
     max_samples_per_shard = 1000
+    maxsize = 500 * 1024 * 1024  # 500 MB
     seen_keys = set()
 
-    with wds.ShardWriter(shard_pattern, maxcount=max_samples_per_shard) as sink:
+    with wds.ShardWriter(shard_pattern, maxcount=max_samples_per_shard, maxsize=maxsize) as sink:
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             next_idx = 0
             in_flight = set()

@@ -43,6 +43,15 @@ def get_model(params, brain_regions, sorted_indices):
             brain_regions=None,
             # sorted_indices
         )
+    elif params.model == 'CNN':
+        from .cnn import CSBrainCNN
+        model = CSBrainCNN(
+            params.in_dim, params.out_dim, params.d_model, params.dim_feedforward, params.seq_len, params.n_layer,
+            params.nhead,
+            eval(params.TemEmbed_kernel_sizes),
+            brain_regions=None,
+            # sorted_indices
+        )
     else:
         raise ValueError(f"Unknown model type: {params.model}")
     

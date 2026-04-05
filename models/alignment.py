@@ -301,14 +301,17 @@ class CSBrainAlign(nn.Module):
         if self.add_global:
             patch_emb = torch.cat([self.global_channel.expand(patch_emb.size(0), -1, patch_emb.size(2), -1), patch_emb], dim=1)
             patch_emb = torch.cat([self.global_token.expand(patch_emb.size(0), patch_emb.size(1), -1, -1), patch_emb], dim=2)
+            if 'valid_channel_mask' in batch:
+                batch['valid_channel_mask'] = torch.cat([torch.ones_like(batch['valid_channel_mask'][:, :1], dtype=torch.bool), batch['valid_channel_mask']], dim=1)
+            if 'valid_length_mask' in batch:
+                batch['valid_length_mask'] = torch.cat([torch.ones_like(batch['valid_length_mask'][:, :1], dtype=torch.bool), batch['valid_length_mask']], dim=1)
 
         contrastive_loss = dict()
 
         for layer_idx in range(self.encoder.num_layers):
             patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
-            patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
-
-            patch_emb = self.encoder.layers[layer_idx](patch_emb, self.area_config)
+            # patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
+            patch_emb = self.encoder.layers[layer_idx](patch_emb, self.area_config, inter_window_attn_mask=~batch['valid_length_mask'] if 'valid_length_mask' in batch else None, inter_region_attn_mask=~batch['valid_channel_mask'] if 'valid_channel_mask' in batch else None)
 
             if layer_idx == self.encoder.num_layers - 3:
                 i_branch = 0
@@ -354,8 +357,14 @@ class CSBrainAlign(nn.Module):
 
                     contrastive_loss[f"contrastive_acc_{i_branch}"] = acc.mean()
                     contrastive_loss_per_source = defaultdict(list)
-                    for i, src in enumerate(batch['source']):
+
+                    sources = batch['source']
+                    if has_image is not None:
+                        mask_list = has_image.detach().cpu().tolist()
+                        sources = [s for s, m in zip(sources, mask_list) if m]
+                    for i, src in enumerate(sources):
                         contrastive_loss_per_source[src].append(acc[i])
+
                     for src, acc_list in contrastive_loss_per_source.items():
                         contrastive_loss[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
 
@@ -401,16 +410,16 @@ class PatchEmbedding(nn.Module):
         self.mask_encoding = nn.Parameter(torch.zeros(in_dim), requires_grad=False)
 
         self.proj_in = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=20, kernel_size=(1, 20), stride=(1, 1), padding=(0, 0)),
-            nn.GroupNorm(5, 20),
+            nn.Conv2d(in_channels=1, out_channels=d_model, kernel_size=(1, d_model), stride=(1, 1), padding=(0, 0)),
+            nn.GroupNorm(5, d_model),
             nn.GELU(),
 
-            nn.Conv2d(in_channels=20, out_channels=20, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
-            nn.GroupNorm(5, 20),
+            nn.Conv2d(in_channels=d_model, out_channels=d_model, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
+            nn.GroupNorm(5, d_model),
             nn.GELU(),
 
-            nn.Conv2d(in_channels=20, out_channels=20, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
-            nn.GroupNorm(5, 20),
+            nn.Conv2d(in_channels=d_model, out_channels=d_model, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
+            nn.GroupNorm(5, d_model),
             nn.GELU(),
         )
         self.spectral_proj = nn.Sequential(

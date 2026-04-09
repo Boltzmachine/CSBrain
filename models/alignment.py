@@ -262,7 +262,7 @@ class CSBrainAlign(nn.Module):
             branch_embed = branch_time[i_branch].view(*patch_emb.size())
             for layer_idx in range(self.encoder_alignment.num_layers):
                 branch_embed = self.TemEmbedEEGLayer(branch_embed) + branch_embed
-                branch_embed = self.BrainEmbedEEGLayer(branch_embed, self.area_config) + branch_embed
+                # branch_embed = self.BrainEmbedEEGLayer(branch_embed, self.area_config) + branch_embed
                 branch_embed = self.encoder_alignment.layers[layer_idx](branch_embed, self.area_config)
             branch_embeds.append(branch_embed)
         branch_embeds = torch.stack(branch_embeds, dim=1)
@@ -283,6 +283,12 @@ class CSBrainAlign(nn.Module):
 
     def forward(self, batch, mask=None):
         x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
+        timeseries = x.view(x.size(0), x.size(1), -1)
+        spectral = torch.fft.rfft(timeseries, dim=-1, norm='forward')
+        masks = torch.sigmoid(self.freq_mask_logits[:1, :spectral.size(-1)]) # (num_visual_levels, n_freq_bins)
+        branch_spectral = spectral * masks.unsqueeze(0) # (n_branch, B, n_ch, n_freq_bins)
+        branch_time = torch.fft.irfft(branch_spectral, norm='forward') # (n_branch, B, n_ch, seq_len)
+        x = branch_time.view_as(x)
 
         # x = x[:, self.sorted_indices, :, :]
         patch_emb = self.patch_embedding(x, mask)

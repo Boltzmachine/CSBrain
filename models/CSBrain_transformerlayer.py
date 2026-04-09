@@ -62,15 +62,16 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
         src: torch.Tensor,
         area_config: Optional[dict] = None,
         src_mask: Optional[torch.Tensor] = None,
-        src_key_padding_mask: Optional[torch.Tensor] = None
+        inter_window_attn_mask: Optional[torch.Tensor] = None,
+        inter_region_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = src
-        x = x + self._inter_window_attention(self.norm1(x), src_mask, src_key_padding_mask)
-
+        x = x + self._inter_window_attention(self.norm1(x), src_mask, inter_window_attn_mask)
         if self.region_attn_mask is None and area_config is not None:
-            x = x + self._inter_region_attention_dynamic(self.norm2(x), area_config, src_mask, src_key_padding_mask)
+            x = x + self._inter_region_attention_dynamic(self.norm2(x), area_config, src_mask, inter_region_attn_mask)
+            raise
         else:
-            x = x + self._inter_region_attention_static(self.norm2(x), src_mask, src_key_padding_mask)
+            x = x + self._inter_region_attention_static(self.norm2(x), src_mask, inter_region_attn_mask)
 
         x = x + self._ff_block(self.norm3(x))
         return x
@@ -85,6 +86,7 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
 
         x_reshaped = x.permute(0, 2, 1, 3)
         x_flat = x_reshaped.reshape(batch * T, chans, F)
+        key_padding_mask = key_padding_mask.unsqueeze(2).expand(-1, -1, T).permute(0, 2, 1).reshape(batch * T, chans) if key_padding_mask is not None else None
 
         if self.region_attn_mask is None or self.region_indices_dict is None:
             x_enhanced = x_flat
@@ -134,6 +136,7 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
         if T % window_size != 0:
             pad_length = window_size - (T % window_size)
             x = F.pad(x, (0, 0, 0, pad_length))
+            key_padding_mask = F.pad(key_padding_mask, (0, pad_length), value=True) if key_padding_mask is not None else None
             T = T + pad_length
             num_windows = T // window_size
 
@@ -141,6 +144,8 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
 
         x = x.permute(0, 3, 1, 2, 4)
         x = x.reshape(batch * window_size * chans, num_windows, Fea)
+
+        key_padding_mask = key_padding_mask.unsqueeze(1).expand(-1, chans, -1).view(batch, chans, num_windows, window_size).permute(0, 3, 1, 2).reshape(batch * window_size * chans, num_windows) if key_padding_mask is not None else None
 
         temporal_attn_mask = None
         if attn_mask is not None:

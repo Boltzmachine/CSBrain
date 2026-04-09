@@ -82,13 +82,13 @@ class PatchEmbedding(nn.Module):
         self.mask_encoding = nn.Parameter(torch.zeros(in_dim), requires_grad=False)
 
         self.proj_in = nn.Sequential(
-            nn.Conv2d(1, d_model, kernel_size=(1, d_model), stride=1, padding=0),
-            nn.GroupNorm(5, d_model), nn.GELU(),
-            nn.Conv2d(d_model, d_model, kernel_size=1), nn.GroupNorm(5, d_model), nn.GELU(),
-            nn.Conv2d(d_model, d_model, kernel_size=1), nn.GroupNorm(5, d_model), nn.GELU(),
+            nn.Conv2d(1, d_model, kernel_size=(1, in_dim), stride=1, padding=0),
+            nn.GroupNorm(8, d_model), nn.GELU(),
+            nn.Conv2d(d_model, d_model, kernel_size=1), nn.GroupNorm(8, d_model), nn.GELU(),
+            nn.Conv2d(d_model, d_model, kernel_size=1), nn.GroupNorm(8, d_model), nn.GELU(),
         )
         self.spectral_proj = nn.Sequential(
-            nn.Linear(d_model // 2 + 1, d_model),
+            nn.Linear(in_dim // 2 + 1, d_model),
             nn.Dropout(0.1),
         )
 

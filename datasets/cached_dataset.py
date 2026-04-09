@@ -26,11 +26,11 @@ def collate_cached(batch):
         if chs < max_chs:
             padding_chs = max_chs - chs
             x['timeseries'] = torch.cat([x['timeseries'], torch.zeros(padding_chs, x['timeseries'].shape[1], x['timeseries'].shape[2])], dim=0)
-            if lens < max_lens:
-                padding_len = max_lens - lens
-                x['timeseries'] = torch.cat([x['timeseries'], torch.zeros(x['timeseries'].shape[0], padding_len, x['timeseries'].shape[2])], dim=1)
             x['ch_coords'] = torch.cat([x['ch_coords'], torch.zeros(padding_chs, 3)], dim=0)
             x['ch_names'] = list(x['ch_names']) + ['pad'] * padding_chs
+        if lens < max_lens:
+            padding_len = max_lens - lens
+            x['timeseries'] = torch.cat([x['timeseries'], torch.zeros(x['timeseries'].shape[0], padding_len, x['timeseries'].shape[2])], dim=1)
         x['valid_channel_mask'] = torch.tensor([1] * chs + [0] * (max_chs - chs), dtype=torch.bool)
         x['valid_length_mask'] = torch.tensor([1] * lens + [0] * (max_lens - lens), dtype=torch.bool)
 
@@ -57,12 +57,13 @@ def collate_cached(batch):
             has_image.append(False)
     image_pixel_values = torch.stack(all_pixel_values, dim=0)
     has_image = torch.tensor(has_image, dtype=torch.bool) 
-        
+
     return {
         'timeseries': torch.stack([x['timeseries'] for x in batch], dim=0),
         'ch_coords': torch.stack([x['ch_coords'] for x in batch], dim=0),
         'ch_names': [x['ch_names'] for x in batch],
         'valid_channel_mask': torch.stack([x['valid_channel_mask'] for x in batch], dim=0),
+        "valid_length_mask": torch.stack([x['valid_length_mask'] for x in batch], dim=0),
         'source': [x['source'] for x in batch],
         'image_hidden_states': torch.stack([x['image_hidden_states'] for x in batch if 'image_hidden_states' in x], dim=0) if 'image_hidden_states' in batch[0] else None,
         'events': torch.stack([x['events'] for x in batch if 'events' in x], dim=0) if 'events' in batch[0] else None,
@@ -215,7 +216,7 @@ class _process_webdataset_sample:
         #         data['pixel_values'] = torch.from_numpy(images)
 
         data['sfreq'] = torch.tensor(s_freq, dtype=torch.float32)
-        data['source'] = sample.get('source.txt', "unknown")
+        data['source'] = sample.get('source.txt', None) or sample.get("source", None) or "unknown"
         return data
 
 

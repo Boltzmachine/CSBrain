@@ -209,6 +209,7 @@ if __name__ == "__main__":
                                 "ch_names.json": json.dumps(item["ch_names"]),
                                 "ch_config.txt": item["ch_config"],
                                 "file_name.txt": item["file_name"],
+                                "source.txt": "tueg",
                             }
                             sink.write(sample)
 

@@ -62,7 +62,7 @@ def main():
         from datasets.cached_dataset import get_webdataset, collate_cached
         from torch.utils.data import ConcatDataset
         dataset_names = [
-            'tueg/*.tar',
+            # 'tueg/*.tar',
             # 'siena_scalp/*.tar',
             # 'physionet_2018/*.tar',
             # 'raw_eeg/*.tar',

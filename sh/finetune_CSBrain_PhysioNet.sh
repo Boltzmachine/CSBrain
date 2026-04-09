@@ -8,6 +8,7 @@
 #SBATCH --time=1-00:00:00
 #SBATCH --job-name=csbrain-finetune
 #SBATCH --output=outputs/slurms/%j.out
+#SBATCH --qos=qos_nmi
 
 SCRIPT_DIR=$(dirname "$0")
 
@@ -21,47 +22,43 @@ LOG_FILE="${LOG_DIR}/${LOG_FILE_NAME}.log"
 echo "Job started at $(date)" | tee -a "$LOG_FILE"
 
 
+# python finetune_main.py \
+#     --model Align \
+#     --downstream_dataset PhysioNet-MI \
+#     --datasets_dir data/preprocessed/physionet_mi \
+#     --num_of_classes 4 \
+#     --model_dir outputs/CSBrain/finetune_CSBrain_PhysioNet \
+#     --foundation_dir outputs/Align-alljoined-mask/epoch22_loss4.793579578399658.pth \
+#     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
+#     --use_pretrained_weights \
+#     --in_dim 40 \
+#     --out_dim 40 \
+#     --d_model 40 \
+#     --seq_len 20 \
+#     --nhead 4 \
+#     --n_layer 24 \
+#     --dropout 0.3 \
+#     --weight_decay  0.01 \
+#     --lr 0.00005 
+
 python finetune_main.py \
-    --model Align \
+    --model Spectral \
     --downstream_dataset PhysioNet-MI \
     --datasets_dir data/preprocessed/physionet_mi \
     --num_of_classes 4 \
     --model_dir outputs/CSBrain/finetune_CSBrain_PhysioNet \
-    --foundation_dir outputs/Align-all-add-global/epoch20_loss4.769124984741211.pth \
+    --foundation_dir outputs/Spectral-4band-3level-alljoned/epoch23_loss19.110177993774414.pth \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --use_pretrained_weights \
-    --in_dim 20 \
-    --out_dim 20 \
-    --d_model 20 \
-    --seq_len 300 \
+    --in_dim 40 \
+    --out_dim 40 \
+    --d_model 40 \
+    --seq_len 20 \
     --nhead 4 \
     --n_layer 24 \
     --dropout 0.3 \
     --weight_decay  0.01 \
     --lr 0.00005 
-
-# python finetune_main.py  \
-#     --downstream_dataset PhysioNet-MI \
-#     --datasets_dir data/preprocessed/physionet_mi \
-#     --num_of_classes 4 \
-#     --model_dir outputs/CSBrain/finetune_CSBrain_PhysioNet \
-#     --foundation_dir outputs/CSBrain-deep/epoch19_loss0.03231504559516907.pth  \
-#     --use_pretrained_weights \
-#     --dropout 0.3 \
-#     --weight_decay  0.01 \
-#     --lr 0.00005 
-
-# python finetune_main.py  \
-#     --downstream_dataset PhysioNet-MI \
-#     --datasets_dir data/preprocessed/physionet_mi \
-#     --num_of_classes 4 \
-#     --model_dir outputs/CSBrain/finetune_CSBrain_PhysioNet \
-#     --foundation_dir outputs/llm_vq/epoch21_loss0.03721848130226135.pth  \
-#     --model LLMVQ \
-#     --use_pretrained_weights \
-#     --dropout 0.3 \
-#     --weight_decay  0.01 \
-#     --lr 0.00005 
 
 wait
 

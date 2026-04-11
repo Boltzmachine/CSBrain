@@ -15,40 +15,145 @@ from transformers import Dinov2Model
 
 class SourceProjector(nn.Module):
     """
-    Input:  (B, C, N, d)
-    Output: (B, K, N, d)
+    Standalone sensor-to-source projector.
 
-    - Handles variable number of channels C.
-    - Channel order equivariant in interaction layers.
-    - Final source extraction is permutation-invariant to channel order
-      via learned source queries attending over the channel set.
+    Input:  x (B, C, N, d), ch_coords (B, C, 3)  — raw sensor signals + spherical coords
+    Output: (B, K, N, d)  — source-space signals
+
+    Mixing weights depend only on electrode coordinates (not data),
+    analogous to a learned lead-field matrix.
+
+    Pre-trainable with reconstruction + decorrelation (see training_step).
     """
     def __init__(
         self,
-        patch_dim: int,
-        num_sources: int,
-        hidden_dim: int,
+        in_dim: int,
+        num_sources: int = 32,
+        decorr_weight: float = 0.1,
     ):
         super().__init__()
+        self.in_dim = in_dim
         self.num_sources = num_sources
-        self.hidden_dim = hidden_dim
+        self.decorr_weight = decorr_weight
 
-        # self.mixer = nn.Parameter(torch.randn(1, 32, num_sources))
+        # --- spherical positional encoding ---
+        self.spherical_r_scale = 0.1
+        self.spherical_num_freqs = 32
+        self.spherical_pe_base = 20.0
+        inv_freq = torch.exp(
+            -math.log(self.spherical_pe_base)
+            * torch.arange(self.spherical_num_freqs, dtype=torch.float32)
+            / self.spherical_num_freqs
+        )
+        self.register_buffer("spherical_inv_freq", inv_freq, persistent=False)
 
-        self.mixer = nn.Linear(patch_dim, num_sources, bias=False)
+        pe_dim = 3 * 2 * self.spherical_num_freqs  # 192
 
-    def forward(self, x: torch.Tensor, coord_emb: torch.Tensor) -> torch.Tensor:
+        # coord -> forward mixing weights  (sensors -> sources)
+        self.forward_mix = nn.Sequential(
+            nn.Linear(pe_dim, in_dim),
+            nn.GELU(),
+            nn.Linear(in_dim, num_sources),
+        )
+
+        # coord -> inverse mixing weights  (sources -> sensors, for reconstruction)
+        self.inverse_mix = nn.Sequential(
+            nn.Linear(pe_dim, in_dim),
+            nn.GELU(),
+            nn.Linear(in_dim, num_sources),
+        )
+
+    def _spherical_positional_encoding(self, ch_coords):
+        """ch_coords: (B, C, 3) spherical (r, theta, phi)."""
+        finite_mask = torch.isfinite(ch_coords).all(dim=-1, keepdim=True)
+        safe_coords = torch.where(finite_mask, ch_coords, torch.zeros_like(ch_coords))
+
+        r = safe_coords[..., 0:1] / self.spherical_r_scale
+        theta = safe_coords[..., 1:2] / math.pi
+        phi = safe_coords[..., 2:3] / math.pi
+        norm_coords = torch.cat([r, theta, phi], dim=-1)
+
+        inv_freq = self.spherical_inv_freq.to(device=norm_coords.device, dtype=norm_coords.dtype)
+        angles = norm_coords.unsqueeze(-1) * inv_freq.view(1, 1, 1, -1)
+        pe = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        pe = pe.reshape(norm_coords.size(0), norm_coords.size(1), -1)
+        return pe, finite_mask.squeeze(-1)
+
+    def _valid_channel_mask(self, ch_coords, valid_channel_mask=None):
+        """Combine user-supplied validity mask with finite-coordinate check."""
+        _, finite_mask = self._spherical_positional_encoding(ch_coords)
+        if valid_channel_mask is not None:
+            return valid_channel_mask.bool() & finite_mask
+        return finite_mask
+
+    def forward(self, x: torch.Tensor, ch_coords: torch.Tensor,
+                valid_channel_mask: torch.Tensor = None):
         """
-        x: (B, C, N, d)
-        coord_emb: (B, C, 1, d)
+        x:         (B, C, N, d)  raw sensor timeseries
+        ch_coords: (B, C, 3)    spherical coordinates
+        valid_channel_mask: (B, C) bool — False for padded/invalid channels
+        Returns:   (B, K, N, d) source signals
         """
+        coord_pe, _ = self._spherical_positional_encoding(ch_coords)
         b, c, n, d = x.shape
-        x = x.permute(0, 2, 3, 1).contiguous().view(b, n * d, c)
-        mixer = self.mixer(coord_emb)  # (B, C, d) -> (B, C, K)
-        x = x @ mixer # (B, N*d, K)
-        s = x.view(b, n, d, self.num_sources).permute(0, 3, 1, 2).contiguous()  # (B, K, N, d)
 
+        w_fwd = self.forward_mix(coord_pe)        # (B, C, K)
+
+        # Zero out weights for invalid/padded channels
+        valid = self._valid_channel_mask(ch_coords, valid_channel_mask)  # (B, C)
+        w_fwd = w_fwd * valid.unsqueeze(-1).float()
+
+        x_flat = x.permute(0, 2, 3, 1).contiguous().view(b, n * d, c)
+        s = (x_flat @ w_fwd).view(b, n, d, self.num_sources)
+        s = s.permute(0, 3, 1, 2).contiguous()    # (B, K, N, d)
         return s
+
+    def inverse(self, s: torch.Tensor, ch_coords: torch.Tensor,
+                valid_channel_mask: torch.Tensor = None):
+        """Reconstruct sensors from sources: (B, K, N, d) -> (B, C, N, d)."""
+        coord_pe, _ = self._spherical_positional_encoding(ch_coords)
+        w_inv = self.inverse_mix(coord_pe)         # (B, C, K)
+
+        valid = self._valid_channel_mask(ch_coords, valid_channel_mask)  # (B, C)
+        w_inv = w_inv * valid.unsqueeze(-1).float()
+
+        recon = torch.einsum('bck,bknd->bcnd', w_inv, s)
+        return recon
+
+    def compute_decorr_loss(self, sources):
+        """Penalise cross-source instantaneous correlation."""
+        src = sources.view(sources.size(0), sources.size(1), -1)  # (B, K, N*d)
+        src = src - src.mean(dim=-1, keepdim=True)
+        src = src / (src.std(dim=-1, keepdim=True) + 1e-6)
+        corr = torch.matmul(src, src.transpose(1, 2)) / src.size(-1)
+        eye = torch.eye(corr.size(-1), device=corr.device, dtype=corr.dtype).unsqueeze(0)
+        return ((corr * (1.0 - eye)) ** 2).mean()
+
+    def training_step(self, batch, mask=None):
+        """
+        Pre-training: sensor -> source -> sensor reconstruction.
+        Returns (recon, loss_dict) compatible with the existing Trainer.
+        """
+        x = batch['timeseries']       # (B, C, N, d)
+        ch_coords = batch['ch_coords']
+        valid_channel_mask = batch.get('valid_channel_mask', None)
+
+        valid = self._valid_channel_mask(ch_coords, valid_channel_mask)
+
+        sources = self.forward(x, ch_coords, valid_channel_mask=valid)
+        recon = self.inverse(sources, ch_coords, valid_channel_mask=valid)
+
+        # Loss only on valid channels
+        mask_exp = valid.unsqueeze(-1).unsqueeze(-1).float()  # (B, C, 1, 1)
+        n_valid = mask_exp.sum().clamp(min=1)
+
+        recon_loss = ((recon - x) ** 2 * mask_exp).sum() / (n_valid * x.size(2) * x.size(3))
+        decorr_loss = self.compute_decorr_loss(sources)
+
+        return recon, {
+            "recon_loss": (1.0, recon_loss),
+            "decorr_loss": (self.decorr_weight, decorr_loss),
+        }
 
 
 
@@ -122,13 +227,32 @@ class AttentionMLPSemanticReadout(nn.Module):
 
 class CSBrainAlign(nn.Module):
     def __init__(self, in_dim=200, out_dim=200, d_model=200, dim_feedforward=800, seq_len=30, n_layer=12,
-                 nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[]):
+                 nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[],
+                 causal=False, project_to_source=False, num_sources=32,
+                 source_projector_ckpt=None, freeze_source_projector=True):
         super().__init__()
-        self.patch_embedding = PatchEmbedding(in_dim, out_dim, d_model, seq_len)
+        self.causal = causal
+        self.project_to_source = project_to_source
+
+        # --- Source projector (operates on raw timeseries, before patch embedding) ---
+        self.source_projector = SourceProjector(
+            in_dim=in_dim,
+            num_sources=num_sources,
+        )
+        if source_projector_ckpt is not None:
+            ckpt = torch.load(source_projector_ckpt, map_location='cpu')
+            self.source_projector.load_state_dict(ckpt, strict=True)
+            print(f"Loaded pre-trained source projector from {source_projector_ckpt}")
+        if self.project_to_source and freeze_source_projector:
+            for p in self.source_projector.parameters():
+                p.requires_grad = False
+            print("Source projector weights frozen")
+
+        self.patch_embedding = PatchEmbedding(in_dim, out_dim, d_model, seq_len, causal=causal)
 
         self.TemEmbed_kernel_sizes = TemEmbed_kernel_sizes
         kernel_sizes = self.TemEmbed_kernel_sizes
-        self.TemEmbedEEGLayer = TemEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim, kernel_sizes=kernel_sizes, stride=1)
+        self.TemEmbedEEGLayer = TemEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim, kernel_sizes=kernel_sizes, stride=1, causal=causal)
 
         self.brain_regions = brain_regions
         self.area_config = None #generate_area_config(sorted(brain_regions))
@@ -138,7 +262,7 @@ class CSBrainAlign(nn.Module):
         self.pretrained_image_encoder = Dinov2Model.from_pretrained("facebook/dinov2-base").eval()
         encoder_layer = CSBrain_TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, area_config=self.area_config, sorted_indices=self.sorted_indices, batch_first=True,
-            activation=F.gelu
+            activation=F.gelu, causal=causal
         )
         self.encoder = CSBrain_TransformerEncoder(encoder_layer, num_layers=n_layer, enable_nested_tensor=False)
 
@@ -150,14 +274,6 @@ class CSBrainAlign(nn.Module):
         if self.add_global:
             self.global_channel = nn.Parameter(torch.randn(1, 1, 1, d_model))
             self.global_token = nn.Parameter(torch.randn(1, 1, 1, d_model))
-
-        self.use_proj = False
-        num_sources = 32
-        self.source_projector = SourceProjector(
-            patch_dim=in_dim,
-            num_sources=num_sources,
-            hidden_dim=d_model * seq_len,
-        )
 
         self.spherical_r_scale = 0.1
         self.spherical_num_freqs = 32
@@ -172,11 +288,6 @@ class CSBrainAlign(nn.Module):
             nn.Linear(3 * 2 * self.spherical_num_freqs, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
-        )
-        self.coord_to_source_weights = nn.Sequential(
-            nn.Linear(3 * 2 * self.spherical_num_freqs, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, self.source_projector.num_sources),
         )
 
         self.features_by_layer = []
@@ -283,27 +394,42 @@ class CSBrainAlign(nn.Module):
 
     def forward(self, batch, mask=None):
         x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
-        timeseries = x.view(x.size(0), x.size(1), -1)
-        spectral = torch.fft.rfft(timeseries, dim=-1, norm='forward')
-        masks = torch.sigmoid(self.freq_mask_logits[:1, :spectral.size(-1)]) # (num_visual_levels, n_freq_bins)
-        branch_spectral = spectral * masks.unsqueeze(0) # (n_branch, B, n_ch, n_freq_bins)
-        branch_time = torch.fft.irfft(branch_spectral, norm='forward') # (n_branch, B, n_ch, seq_len)
-        x = branch_time.view_as(x)
+        ch_coords = batch['ch_coords']
 
-        # x = x[:, self.sorted_indices, :, :]
+        # --- Apply mask in sensor space, then project to source space ---
+        if self.project_to_source:
+            valid_ch = batch.get('valid_channel_mask', None)
+            if mask is not None:
+                # Apply mask in original sensor space before source projection
+                x_masked = x.clone()
+                x_masked[mask == 1] = 0.0  # zero out masked patches in sensor space
+                x = self.source_projector(x_masked, ch_coords, valid_channel_mask=valid_ch)
+            else:
+                x = self.source_projector(x, ch_coords, valid_channel_mask=valid_ch)
+            # Don't pass mask to patch_embedding — already applied
+            mask = None
+
+        if not self.causal:
+            # Spectral filtering mixes all time steps — skip in causal mode
+            timeseries = x.view(x.size(0), x.size(1), -1)
+            spectral = torch.fft.rfft(timeseries, dim=-1, norm='forward')
+            masks = torch.sigmoid(self.freq_mask_logits[:1, :spectral.size(-1)]) # (num_visual_levels, n_freq_bins)
+            branch_spectral = spectral * masks.unsqueeze(0) # (n_branch, B, n_ch, n_freq_bins)
+            branch_time = torch.fft.irfft(branch_spectral, norm='forward') # (n_branch, B, n_ch, seq_len)
+            x = branch_time.view_as(x)
+
         patch_emb = self.patch_embedding(x, mask)
 
-        ch_coords = batch['ch_coords']
-        coord_pe, finite_coord_mask = self._spherical_positional_encoding(ch_coords)
-
-        coord_emb = self.coord_enhancement(coord_pe)
-
-        if self.use_proj:
-            patch_emb = self.source_projector(patch_emb, coord_emb)
+        if self.project_to_source:
+            # Sources are always valid (no padding in source dim)
+            b = patch_emb.size(0)
+            batch['valid_channel_mask'] = torch.ones(b, self.source_projector.num_sources,
+                                                     dtype=torch.bool, device=patch_emb.device)
         else:
+            coord_pe, finite_coord_mask = self._spherical_positional_encoding(ch_coords)
+            coord_emb = self.coord_enhancement(coord_pe)
             patch_emb = patch_emb + coord_emb.unsqueeze(2)
 
-        # zero_lag_sync_loss = self.compute_zero_lag_sync_loss(patch_emb)
         if self.add_global:
             patch_emb = torch.cat([self.global_channel.expand(patch_emb.size(0), -1, patch_emb.size(2), -1), patch_emb], dim=1)
             patch_emb = torch.cat([self.global_token.expand(patch_emb.size(0), patch_emb.size(1), -1, -1), patch_emb], dim=2)
@@ -374,24 +500,18 @@ class CSBrainAlign(nn.Module):
                     for src, acc_list in contrastive_loss_per_source.items():
                         contrastive_loss[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
 
-        if self.use_proj:
-            if 'valid_channel_mask' in batch:
-                valid_channel_mask = batch['valid_channel_mask'].to(x.device).bool()
-            else:
-                valid_channel_mask = torch.ones_like(finite_coord_mask, dtype=torch.bool)
-
-            coord_valid_mask = valid_channel_mask & finite_coord_mask
-
-            source_weights = self.coord_to_source_weights(coord_pe)
-            eeg_from_sources = torch.einsum('bck,bknd->bcnd', source_weights, patch_emb)
-            eeg_from_sources = eeg_from_sources * coord_valid_mask.unsqueeze(-1).unsqueeze(-1).to(eeg_from_sources.dtype)
-            out = self.proj_out(eeg_from_sources)
+        if self.project_to_source:
+            source_emb = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
+            # Reconstruct back to sensor space for masked reconstruction loss
+            out = self.source_projector.inverse(source_emb, ch_coords,
+                                                valid_channel_mask=valid_ch)
+            out = self.proj_out(out)
         else:
             out = self.proj_out(patch_emb)
+            if self.add_global:
+                out = out[:, 1:, 1:, :]
 
         rep = branch_embs # (B, K, N, d)
-        if self.add_global:
-            out = out[:, 1:, 1:, :]
         #     rep = torch.cat([self.global_token.expand(out.size(0), -1, -1, -1), out], dim=2)
 
         return out, {
@@ -406,13 +526,23 @@ class CSBrainAlign(nn.Module):
 
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, in_dim, out_dim, d_model, seq_len):
+    def __init__(self, in_dim, out_dim, d_model, seq_len, causal=False):
         super().__init__()
         self.d_model = d_model
-        self.positional_encoding = nn.Sequential(
-            nn.Conv2d(in_channels=d_model, out_channels=d_model, kernel_size=(19, 7), stride=(1, 1), padding=(9, 3),
-                      groups=d_model),
-        )
+        self.causal = causal
+        if causal:
+            # Channel dim (kernel=19, pad=9) stays symmetric.
+            # Time dim (kernel=7): no built-in padding; left-pad manually.
+            self.positional_encoding = nn.Sequential(
+                nn.Conv2d(in_channels=d_model, out_channels=d_model, kernel_size=(19, 7),
+                          stride=(1, 1), padding=(9, 0), groups=d_model),
+            )
+            self.pos_time_pad = 6  # kernel_time - 1
+        else:
+            self.positional_encoding = nn.Sequential(
+                nn.Conv2d(in_channels=d_model, out_channels=d_model, kernel_size=(19, 7), stride=(1, 1), padding=(9, 3),
+                          groups=d_model),
+            )
         self.mask_encoding = nn.Parameter(torch.zeros(in_dim), requires_grad=False)
 
         self.proj_in = nn.Sequential(
@@ -441,9 +571,16 @@ class PatchEmbedding(nn.Module):
             mask_x = x.clone()
             mask_x[mask == 1] = self.mask_encoding
 
-        mask_x = mask_x.contiguous().view(bz, 1, ch_num * patch_num, patch_size)
-        patch_emb = self.proj_in(mask_x)
-        patch_emb = patch_emb.permute(0, 2, 1, 3).contiguous().view(bz, ch_num, patch_num, self.d_model)
+        if self.causal:
+            # Process each time step independently so GroupNorm doesn't mix across time
+            proj_in_x = mask_x.permute(0, 2, 1, 3).contiguous().view(bz * patch_num, 1, ch_num, patch_size)
+            patch_emb = self.proj_in(proj_in_x)  # (B*T, d_model, C, 1)
+            patch_emb = patch_emb.permute(0, 2, 1, 3).contiguous().view(bz, patch_num, ch_num, self.d_model)
+            patch_emb = patch_emb.permute(0, 2, 1, 3).contiguous()  # (B, C, T, d_model)
+        else:
+            mask_x = mask_x.contiguous().view(bz, 1, ch_num * patch_num, patch_size)
+            patch_emb = self.proj_in(mask_x)
+            patch_emb = patch_emb.permute(0, 2, 1, 3).contiguous().view(bz, ch_num, patch_num, self.d_model)
 
         mask_x = mask_x.contiguous().view(bz * ch_num * patch_num, patch_size)
         spectral = torch.fft.rfft(mask_x, dim=-1, norm='forward')
@@ -451,7 +588,10 @@ class PatchEmbedding(nn.Module):
         spectral_emb = self.spectral_proj(spectral)
         patch_emb = patch_emb + spectral_emb
 
-        positional_embedding = self.positional_encoding(patch_emb.permute(0, 3, 1, 2))
+        pe_input = patch_emb.permute(0, 3, 1, 2)  # (B, d_model, ch, time)
+        if self.causal:
+            pe_input = F.pad(pe_input, (self.pos_time_pad, 0))  # left-pad time dim
+        positional_embedding = self.positional_encoding(pe_input)
         positional_embedding = positional_embedding.permute(0, 2, 3, 1)
 
         patch_emb = patch_emb + positional_embedding

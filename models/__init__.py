@@ -41,7 +41,11 @@ def get_model(params, brain_regions, sorted_indices):
             params.nhead,
             eval(params.TemEmbed_kernel_sizes),
             brain_regions=None,
-            # sorted_indices
+            causal=getattr(params, 'causal', False),
+            project_to_source=getattr(params, 'project_to_source', False),
+            num_sources=getattr(params, 'num_sources', 32),
+            source_projector_ckpt=getattr(params, 'source_projector_ckpt', None),
+            freeze_source_projector=getattr(params, 'freeze_source_projector', True),
         )
     elif params.model == 'Spectral':
         from .spectral_alignment import CSBrainSpectral
@@ -54,6 +58,14 @@ def get_model(params, brain_regions, sorted_indices):
             num_visual_levels=getattr(params, 'num_visual_levels', 3),
             dino_layer_indices=getattr(params, 'dino_layer_indices', (3, 7, 12)),
         )
+    elif params.model == 'SourceProjector':
+        from .alignment import SourceProjector
+        model = SourceProjector(
+            in_dim=params.in_dim,
+            num_sources=getattr(params, 'num_sources', 32),
+            decorr_weight=getattr(params, 'decorr_weight', 0.1),
+        )
+        return model
     elif params.model == 'CNN':
         from .cnn import CSBrainCNN
         model = CSBrainCNN(

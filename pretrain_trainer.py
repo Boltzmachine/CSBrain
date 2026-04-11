@@ -76,7 +76,30 @@ class Trainer(object):
                         batch['timeseries'] = x
                     else:
                         batch = {'timeseries': x.to(self.device) / 100}
-                    if self.params.need_mask:
+                    if getattr(self.params, 'causal', False):
+                        # Causal next-patch prediction: no masking needed
+                        out = self.model.training_step(batch, mask=None)
+
+                        loss_dict = {}
+                        logs = {}
+                        if isinstance(out, tuple):
+                            y, info = out
+                            for key, value in info.items():
+                                if 'loss' in key:
+                                    coef, lss = value
+                                    loss_dict[key] = coef * lss
+                                    logs[key] = lss.data.cpu().numpy()
+                                elif 'acc' in key:
+                                    logs[key] = value.data.cpu().numpy()
+
+                        # Next-patch prediction: output at t predicts input at t+1
+                        # y: (B, n_ch, seq_len, patch_size), x: (B, n_ch, seq_len, patch_size)
+                        pred = y[:, :, :-1, :]   # predictions from t=0..T-2
+                        target = x[:, :, 1:, :]  # targets from t=1..T-1
+                        causal_loss = self.criterion(pred, target)
+                        loss = causal_loss + sum(loss_dict.values())
+                        logs["causal_loss"] = causal_loss.data.cpu().numpy()
+                    elif self.params.need_mask:
                         bz, ch_num, patch_num, patch_size = x.shape
                         mask = generate_mask(
                             bz, ch_num, patch_num, mask_ratio=self.params.mask_ratio, device=self.device,
@@ -103,7 +126,21 @@ class Trainer(object):
                         # loss = sum(loss_dict.values())
                         logs["mask_loss"] = mask_loss.data.cpu().numpy()
                     else:
-                        raise NotImplementedError("Currently only support masked training for dict input")
+                        out = self.model.training_step(batch, mask=None)
+
+                        loss_dict = {}
+                        logs = {}
+                        if isinstance(out, tuple):
+                            y, info = out
+                            for key, value in info.items():
+                                if 'loss' in key:
+                                    coef, lss = value
+                                    loss_dict[key] = coef * lss
+                                    logs[key] = lss.data.cpu().numpy()
+                                elif 'acc' in key:
+                                    logs[key] = value.data.cpu().numpy()
+
+                        loss = sum(loss_dict.values())
                 else:
                     if isinstance(x, dict):
                         x = x['timeseries']

@@ -49,6 +49,12 @@ def main():
     parser.add_argument('--use_SmallerToken', type=bool, default=False, help='SmallerToken->dataset.py')
     parser.add_argument('--model', type=str, default='CSBrain', help='CSBrain')
     parser.add_argument('--run_name', type=str, default=None)
+    parser.add_argument('--causal', action='store_true', default=False, help='use causal (next-patch prediction) instead of masked reconstruction')
+    parser.add_argument('--project_to_source', action='store_true', default=False, help='project sensors to source space before transformer')
+    parser.add_argument('--num_sources', type=int, default=32, help='number of brain sources')
+    parser.add_argument('--decorr_weight', type=float, default=0.1, help='decorrelation loss weight for source projector pretraining')
+    parser.add_argument('--source_projector_ckpt', type=str, default=None, help='path to pre-trained source projector checkpoint')
+    parser.add_argument('--freeze_source_projector', action='store_true', default=False, help='freeze source projector weights during stage 2')
 
     params = parser.parse_args()
     print(params)

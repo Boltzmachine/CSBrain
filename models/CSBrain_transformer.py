@@ -74,33 +74,56 @@ class TemEmbedEEGLayer(nn.Module):
         dim_in,
         dim_out,
         kernel_sizes,
-        stride=1
+        stride=1,
+        causal=False
     ):
         super().__init__()
+        self.causal = causal
         kernel_sizes = sorted(kernel_sizes)
         num_scales = len(kernel_sizes)
 
         dim_scales = [int(dim_out / (2 ** i)) for i in range(1, num_scales)]
         dim_scales = [*dim_scales, dim_out - sum(dim_scales)]
 
-        self.convs = nn.ModuleList([
-            nn.Conv2d(in_channels=dim_in, out_channels=dim_scale, kernel_size=(kt, 1),
-                      stride=(stride, 1), padding=((kt - 1) // 2, 0))
-            for (kt,), dim_scale in zip(kernel_sizes, dim_scales)
-        ])
+        self.kernel_time_sizes = [kt for (kt,) in kernel_sizes]
+
+        if causal:
+            # No built-in padding; we manually left-pad in forward
+            self.convs = nn.ModuleList([
+                nn.Conv2d(in_channels=dim_in, out_channels=dim_scale, kernel_size=(kt, 1),
+                          stride=(stride, 1), padding=(0, 0))
+                for (kt,), dim_scale in zip(kernel_sizes, dim_scales)
+            ])
+        else:
+            self.convs = nn.ModuleList([
+                nn.Conv2d(in_channels=dim_in, out_channels=dim_scale, kernel_size=(kt, 1),
+                          stride=(stride, 1), padding=((kt - 1) // 2, 0))
+                for (kt,), dim_scale in zip(kernel_sizes, dim_scales)
+            ])
 
     def forward(self, x):
         batch, chans, time, d_model = x.shape
 
-        x = x.view(batch * chans, d_model, time, 1)
-
-        fmaps = [conv(x) for conv in self.convs]
+        if self.causal:
+            # Permute so Conv2d dim-2 is the real time axis: (B*C, d_model, time, 1)
+            x = x.permute(0, 1, 3, 2).contiguous().view(batch * chans, d_model, time, 1)
+            fmaps = []
+            for conv, kt in zip(self.convs, self.kernel_time_sizes):
+                x_padded = Fun.pad(x, (0, 0, kt - 1, 0))
+                fmaps.append(conv(x_padded))
+        else:
+            x = x.view(batch * chans, d_model, time, 1)
+            fmaps = [conv(x) for conv in self.convs]
 
         assert all(f.shape[2] == time for f in fmaps), "Time dimension mismatch after convolutions!"
 
         x = torch.cat(fmaps, dim=1)
 
-        x = x.view(batch, chans, time, -1)
+        if self.causal:
+            # Undo the permute: (B*C, d_out, time, 1) -> (B, C, time, d_out)
+            x = x.view(batch, chans, -1, time).permute(0, 1, 3, 2).contiguous()
+        else:
+            x = x.view(batch, chans, time, -1)
 
         return x
 

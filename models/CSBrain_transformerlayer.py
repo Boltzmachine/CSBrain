@@ -13,11 +13,12 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: Union[str, Callable[[torch.Tensor], torch.Tensor]] = F.relu,
                  layer_norm_eps: float = 1e-5, batch_first: bool = False, bias: bool = True,
-                 area_config: dict = {}, sorted_indices: list = []):
+                 area_config: dict = {}, sorted_indices: list = [], causal: bool = False):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.batch_first = batch_first
+        self.causal = causal
 
         self.inter_region_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout,
                                                        bias=bias, batch_first=batch_first)
@@ -148,7 +149,12 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
         key_padding_mask = key_padding_mask.unsqueeze(1).expand(-1, chans, -1).view(batch, chans, num_windows, window_size).permute(0, 3, 1, 2).reshape(batch * window_size * chans, num_windows) if key_padding_mask is not None else None
 
         temporal_attn_mask = None
-        if attn_mask is not None:
+        if self.causal:
+            temporal_attn_mask = torch.triu(
+                torch.ones(num_windows, num_windows, device=x.device) * float('-inf'),
+                diagonal=1
+            )
+        elif attn_mask is not None:
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 2:
                 temporal_attn_mask = torch.triu(
                     torch.ones(num_windows, num_windows, device=x.device) * float('-inf'),

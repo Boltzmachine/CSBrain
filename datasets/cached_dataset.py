@@ -1,4 +1,6 @@
 import os
+import re
+from collections import defaultdict, deque
 
 from matplotlib import image
 from torch.utils.data import Dataset
@@ -73,6 +75,7 @@ def collate_cached(batch):
         },
         "has_image": has_image,
         "source": [x['source'] for x in batch],
+        "session_id": [x.get('session_id', 'unknown') for x in batch],
     }
 
 
@@ -217,7 +220,139 @@ class _process_webdataset_sample:
 
         data['sfreq'] = torch.tensor(s_freq, dtype=torch.float32)
         data['source'] = sample.get('source.txt', None) or sample.get("source", None) or "unknown"
+        data['session_id'] = self._extract_session_id(sample)
         return data
+
+    @staticmethod
+    def _extract_session_id(sample):
+        # Explicit field (written by updated preprocessing)
+        if 'session_id.txt' in sample:
+            sid = sample['session_id.txt']
+            return sid.decode('utf-8') if isinstance(sid, bytes) else sid
+        # Parse from Alljoined-style key: sub-XX_sess-XX_block-XX_evt_XXXXXXXX
+        key = sample.get('__key__', '')
+        m = re.match(r'(sub-\d+_sess-\d+)', key)
+        if m:
+            return m.group(1)
+        # Fall back to file_name (each recording file ≈ one session)
+        file_name = sample.get('file_name.txt', key)
+        if isinstance(file_name, bytes):
+            file_name = file_name.decode('utf-8')
+        source = sample.get('source.txt', 'unknown')
+        if isinstance(source, bytes):
+            source = source.decode('utf-8')
+        return f"{source}/{file_name}"
+
+
+class SessionGroupedLoader:
+    """Wraps a DataLoader that yields *individual samples* and re-batches
+    them into session-grouped batches in the main process.
+
+    Why this exists
+    ---------------
+    WebDataset reads tar shards sequentially — each shard contains ~2 k
+    samples from **one** session.  A per-worker session batcher would have
+    to wait for one shard to finish before seeing the next session.
+
+    By moving the grouping into the main process we benefit from the
+    DataLoader's multi-worker interleaving: with ``num_workers=8``, eight
+    different shards (≈ eight different sessions) are read concurrently and
+    their samples arrive interleaved, so the grouper fills up quickly.
+
+    Parameters
+    ----------
+    loader : DataLoader
+        Must yield individual sample dicts (``batch_size=None`` with a
+        WebDataset that has *no* ``.batched()`` stage).
+    samples_per_session : int
+        How many samples to draw from each session in one batch.
+    sessions_per_batch : int
+        Target number of distinct sessions per batch.
+        Effective batch size = samples_per_session × sessions_per_batch.
+    collation_fn : callable
+        ``collate_cached`` or equivalent.
+    min_sessions : int
+        Minimum sessions required to emit a partial batch when the stream
+        is temporarily stuck on one session.
+    batches_per_epoch : int | None
+        If set, stop iteration after this many batches (replaces
+        ``with_epoch``).
+    """
+
+    def __init__(self, loader, samples_per_session, sessions_per_batch,
+                 collation_fn, min_sessions=2, batches_per_epoch=None):
+        self.loader = loader
+        self.samples_per_session = samples_per_session
+        self.sessions_per_batch = sessions_per_batch
+        self.collation_fn = collation_fn
+        self.min_sessions = min_sessions
+        self.batches_per_epoch = batches_per_epoch
+
+    def __len__(self):
+        if self.batches_per_epoch:
+            return self.batches_per_epoch
+        # rough estimate
+        batch_sz = self.samples_per_session * self.sessions_per_batch
+        return max(1, len(self.loader) // batch_sz)
+
+    # ------------------------------------------------------------------ #
+
+    def __iter__(self):
+        session_buffers = defaultdict(list)
+        ready = deque()
+        ready_set = set()
+        n_batches = 0
+        n_skipped = 0
+
+        for sample in self.loader:
+            sid = sample.get('session_id', 'unknown')
+
+            # Cap per-session buffer — drop excess from already-full sessions
+            if sid in ready_set:
+                n_skipped += 1
+            else:
+                session_buffers[sid].append(sample)
+                n_skipped = 0
+                if len(session_buffers[sid]) >= self.samples_per_session:
+                    ready.append(sid)
+                    ready_set.add(sid)
+
+            # Primary: emit a full batch
+            while len(ready) >= self.sessions_per_batch:
+                yield self._pop_batch(session_buffers, ready, ready_set,
+                                      self.sessions_per_batch)
+                n_batches += 1
+                n_skipped = 0
+                if self.batches_per_epoch and n_batches >= self.batches_per_epoch:
+                    return
+
+            # Fallback: stuck in a same-session burst — emit partial batch
+            if (n_skipped > self.samples_per_session * 4
+                    and len(ready) >= self.min_sessions):
+                n_emit = min(len(ready), self.sessions_per_batch)
+                yield self._pop_batch(session_buffers, ready, ready_set,
+                                      n_emit)
+                n_batches += 1
+                n_skipped = 0
+                if self.batches_per_epoch and n_batches >= self.batches_per_epoch:
+                    return
+
+    def _pop_batch(self, session_buffers, ready, ready_set, n_sessions):
+        batch_samples = []
+        for _ in range(n_sessions):
+            sid = ready.popleft()
+            ready_set.discard(sid)
+            batch_samples.extend(session_buffers[sid][:self.samples_per_session])
+            remaining = session_buffers[sid][self.samples_per_session:]
+            if remaining:
+                session_buffers[sid] = remaining
+                if len(remaining) >= self.samples_per_session:
+                    ready.append(sid)
+                    ready_set.add(sid)
+            else:
+                del session_buffers[sid]
+        random.shuffle(batch_samples)
+        return self.collation_fn(batch_samples)
 
 
 import tarfile

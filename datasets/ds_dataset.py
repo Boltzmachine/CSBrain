@@ -219,7 +219,7 @@ def preprocess():
             np.save(buf, arr, allow_pickle=False)
             return buf.getvalue()
 
-        pattern = os.path.join(output_dir, "siena-%06d.tar")
+        pattern = os.path.join(output_dir, f"{ds}-%06d.tar")
         with wds.ShardWriter(pattern, maxcount=256) as sink:
             for idx in tqdm(range(len(dataset)), desc="Writing WebDataset"):
                 item = dataset.cache_item(idx)
@@ -232,6 +232,7 @@ def preprocess():
                     "ch_config.txt": item["ch_config"],
                     "file_name.txt": item["file_name"],
                     "source.txt": ds,
+                    "session_id.txt": f"{ds}/{item['file_name']}",
                 })
 
 def plot():

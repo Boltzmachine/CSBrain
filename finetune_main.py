@@ -1,4 +1,5 @@
 import argparse
+import csv
 import random
 
 import numpy as np
@@ -62,6 +63,9 @@ def main():
     parser.add_argument('--use_CSBrainTF_Tep_Bra_Pal', action='store_true', default=False, help='use_CSBrainTF_Tep_Bra_Pal')
     parser.add_argument('--use_IntraBraEmbed', action='store_true', default=False, help='use_IntraBraEmbed')
     parser.add_argument('--use_finetune_weights', type=bool,default=False, help='use_finetune_weights')
+    parser.add_argument('--project_to_source', action='store_true', default=False, help='project sensors to source space before transformer')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name')
+    parser.add_argument('--results_csv', type=str, default=None, help='path to CSV file for logging results')
 
         
 
@@ -73,25 +77,26 @@ def main():
     setup_seed(params.seed)
     torch.cuda.set_device(params.cuda)
     print('The downstream dataset is {}'.format(params.downstream_dataset))
-    wandb.init(project='CSBrain_finetune', group=f"{params.downstream_dataset}")
-    if params.downstream_dataset == 'FACED': 
+    wandb.init(project='CSBrain_finetune', group=f"{params.downstream_dataset}", name=params.wandb_run_name)
+    results = None
+    if params.downstream_dataset == 'FACED':
         load_dataset = faced_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_faced.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'SEED-V':
         load_dataset = seedv_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_seedv.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass() 
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'PhysioNet-MI':
         load_dataset = physio_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_physio.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'SHU-MI':
         load_dataset = shu_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
@@ -103,7 +108,7 @@ def main():
         data_loader = load_dataset.get_data_loader()
         model = model_for_isruc.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'CHB-MIT':
         load_dataset = chb_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
@@ -115,7 +120,7 @@ def main():
         data_loader = load_dataset.get_data_loader()
         model = model_for_speech.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass() 
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'Mumtaz2016':
         load_dataset = mumtaz_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
@@ -140,7 +145,7 @@ def main():
         data_loader = load_dataset.get_data_loader()
         model = model_for_tuev.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass() 
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'TUAB':
         load_dataset = tuab_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
@@ -152,13 +157,13 @@ def main():
         data_loader = load_dataset
         model = model_for_tusl.Model(params) # TODO
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'BCIC-IV-2a':
         load_dataset = bciciv2a_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_bciciv2a.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass() 
+        results = t.train_for_multiclass()
     elif params.downstream_dataset == 'siena': 
         load_dataset = siena_dataset.LoadDataset(params) 
         data_loader = load_dataset.get_data_loader()
@@ -170,8 +175,26 @@ def main():
         data_loader = load_dataset.get_data_loader()
         model = model_for_hmc.Model(params)
         t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
+        results = t.train_for_multiclass()
     print("model:", params.model, "seed:", params.seed, "lr:", params.lr,"weight_decay:",params.weight_decay, "dropout:", params.dropout, "foundation_dir:", params.foundation_dir)
+
+    if params.results_csv and results is not None:
+        csv_path = params.results_csv
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(['base_model_ckpt', 'finetuned_model_ckpt',
+                                 'val_kappa', 'val_acc', 'val_f1',
+                                 'test_kappa', 'test_acc', 'test_f1'])
+            writer.writerow([
+                os.path.basename(params.foundation_dir),
+                os.path.basename(results['model_path']),
+                results['val_kappa'], results['val_acc'], results['val_f1'],
+                results['test_kappa'], results['test_acc'], results['test_f1'],
+            ])
+        print(f"Results appended to {csv_path}")
+
     print('Done!!!!!')
 
 

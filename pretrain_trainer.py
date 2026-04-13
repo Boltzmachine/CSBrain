@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn import MSELoss
 from tqdm import tqdm
 from utils.util import generate_mask
@@ -7,6 +8,7 @@ import os
 import wandb
 import time
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+from models.adversarial import SessionDiscriminator, construct_session_pairs
 
 def to_device(x, device):
     if isinstance(x, dict):
@@ -36,6 +38,15 @@ class Trainer(object):
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.params.lr,
                                            weight_decay=self.params.weight_decay)
+
+        # --- Adversarial session discriminator ---
+        self.adversarial_weight = getattr(self.params, 'adversarial_weight', 0.0)
+        if self.adversarial_weight > 0:
+            d_model = getattr(self.params, 'd_model', self.params.in_dim)
+            self.discriminator = SessionDiscriminator(d_model=d_model).to(self.device)
+            self.disc_optimizer = torch.optim.Adam(
+                self.discriminator.parameters(), lr=1e-3
+            )
 
         if self.params.lr_scheduler == 'CosineAnnealingLR':
             self.optimizer_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -160,6 +171,51 @@ class Trainer(object):
                     logs = {
                         "mask_loss": loss.data.cpu().numpy(),
                     }
+                # --- Adversarial session-agnostic training ---
+                if self.adversarial_weight > 0 and isinstance(out, tuple):
+                    global_rep = info.get('global_rep')
+                    session_ids = batch.get('session_id')
+                    if global_rep is not None and session_ids is not None:
+                        idx_a, idx_b, pair_labels = construct_session_pairs(
+                            session_ids, max_pairs=128
+                        )
+                        if len(idx_a) > 0:
+                            pair_labels = pair_labels.to(self.device)
+                            idx_a = idx_a.to(self.device)
+                            idx_b = idx_b.to(self.device)
+
+                            # Step 1: train discriminator (detached encoder)
+                            rep_det = global_rep.detach()
+                            disc_logits = self.discriminator(
+                                rep_det[idx_a], rep_det[idx_b]
+                            )
+                            disc_loss = F.binary_cross_entropy_with_logits(
+                                disc_logits, pair_labels
+                            )
+                            self.disc_optimizer.zero_grad()
+                            disc_loss.backward()
+                            self.disc_optimizer.step()
+
+                            # Step 2: adversarial loss for encoder (fool disc)
+                            for p in self.discriminator.parameters():
+                                p.requires_grad = False
+                            enc_logits = self.discriminator(
+                                global_rep[idx_a], global_rep[idx_b]
+                            )
+                            # flip labels: encoder should make disc wrong
+                            adv_loss = F.binary_cross_entropy_with_logits(
+                                enc_logits, 1.0 - pair_labels
+                            )
+                            loss = loss + self.adversarial_weight * adv_loss
+                            for p in self.discriminator.parameters():
+                                p.requires_grad = True
+
+                            with torch.no_grad():
+                                disc_acc = ((disc_logits > 0).float() == pair_labels).float().mean()
+                            logs["disc_loss"] = disc_loss.data.cpu().numpy()
+                            logs["disc_acc"] = disc_acc.data.cpu().numpy()
+                            logs["adv_loss"] = adv_loss.data.cpu().numpy()
+
                 loss.backward()
                 if self.params.clip_value > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)

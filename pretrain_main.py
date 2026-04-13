@@ -55,6 +55,9 @@ def main():
     parser.add_argument('--decorr_weight', type=float, default=0.1, help='decorrelation loss weight for source projector pretraining')
     parser.add_argument('--source_projector_ckpt', type=str, default=None, help='path to pre-trained source projector checkpoint')
     parser.add_argument('--freeze_source_projector', action='store_true', default=False, help='freeze source projector weights during stage 2')
+    parser.add_argument('--adversarial_weight', type=float, default=0.0, help='weight for adversarial session-agnostic loss (0 = disabled)')
+    parser.add_argument('--samples_per_session', type=int, default=8, help='samples per session in session-grouped batching')
+    parser.add_argument('--sessions_per_batch', type=int, default=16, help='number of distinct sessions per batch')
 
     params = parser.parse_args()
     print(params)
@@ -65,7 +68,7 @@ def main():
         params.batch_size = 4
 
     if params.dataset_dir == 'mix':
-        from datasets.cached_dataset import get_webdataset, collate_cached
+        from datasets.cached_dataset import get_webdataset, collate_cached, SessionGroupedLoader
         from torch.utils.data import ConcatDataset
         dataset_names = [
             # 'tueg/*.tar',
@@ -91,33 +94,57 @@ def main():
             params
         ) #resampled=True
 
-        n_batches_per_epoch = (n_samples_per_epoch + params.batch_size - 1) // params.batch_size
         num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
-        n_batches_per_epoch = (n_samples_per_epoch + params.batch_size - 1) // params.batch_size
-        batches_per_worker = math.ceil(n_batches_per_epoch / max(1, num_workers))
-        total_yielded_batches = batches_per_worker * max(1, num_workers)
 
-        pretrained_dataset = (
-            pretrained_dataset
-            .shuffle(5000)
-            # .repeat()
-            # .split_by_worker()
-            .batched(params.batch_size, partial=True, collation_fn=collate_cached)
-            .with_epoch(batches_per_worker)   # epoch length in yielded batches
-            .with_length(total_yielded_batches)
-        )
+        if params.adversarial_weight > 0:
+            # Session-grouped batching.
+            # WebDataset yields individual samples (no .batched());
+            # multi-worker DataLoader interleaves samples from different
+            # shards (different sessions); SessionGroupedLoader in the
+            # main process collects them into session-balanced batches.
+            effective_batch_size = params.samples_per_session * params.sessions_per_batch
+            n_batches_per_epoch = n_samples_per_epoch // effective_batch_size
+            samples_per_worker = math.ceil(n_samples_per_epoch / max(1, num_workers))
 
-        data_loader = DataLoader(
-            pretrained_dataset,
-            batch_size=None,#params.batch_size,
-            num_workers=num_workers,
-            # shuffle=True,
-            # collate_fn=collate_cached,
-            pin_memory=True,
-            # persistent_workers=True,
-        )
-        # for _ in range(10):
-        #     next(iter(data_loader))
+            pretrained_dataset = (
+                pretrained_dataset
+                .shuffle(2000)
+                .with_epoch(samples_per_worker)
+                .with_length(n_samples_per_epoch)
+            )
+
+            raw_loader = DataLoader(
+                pretrained_dataset,
+                batch_size=None,
+                num_workers=num_workers,
+                pin_memory=False,
+            )
+            data_loader = SessionGroupedLoader(
+                raw_loader,
+                samples_per_session=params.samples_per_session,
+                sessions_per_batch=params.sessions_per_batch,
+                collation_fn=collate_cached,
+                batches_per_epoch=n_batches_per_epoch,
+            )
+        else:
+            n_batches_per_epoch = (n_samples_per_epoch + params.batch_size - 1) // params.batch_size
+            batches_per_worker = math.ceil(n_batches_per_epoch / max(1, num_workers))
+            total_yielded_batches = batches_per_worker * max(1, num_workers)
+
+            pretrained_dataset = (
+                pretrained_dataset
+                .shuffle(5000)
+                .batched(params.batch_size, partial=True, collation_fn=collate_cached)
+                .with_epoch(batches_per_worker)
+                .with_length(total_yielded_batches)
+            )
+
+            data_loader = DataLoader(
+                pretrained_dataset,
+                batch_size=None,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
        
     else:
         pretrained_dataset = PretrainingDataset(

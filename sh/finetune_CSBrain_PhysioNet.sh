@@ -41,13 +41,20 @@ echo "Job started at $(date)" | tee -a "$LOG_FILE"
 #     --weight_decay  0.01 \
 #     --lr 0.00005 
 
+FOUNDATION_DIR="outputs/alljoined-adversarial/epoch38_loss4.8799238204956055.pth"
+CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
+EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
+WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}"
+
 python finetune_main.py \
-    --model Spectral \
+    --model Align \
     --downstream_dataset PhysioNet-MI \
     --datasets_dir data/preprocessed/physionet_mi \
     --num_of_classes 4 \
     --model_dir outputs/CSBrain/finetune_CSBrain_PhysioNet \
-    --foundation_dir outputs/Spectral-4band-3level-alljoned/epoch23_loss19.110177993774414.pth \
+    --foundation_dir "$FOUNDATION_DIR" \
+    --wandb_run_name "$WANDB_RUN_NAME" \
+    --results_csv outputs/finetune_results.csv \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --use_pretrained_weights \
     --in_dim 40 \

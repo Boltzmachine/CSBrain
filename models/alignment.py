@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.CSBrain_transformerlayer import *
 from models.CSBrain_transformer import *
+from models.adversarial import SessionDiscriminator
 from collections import Counter
 from collections import defaultdict
 
@@ -229,10 +230,12 @@ class CSBrainAlign(nn.Module):
     def __init__(self, in_dim=200, out_dim=200, d_model=200, dim_feedforward=800, seq_len=30, n_layer=12,
                  nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[],
                  causal=False, project_to_source=False, num_sources=32,
-                 source_projector_ckpt=None, freeze_source_projector=True):
+                 source_projector_ckpt=None, freeze_source_projector=True,
+                 adversarial_weight=0.0, num_sessions=256):
         super().__init__()
         self.causal = causal
-        self.project_to_source = project_to_source
+        self.project_to_source = project_to_source # Does not work
+        self.adversarial_weight = adversarial_weight
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
         self.source_projector = SourceProjector(
@@ -500,6 +503,9 @@ class CSBrainAlign(nn.Module):
                     for src, acc_list in contrastive_loss_per_source.items():
                         contrastive_loss[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
 
+        # Extract global token representation for adversarial training
+        global_rep = patch_emb[:, 0, 0, :] if self.add_global else patch_emb.mean(dim=(1, 2))
+
         if self.project_to_source:
             source_emb = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
             # Reconstruct back to sensor space for masked reconstruction loss
@@ -516,6 +522,7 @@ class CSBrainAlign(nn.Module):
 
         return out, {
             "rep": rep,
+            "global_rep": global_rep,
             # "zero_lag_sync_loss": (0.1, zero_lag_sync_loss),
             **contrastive_loss,
         }

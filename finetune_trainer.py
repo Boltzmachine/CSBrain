@@ -168,6 +168,11 @@ class Trainer(object):
             model_path = self.params.model_dir + "/epoch{}_acc_{:.5f}_kappa_{:.5f}_f1_{:.5f}.pth".format(best_f1_epoch, acc, kappa, f1)
             torch.save(self.model.state_dict(), model_path)
             print("model save in " + model_path)
+            return {
+                'val_kappa': kappa_best, 'val_acc': acc_best, 'val_f1': f1_best,
+                'test_kappa': kappa, 'test_acc': acc, 'test_f1': f1,
+                'model_path': model_path,
+            }
 
 
     def train_for_binaryclass(self):

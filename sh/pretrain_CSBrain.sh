@@ -27,19 +27,57 @@
 #     --dataset_dir mix \
 #     --run_name ours_all_zerosync_16
 
+# ============================================================
+# Stage 1: Pre-train source projector (reconstruction + decorrelation)
+# ============================================================
+# python pretrain_main.py \
+#     --model SourceProjector \
+#     --model_dir outputs/ \
+#     --dataset_dir mix \
+#     --batch_size 256 \
+#     --epochs 100 \
+#     --in_dim 40 \
+#     --seq_len 20 \
+#     --num_sources 32 \
+#     --decorr_weight 0.1 \
+#     --need_mask False \
+#     --run_name source_projector_pretrain2
+
+# ============================================================
+# Stage 2: Train full model with pre-trained source projector
+# ============================================================
+# python pretrain_main.py \
+#     --model Align \
+#     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
+#     --model_dir outputs/ \
+#     --dataset_dir mix \
+#     --batch_size 128 \
+#     --n_layer 24 \
+#     --in_dim 40 \
+#     --out_dim 40 \
+#     --d_model 40 \
+#     --seq_len 20 \
+#     --nhead 4 \
+#     --run_name alljoined-projector-freeze
+
+# ============================================================
+# Adversarial session-agnostic pretraining
+# ============================================================
 python pretrain_main.py \
     --model Align \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --model_dir outputs/ \
     --dataset_dir mix \
-    --batch_size 128 \
     --n_layer 24 \
     --in_dim 40 \
     --out_dim 40 \
-    --d_model 256 \
+    --d_model 40 \
     --seq_len 20 \
     --nhead 4 \
-    --run_name Align-alljoined-mask
+    --adversarial_weight 0.01 \
+    --samples_per_session 8 \
+    --sessions_per_batch 16 \
+    --run_name alljoined-1e-2-adversarial
 
 # python pretrain_main.py \
 #     --model LLMVQ \

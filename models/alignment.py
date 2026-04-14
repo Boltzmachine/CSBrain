@@ -1,4 +1,5 @@
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,84 @@ from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 from transformers import Dinov2Model
+
+
+# ---------------------------------------------------------------------------
+# Hemispheric flip utilities
+# ---------------------------------------------------------------------------
+
+def _normalize_ch_name(name):
+    """Normalize channel name: uppercase, strip common reference suffixes."""
+    name = name.upper().strip()
+    for suffix in ('-REF', '-LE', '-AR', '-AVG'):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    return name
+
+
+def _get_homologous_name(norm_name):
+    """Return the contralateral homologue of a normalized channel name.
+
+    Odd-numbered electrodes are left-hemisphere; even are right.
+    Midline channels (ending in 'Z') and channels without a trailing
+    digit map to themselves.
+    """
+    if norm_name in ('PAD', ''):
+        return norm_name
+    if norm_name.endswith('Z'):
+        return norm_name
+    # Split into alphabetic base and trailing number
+    m = re.match(r'^([A-Z]+)(\d+)$', norm_name)
+    if m is None:
+        return norm_name  # no trailing digit → identity
+    base, num_str = m.group(1), int(m.group(2))
+    pair_num = num_str + 1 if num_str % 2 == 1 else num_str - 1
+    return f'{base}{pair_num}'
+
+
+def build_flip_perm_batch(ch_names_batch, valid_channel_mask=None):
+    """Build a hemispheric-flip permutation for every sample in a batch.
+
+    Parameters
+    ----------
+    ch_names_batch : list[list[str]]
+        Per-sample channel name lists.
+    valid_channel_mask : (B, C) bool tensor, optional
+        ``False`` for padded / invalid channels.
+
+    Returns
+    -------
+    perm : (B, C) long tensor
+        ``perm[b, i]`` is the index of the channel whose *data* should
+        appear at position *i* after the hemispheric flip.  Midline and
+        unpaired channels map to themselves.
+    """
+    B = len(ch_names_batch)
+    C = max(len(names) for names in ch_names_batch)
+    perm = torch.arange(C, dtype=torch.long).unsqueeze(0).expand(B, -1).clone()
+
+    for b, ch_names in enumerate(ch_names_batch):
+        # normalised-name → original index  (valid channels only)
+        norm_to_idx = {}
+        for i, name in enumerate(ch_names):
+            if valid_channel_mask is not None and not valid_channel_mask[b, i]:
+                continue
+            norm = _normalize_ch_name(name)
+            if norm == 'PAD':
+                continue
+            norm_to_idx[norm] = i
+
+        for i, name in enumerate(ch_names):
+            if valid_channel_mask is not None and not valid_channel_mask[b, i]:
+                continue
+            norm = _normalize_ch_name(name)
+            if norm == 'PAD':
+                continue
+            pair_norm = _get_homologous_name(norm)
+            if pair_norm in norm_to_idx:
+                perm[b, i] = norm_to_idx[pair_norm]
+    return perm
 
 
 class SourceProjector(nn.Module):
@@ -231,11 +310,14 @@ class CSBrainAlign(nn.Module):
                  nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[],
                  causal=False, project_to_source=False, num_sources=32,
                  source_projector_ckpt=None, freeze_source_projector=True,
-                 adversarial_weight=0.0, num_sessions=256):
+                 adversarial_weight=0.0, num_sessions=256,
+                 equivariance_weight=0.0, info_max_weight=0.0):
         super().__init__()
         self.causal = causal
         self.project_to_source = project_to_source # Does not work
         self.adversarial_weight = adversarial_weight
+        self.equivariance_weight = equivariance_weight
+        self.info_max_weight = info_max_weight
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
         self.source_projector = SourceProjector(
@@ -325,6 +407,15 @@ class CSBrainAlign(nn.Module):
             nn.Linear(d_model, 768),
         )
 
+        # Equivariance projection head — discarded at fine-tuning so the
+        # backbone representation stays unconstrained.
+        if equivariance_weight > 0:
+            self.equiv_projector = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+
         self.apply(_weights_init)
 
         self.features_by_layer = []
@@ -395,9 +486,134 @@ class CSBrainAlign(nn.Module):
         return selected_hidden_states
 
 
+    # ------------------------------------------------------------------
+    # Hemispheric equivariance helpers
+    # ------------------------------------------------------------------
+
+    def _encode_to_global_rep(self, x, ch_coords,
+                              valid_channel_mask=None,
+                              valid_length_mask=None,
+                              mask=None):
+        """Lightweight encoder pass that returns only the global-token rep.
+
+        Mirrors the main ``forward`` pipeline but skips contrastive
+        learning, reconstruction output, and adversarial loss.
+        """
+        # --- source projection ---
+        if self.project_to_source:
+            if mask is not None:
+                x_in = x.clone()
+                x_in[mask == 1] = 0.0
+                x = self.source_projector(x_in, ch_coords,
+                                          valid_channel_mask=valid_channel_mask)
+            else:
+                x = self.source_projector(x, ch_coords,
+                                          valid_channel_mask=valid_channel_mask)
+            mask = None  # already applied
+
+        # --- spectral filtering ---
+        if not self.causal:
+            ts = x.view(x.size(0), x.size(1), -1)
+            spectral = torch.fft.rfft(ts, dim=-1, norm='forward')
+            freq_mask = torch.sigmoid(
+                self.freq_mask_logits[:1, :spectral.size(-1)])
+            ts = torch.fft.irfft(spectral * freq_mask.unsqueeze(0),
+                                 norm='forward')
+            x = ts.view_as(x)
+
+        # --- patch embedding ---
+        patch_emb = self.patch_embedding(x, mask)
+
+        # --- coordinate enhancement / source-space bookkeeping ---
+        if self.project_to_source:
+            b = patch_emb.size(0)
+            vcm = torch.ones(b, self.source_projector.num_sources,
+                             dtype=torch.bool, device=patch_emb.device)
+        else:
+            coord_pe, _ = self._spherical_positional_encoding(ch_coords)
+            coord_emb = self.coord_enhancement(coord_pe)
+            patch_emb = patch_emb + coord_emb.unsqueeze(2)
+            vcm = valid_channel_mask
+        vlm = valid_length_mask
+
+        # --- global tokens ---
+        if self.add_global:
+            patch_emb = torch.cat([
+                self.global_channel.expand(
+                    patch_emb.size(0), -1, patch_emb.size(2), -1),
+                patch_emb], dim=1)
+            patch_emb = torch.cat([
+                self.global_token.expand(
+                    patch_emb.size(0), patch_emb.size(1), -1, -1),
+                patch_emb], dim=2)
+            if vcm is not None:
+                vcm = torch.cat([
+                    torch.ones_like(vcm[:, :1], dtype=torch.bool), vcm
+                ], dim=1)
+            if vlm is not None:
+                vlm = torch.cat([
+                    torch.ones_like(vlm[:, :1], dtype=torch.bool), vlm
+                ], dim=1)
+
+        # --- transformer encoder (no contrastive branch) ---
+        for layer_idx in range(self.encoder.num_layers):
+            patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
+            patch_emb = self.encoder.layers[layer_idx](
+                patch_emb, self.area_config,
+                inter_window_attn_mask=(
+                    ~vlm if vlm is not None else None),
+                inter_region_attn_mask=(
+                    ~vcm if vcm is not None else None),
+            )
+
+        global_rep = (patch_emb[:, 0, 0, :]
+                      if self.add_global
+                      else patch_emb.mean(dim=(1, 2)))
+        return global_rep
+
+    @staticmethod
+    def _info_max_loss(z_inv, z_eq):
+        """VICReg-style regulariser preventing collapse of either subspace.
+
+        Returns a scalar combining:
+        * **variance**: per-dimension std across the batch ≥ 1
+        * **covariance**: off-diagonal covariance within each subspace → 0
+        * **cross-covariance**: covariance between the two subspaces → 0
+        """
+        def _var(z):
+            std = torch.sqrt(z.var(dim=0) + 1e-4)
+            return torch.clamp(1.0 - std, min=0).mean()
+
+        def _cov(z):
+            z_c = z - z.mean(dim=0)
+            N = max(z.size(0) - 1, 1)
+            cov = (z_c.T @ z_c) / N
+            off = cov - torch.diag(cov.diag())
+            return (off ** 2).sum() / z.size(-1)
+
+        var_loss = _var(z_inv) + _var(z_eq)
+        cov_loss = _cov(z_inv) + _cov(z_eq)
+
+        # cross-subspace decorrelation
+        inv_c = z_inv - z_inv.mean(dim=0)
+        eq_c = z_eq - z_eq.mean(dim=0)
+        N = max(z_inv.size(0) - 1, 1)
+        cross = (inv_c.T @ eq_c) / N
+        cross_loss = (cross ** 2).sum() / z_inv.size(-1)
+
+        return var_loss + cov_loss + cross_loss
+
+    # ------------------------------------------------------------------
+
     def forward(self, batch, mask=None):
         x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
         ch_coords = batch['ch_coords']
+
+        # Save originals before the batch dict gets mutated by global-token
+        # concatenation — needed for the equivariance second pass.
+        _orig_vcm = batch.get('valid_channel_mask')
+        _orig_vlm = batch.get('valid_length_mask')
+        _orig_mask = mask
 
         # --- Apply mask in sensor space, then project to source space ---
         if self.project_to_source:
@@ -520,11 +736,54 @@ class CSBrainAlign(nn.Module):
         rep = branch_embs # (B, K, N, d)
         #     rep = torch.cat([self.global_token.expand(out.size(0), -1, -1, -1), out], dim=2)
 
+        # ------------------------------------------------------------------
+        # Hemispheric equivariance loss  (only during training)
+        # ------------------------------------------------------------------
+        equiv_losses = {}
+        if self.training and self.equivariance_weight > 0:
+            ch_names = batch.get('ch_names')
+            if ch_names is not None:
+                x_raw = batch['timeseries']   # original (scaled) signal
+                B, C, T, d = x_raw.shape
+
+                flip_perm = build_flip_perm_batch(
+                    ch_names, _orig_vcm).to(x_raw.device)      # (B, C)
+                perm_exp = (flip_perm[:, :C]
+                            .unsqueeze(-1).unsqueeze(-1)
+                            .expand(-1, -1, T, d))
+                x_flip = torch.gather(x_raw, 1, perm_exp)
+
+                global_rep_flip = self._encode_to_global_rep(
+                    x_flip, ch_coords, _orig_vcm, _orig_vlm, _orig_mask)
+
+                # Project into the equivariance-specific space so the
+                # inv/eq split lives in the projector (discarded at
+                # fine-tuning), not in the backbone representation.
+                z      = self.equiv_projector(global_rep)
+                z_flip = self.equiv_projector(global_rep_flip)
+
+                half = z.size(-1) // 2
+                z_inv,   z_eq   = z[:, :half],      z[:, half:]
+                z_inv_f, z_eq_f = z_flip[:, :half],  z_flip[:, half:]
+
+                # Invariant half should be identical; equivariant half should negate
+                equiv_loss = (F.mse_loss(z_inv_f, z_inv)
+                              + F.mse_loss(z_eq_f, -z_eq))
+                equiv_losses["equiv_loss"] = (
+                    self.equivariance_weight, equiv_loss)
+
+                # VICReg-style collapse prevention
+                if self.info_max_weight > 0:
+                    info_loss = self._info_max_loss(z_inv, z_eq)
+                    equiv_losses["info_max_loss"] = (
+                        self.info_max_weight, info_loss)
+
         return out, {
             "rep": rep,
             "global_rep": global_rep,
             # "zero_lag_sync_loss": (0.1, zero_lag_sync_loss),
             **contrastive_loss,
+            **equiv_losses,
         }
     
     def training_step(self, *args, **kwargs):

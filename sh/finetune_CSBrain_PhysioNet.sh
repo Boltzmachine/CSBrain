@@ -41,7 +41,7 @@ echo "Job started at $(date)" | tee -a "$LOG_FILE"
 #     --weight_decay  0.01 \
 #     --lr 0.00005 
 
-FOUNDATION_DIR="outputs/alljoined-adversarial/epoch38_loss4.8799238204956055.pth"
+FOUNDATION_DIR="outputs/alljoined-swap-1e-8/epoch21_loss4.786162853240967.pth"
 CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
 EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
 WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}"

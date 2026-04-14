@@ -47,6 +47,8 @@ def get_model(params, brain_regions, sorted_indices):
             source_projector_ckpt=getattr(params, 'source_projector_ckpt', None),
             freeze_source_projector=getattr(params, 'freeze_source_projector', True),
             adversarial_weight=getattr(params, 'adversarial_weight', 0.0),
+            equivariance_weight=getattr(params, 'equivariance_weight', 0.0),
+            info_max_weight=getattr(params, 'info_max_weight', 0.0),
         )
     elif params.model == 'Spectral':
         from .spectral_alignment import CSBrainSpectral

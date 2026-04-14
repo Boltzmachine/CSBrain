@@ -74,10 +74,12 @@ python pretrain_main.py \
     --d_model 40 \
     --seq_len 20 \
     --nhead 4 \
-    --adversarial_weight 0.01 \
+    --equivariance_weight 1.0 \
+    --info_max_weight 0.0 \
+    --adversarial_weight 0.0 \
     --samples_per_session 8 \
     --sessions_per_batch 16 \
-    --run_name alljoined-1e-2-adversarial
+    --run_name alljoined-swap-1e-8
 
 # python pretrain_main.py \
 #     --model LLMVQ \

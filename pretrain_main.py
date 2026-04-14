@@ -58,6 +58,8 @@ def main():
     parser.add_argument('--adversarial_weight', type=float, default=0.0, help='weight for adversarial session-agnostic loss (0 = disabled)')
     parser.add_argument('--samples_per_session', type=int, default=8, help='samples per session in session-grouped batching')
     parser.add_argument('--sessions_per_batch', type=int, default=16, help='number of distinct sessions per batch')
+    parser.add_argument('--equivariance_weight', type=float, default=0.0, help='weight for hemispheric equivariance loss (0 = disabled)')
+    parser.add_argument('--info_max_weight', type=float, default=0.0, help='weight for VICReg-style info-max regulariser on inv/eq subspaces (0 = disabled)')
 
     params = parser.parse_args()
     print(params)

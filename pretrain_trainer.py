@@ -36,7 +36,11 @@ class Trainer(object):
 
         self.data_length = len(self.data_loader)
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.params.lr,
+        # Only optimise parameters that require gradients (teacher params
+        # in DINOEEGModel are frozen).
+        trainable_params = [p for p in self.model.parameters()
+                            if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(trainable_params, lr=self.params.lr,
                                            weight_decay=self.params.weight_decay)
 
         # --- Adversarial session discriminator ---
@@ -72,11 +76,24 @@ class Trainer(object):
 
         print(self.model)
 
+    def _get_dino_model(self):
+        """Return the underlying DINOEEGModel if wrapped, else None."""
+        m = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(m, 'update_teacher'):
+            return m
+        return None
+
     def train(self):
         best_loss = 10000
+        total_iters = self.params.epochs * self.data_length
+        teacher_temp_warmup_iters = (
+            getattr(self.params, 'teacher_temp_warmup_epochs', 30)
+            * self.data_length
+        )
+
         for epoch in range(self.params.epochs):
             losses = []
-            for x in tqdm(self.data_loader, mininterval=10):
+            for batch_idx, x in enumerate(tqdm(self.data_loader, mininterval=10)):
                 self.optimizer.zero_grad()
                 if True:#self.params.model != 'CSBrain':
                     if isinstance(x, dict):
@@ -103,13 +120,15 @@ class Trainer(object):
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
 
-                        # Next-patch prediction: output at t predicts input at t+1
-                        # y: (B, n_ch, seq_len, patch_size), x: (B, n_ch, seq_len, patch_size)
-                        pred = y[:, :, :-1, :]   # predictions from t=0..T-2
-                        target = x[:, :, 1:, :]  # targets from t=1..T-1
-                        causal_loss = self.criterion(pred, target)
-                        loss = causal_loss + sum(loss_dict.values())
-                        logs["causal_loss"] = causal_loss.data.cpu().numpy()
+                        if info.get('dino_mode', False):
+                            # DINO replaces the primary causal loss
+                            loss = sum(loss_dict.values())
+                        else:
+                            pred = y[:, :, :-1, :]
+                            target = x[:, :, 1:, :]
+                            causal_loss = self.criterion(pred, target)
+                            loss = causal_loss + sum(loss_dict.values())
+                            logs["causal_loss"] = causal_loss.data.cpu().numpy()
                     elif self.params.need_mask:
                         bz, ch_num, patch_num, patch_size = x.shape
                         mask = generate_mask(
@@ -129,13 +148,15 @@ class Trainer(object):
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
 
-                        masked_x = x[mask == 1]
-                        masked_y = y[mask == 1]
-                        mask_loss = self.criterion(masked_y, masked_x)
-                        # recon_loss = self.criterion(y, x)
-                        loss = mask_loss + sum(loss_dict.values())
-                        # loss = sum(loss_dict.values())
-                        logs["mask_loss"] = mask_loss.data.cpu().numpy()
+                        if info.get('dino_mode', False):
+                            # DINO + iBOT replace the masked reconstruction loss
+                            loss = sum(loss_dict.values())
+                        else:
+                            masked_x = x[mask == 1]
+                            masked_y = y[mask == 1]
+                            mask_loss = self.criterion(masked_y, masked_x)
+                            loss = mask_loss + sum(loss_dict.values())
+                            logs["mask_loss"] = mask_loss.data.cpu().numpy()
                     else:
                         out = self.model.training_step(batch, mask=None)
 
@@ -221,6 +242,19 @@ class Trainer(object):
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
                 self.optimizer.step()
                 self.optimizer_scheduler.step()
+
+                # --- DINOv2 EMA teacher update & schedule step ---
+                dino_model = self._get_dino_model()
+                if dino_model is not None:
+                    iteration = epoch * self.data_length + batch_idx
+                    momentum = dino_model.get_ema_momentum(
+                        iteration, total_iters)
+                    dino_model.update_teacher(momentum)
+                    dino_model.update_schedules(
+                        iteration, total_iters, teacher_temp_warmup_iters)
+                    logs["ema_momentum"] = momentum
+                    logs["teacher_temp"] = dino_model.dino_criterion.teacher_temp
+
                 losses.append(loss.data.cpu().numpy())
                 wandb.log({
                     **logs,

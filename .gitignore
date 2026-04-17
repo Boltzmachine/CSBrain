@@ -2,6 +2,11 @@ wandb/
 outputs/
 data/
 
+.codex
+.vscode/
+Alljoined-1.6M/
+data
+figs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

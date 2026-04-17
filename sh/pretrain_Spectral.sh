@@ -18,7 +18,7 @@ python pretrain_main.py \
     --n_layer 24 \
     --in_dim 40 \
     --out_dim 40 \
-    --d_model 256 \
+    --d_model 40 \
     --seq_len 20 \
     --nhead 4 \
-    --run_name Spectral-4band-3level-256d
+    --run_name Spectral-4band-3level-40d

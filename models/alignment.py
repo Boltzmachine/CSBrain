@@ -311,13 +311,15 @@ class CSBrainAlign(nn.Module):
                  causal=False, project_to_source=False, num_sources=32,
                  source_projector_ckpt=None, freeze_source_projector=True,
                  adversarial_weight=0.0, num_sessions=256,
-                 equivariance_weight=0.0, info_max_weight=0.0):
+                 equivariance_weight=0.0, info_max_weight=0.0,
+                 alignment_weight=1.0):
         super().__init__()
         self.causal = causal
         self.project_to_source = project_to_source # Does not work
         self.adversarial_weight = adversarial_weight
         self.equivariance_weight = equivariance_weight
         self.info_max_weight = info_max_weight
+        self.alignment_weight = alignment_weight
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
         self.source_projector = SourceProjector(
@@ -487,18 +489,26 @@ class CSBrainAlign(nn.Module):
 
 
     # ------------------------------------------------------------------
-    # Hemispheric equivariance helpers
+    # Encode — lightweight forward returning CLS + patch tokens
     # ------------------------------------------------------------------
 
-    def _encode_to_global_rep(self, x, ch_coords,
-                              valid_channel_mask=None,
-                              valid_length_mask=None,
-                              mask=None):
-        """Lightweight encoder pass that returns only the global-token rep.
+    def encode(self, batch, mask=None):
+        """Encoder-only pass returning CLS token and patch-level tokens.
 
         Mirrors the main ``forward`` pipeline but skips contrastive
-        learning, reconstruction output, and adversarial loss.
+        learning, reconstruction output, equivariance, and adversarial
+        losses.  Used by the DINOv2 teacher and by the equivariance
+        loss helper.
+
+        Returns:
+            cls_token:    (B, d_model)
+            patch_tokens: (B, C, N, d_model) — global tokens stripped
         """
+        x = batch['timeseries']
+        ch_coords = batch['ch_coords']
+        valid_channel_mask = batch.get('valid_channel_mask')
+        valid_length_mask = batch.get('valid_length_mask')
+
         # --- source projection ---
         if self.project_to_source:
             if mask is not None:
@@ -566,10 +576,30 @@ class CSBrainAlign(nn.Module):
                     ~vcm if vcm is not None else None),
             )
 
-        global_rep = (patch_emb[:, 0, 0, :]
-                      if self.add_global
-                      else patch_emb.mean(dim=(1, 2)))
-        return global_rep
+        cls_token = (patch_emb[:, 0, 0, :]
+                     if self.add_global
+                     else patch_emb.mean(dim=(1, 2)))
+        patch_tokens = (patch_emb[:, 1:, 1:, :]
+                        if self.add_global
+                        else patch_emb)
+        return cls_token, patch_tokens
+
+    # ------------------------------------------------------------------
+    # Hemispheric equivariance helpers
+    # ------------------------------------------------------------------
+
+    def _encode_to_global_rep(self, x, ch_coords,
+                              valid_channel_mask=None,
+                              valid_length_mask=None,
+                              mask=None):
+        """Return only the global-token representation (backward compat)."""
+        _batch = {'timeseries': x, 'ch_coords': ch_coords}
+        if valid_channel_mask is not None:
+            _batch['valid_channel_mask'] = valid_channel_mask
+        if valid_length_mask is not None:
+            _batch['valid_length_mask'] = valid_length_mask
+        cls_token, _ = self.encode(_batch, mask=mask)
+        return cls_token
 
     @staticmethod
     def _info_max_loss(z_inv, z_eq):
@@ -671,7 +701,7 @@ class CSBrainAlign(nn.Module):
                     branch_embs = patch_emb[has_image] # (B_with_image, K, N, d)
                 else:
                     branch_embs = patch_emb
-                if 'image_encoder_inputs' in batch and has_image.any():
+                if 'image_encoder_inputs' in batch and has_image.any() and self.alignment_weight > 0:
                     image_encoder_inputs = {k: v[has_image] for k, v in batch['image_encoder_inputs'].items()}
                     if self.add_global:
                         semantic_emb = self.semantic_readout(branch_embs[:, 0, 0, :])
@@ -697,7 +727,7 @@ class CSBrainAlign(nn.Module):
                     loss_i2p = F.cross_entropy(logits.t(), targets)
                     branch_loss = 0.5 * (loss_p2i + loss_i2p)
 
-                    contrastive_loss[f"contrastive_loss_{i_branch}"] = (1.0, branch_loss)
+                    contrastive_loss[f"contrastive_loss_{i_branch}"] = (self.alignment_weight, branch_loss)
                     with torch.no_grad():
                         pred_to_img = logits.argmax(dim=1)
                         img_to_pred = logits.argmax(dim=0)
@@ -719,8 +749,9 @@ class CSBrainAlign(nn.Module):
                     for src, acc_list in contrastive_loss_per_source.items():
                         contrastive_loss[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
 
-        # Extract global token representation for adversarial training
+        # Extract global token and patch-level representations
         global_rep = patch_emb[:, 0, 0, :] if self.add_global else patch_emb.mean(dim=(1, 2))
+        patch_tokens = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
 
         if self.project_to_source:
             source_emb = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
@@ -781,6 +812,7 @@ class CSBrainAlign(nn.Module):
         return out, {
             "rep": rep,
             "global_rep": global_rep,
+            "patch_tokens": patch_tokens,
             # "zero_lag_sync_loss": (0.1, zero_lag_sync_loss),
             **contrastive_loss,
             **equiv_losses,

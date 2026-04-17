@@ -13,11 +13,25 @@ class CustomDataset(Dataset):
             self,
             data_dir,
             mode='train',
+            flip_aug=False,
     ):
         super(CustomDataset, self).__init__()
         self.db = lmdb.open(data_dir, readonly=True, lock=False, readahead=True, meminit=False)
         with self.db.begin(write=False) as txn:
             self.keys = pickle.loads(txn.get('__keys__'.encode()))[mode]
+
+        # Hemisphere-flip augmentation (training only).
+        # Swaps homologous electrode pairs and relabels left↔right fist.
+        self.flip_aug = flip_aug and mode == 'train'
+        if self.flip_aug:
+            from models.alignment import build_flip_perm_batch
+            with self.db.begin(write=False) as txn:
+                pair = pickle.loads(txn.get(self.keys[0].encode()))
+            self.flip_perm = build_flip_perm_batch(
+                [pair['ch_names']])[0].numpy()
+            # PhysioNet-MI labels: 0=left fist, 1=right fist,
+            #                      2=both fists, 3=both feet
+            self._label_flip = {0: 1, 1: 0}
 
     def __len__(self):
         return len((self.keys))
@@ -29,11 +43,13 @@ class CustomDataset(Dataset):
         data = pair['sample']
         label = pair['label']
 
+        # --- hemisphere-flip augmentation ---
+        if self.flip_aug and random.random() < 0.5:
+            data = data[self.flip_perm]
+            label = self._label_flip.get(label, label)
+
         ch_coords = _to_spherical(pair["ch_coords"])
         ch_names = pair["ch_names"]
-        # print(key)
-        # print(data)
-        # print(label)
         return {
             'x': data/100,
             'y': label,
@@ -56,9 +72,11 @@ class LoadDataset(object):
     def __init__(self, params):
         self.params = params
         self.datasets_dir = params.datasets_dir
+        self.flip_aug = getattr(params, 'hemisphere_flip_aug', False)
 
     def get_data_loader(self):
-        train_set = CustomDataset(self.datasets_dir, mode='train')
+        train_set = CustomDataset(self.datasets_dir, mode='train',
+                                  flip_aug=self.flip_aug)
         val_set = CustomDataset(self.datasets_dir, mode='val')
         test_set = CustomDataset(self.datasets_dir, mode='test')
         print(len(train_set), len(val_set), len(test_set))

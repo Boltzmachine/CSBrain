@@ -49,6 +49,7 @@ def get_model(params, brain_regions, sorted_indices):
             adversarial_weight=getattr(params, 'adversarial_weight', 0.0),
             equivariance_weight=getattr(params, 'equivariance_weight', 0.0),
             info_max_weight=getattr(params, 'info_max_weight', 0.0),
+            alignment_weight=getattr(params, 'alignment_weight', 1.0),
         )
     elif params.model == 'Spectral':
         from .spectral_alignment import CSBrainSpectral
@@ -80,5 +81,32 @@ def get_model(params, brain_regions, sorted_indices):
         )
     else:
         raise ValueError(f"Unknown model type: {params.model}")
-    
+
+    # --- Wrap with DINOv2 self-distillation if requested ---
+    if getattr(params, 'dino_mode', False):
+        from .dino_eeg import DINOEEGModel
+        model = DINOEEGModel(
+            student_backbone=model,
+            d_model=getattr(params, 'd_model', params.in_dim),
+            dino_head_hidden_dim=getattr(params, 'dino_head_hidden_dim', 256),
+            dino_head_bottleneck_dim=getattr(params, 'dino_head_bottleneck_dim', 64),
+            n_prototypes=getattr(params, 'n_prototypes', 4096),
+            dino_head_n_layers=getattr(params, 'dino_head_n_layers', 3),
+            student_temp=getattr(params, 'student_temp', 0.1),
+            teacher_temp_base=getattr(params, 'teacher_temp_base', 0.04),
+            teacher_temp_final=getattr(params, 'teacher_temp_final', 0.07),
+            ema_momentum_base=getattr(params, 'ema_momentum_base', 0.992),
+            ema_momentum_final=getattr(params, 'ema_momentum_final', 1.0),
+            dino_loss_weight=getattr(params, 'dino_loss_weight', 1.0),
+            ibot_loss_weight=getattr(params, 'ibot_loss_weight', 1.0),
+            koleo_loss_weight=getattr(params, 'koleo_loss_weight', 0.1),
+            use_freq_subband=getattr(params, 'use_freq_subband', False),
+            freq_n_bands=getattr(params, 'freq_n_bands', 5),
+            freq_min_bands=getattr(params, 'freq_min_bands', 1),
+            freq_max_bands=getattr(params, 'freq_max_bands', None),
+            n_local_crops=getattr(params, 'n_local_crops', 4),
+            local_crop_time_scale=eval(getattr(params, 'local_crop_time_scale', '(0.3, 0.7)')),
+            local_crop_channel_scale=eval(getattr(params, 'local_crop_channel_scale', '(0.5, 1.0)')),
+        )
+
     return model

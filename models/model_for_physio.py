@@ -71,18 +71,56 @@ class Model(nn.Module):
         self.backbone = get_model(param, brain_regions, sorted_indices)
 
         if param.use_pretrained_weights:
-            map_location = torch.device(f'cuda:{param.cuda}')
+            map_location = "cuda" if torch.cuda.is_available() else "cpu"
             state_dict = torch.load(param.foundation_dir, map_location=map_location)
-            # Remove "module." prefix
-            new_state_dict = {key.replace("module.", ""): value for key, value in state_dict.items()}
+
+            # --- Normalise key prefixes ---
+            # DataParallel wrapping
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+            # --- Handle DINO-pretrained checkpoints ---
+            # The teacher (EMA-smoothed) produces better representations than
+            # the student, so we load teacher weights for finetuning.
+            is_dino_ckpt = any(k.startswith("teacher.") for k in state_dict)
+            if is_dino_ckpt:
+                # Extract teacher backbone weights and strip the "teacher." prefix
+                teacher_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith("teacher."):
+                        teacher_dict[k[len("teacher."):]] = v
+                state_dict = teacher_dict
+
+                # Remove DINO-only keys that don't belong to the backbone
+                dino_prefixes = (
+                    "student_dino_head.",
+                    "teacher_dino_head.",
+                    "student_ibot_head.",
+                    "teacher_ibot_head.",
+                    "dino_criterion.",
+                    "ibot_criterion.",
+                    "freq_subband_view.",
+                )
+                for prefix in dino_prefixes:
+                    for k in [k for k in state_dict if k.startswith(prefix)]:
+                        del state_dict[k]
+
+            if is_dino_ckpt:
+                # The teacher had these modules deleted to save GPU memory
+                # during DINO training, so they won't be in the checkpoint.
+                # Remove them from the backbone before loading.
+                for attr in ('pretrained_image_encoder', 'semantic_readout',
+                             'contrastive_proj', 'equiv_projector'):
+                    if hasattr(self.backbone, attr):
+                        delattr(self.backbone, attr)
+
+            missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
             
-            model_state_dict = self.backbone.state_dict()
-
-            # Filter matching weights by shape
-            matching_dict = new_state_dict#{k: v for k, v in new_state_dict.items() if k in model_state_dict and v.size() == model_state_dict[k].size()}
-
-            model_state_dict.update(matching_dict)
-            self.backbone.load_state_dict(model_state_dict, strict=True)
+            for unexpected_key in unexpected_keys:
+                if "equiv_projector" not in unexpected_key:
+                    raise ValueError(f"UNEXPECTED KEY {unexpected_key}")
+            
+            if len(missing_keys) > 0:
+                raise
 
         self.backbone.proj_out = nn.Identity()
 

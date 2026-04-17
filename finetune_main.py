@@ -66,6 +66,8 @@ def main():
     parser.add_argument('--project_to_source', action='store_true', default=False, help='project sensors to source space before transformer')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name')
     parser.add_argument('--results_csv', type=str, default=None, help='path to CSV file for logging results')
+    parser.add_argument('--hemisphere_flip_aug', action='store_true', default=False,
+                        help='hemisphere-flip data augmentation with label swap (motor imagery)')
 
         
 
@@ -75,7 +77,7 @@ def main():
     print(params)
 
     setup_seed(params.seed)
-    torch.cuda.set_device(params.cuda)
+    # torch.cuda.set_device(params.cuda)
     print('The downstream dataset is {}'.format(params.downstream_dataset))
     wandb.init(project='CSBrain_finetune', group=f"{params.downstream_dataset}", name=params.wandb_run_name)
     results = None
@@ -188,7 +190,7 @@ def main():
                                  'val_kappa', 'val_acc', 'val_f1',
                                  'test_kappa', 'test_acc', 'test_f1'])
             writer.writerow([
-                os.path.basename(params.foundation_dir),
+                os.path.join(os.path.basename(os.path.dirname(params.foundation_dir)), os.path.basename(params.foundation_dir)),
                 os.path.basename(results['model_path']),
                 results['val_kappa'], results['val_acc'], results['val_f1'],
                 results['test_kappa'], results['test_acc'], results['test_f1'],

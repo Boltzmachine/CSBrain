@@ -62,18 +62,26 @@ def main():
     parser.add_argument('--info_max_weight', type=float, default=0.0, help='weight for VICReg-style info-max regulariser on inv/eq subspaces (0 = disabled)')
     parser.add_argument('--alignment_weight', type=float, default=1.0, help='weight for EEG-image contrastive alignment loss (0 = disabled)')
 
+    # --- SSM/Mamba multi-frequency patch embedding ---
+    parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'], help='patch embedder: CNN (default) or multi-frequency Mamba SSM')
+    parser.add_argument('--mamba_band_periods', type=str, default=None, help='list of band sample periods, e.g. "[200,600,1200]"; default [in_dim, 3*in_dim, 6*in_dim]')
+    parser.add_argument('--n_mamba_layers', type=int, default=2, help='number of stacked Mamba blocks in the patch embedder')
+    parser.add_argument('--mamba_d_state', type=int, default=16, help='Mamba state dimension')
+    parser.add_argument('--mamba_d_conv', type=int, default=4, help='Mamba depthwise conv width')
+    parser.add_argument('--mamba_expand', type=int, default=2, help='Mamba expansion factor')
+
     # --- DINOv2 self-distillation ---
     parser.add_argument('--dino_mode', action='store_true', default=False, help='enable DINOv2 self-distillation (replaces masked reconstruction)')
     parser.add_argument('--n_prototypes', type=int, default=4096, help='number of prototype vectors in DINO heads')
     parser.add_argument('--dino_head_hidden_dim', type=int, default=256, help='DINO head MLP hidden dimension')
-    parser.add_argument('--dino_head_bottleneck_dim', type=int, default=64, help='DINO head bottleneck dimension before prototype layer')
+    parser.add_argument('--dino_head_bottleneck_dim', type=int, default=256, help='DINO head bottleneck dimension before prototype layer')
     parser.add_argument('--dino_head_n_layers', type=int, default=3, help='number of MLP layers in DINO head')
     parser.add_argument('--student_temp', type=float, default=0.1, help='student softmax temperature')
     parser.add_argument('--teacher_temp_base', type=float, default=0.04, help='teacher temperature (initial)')
     parser.add_argument('--teacher_temp_final', type=float, default=0.07, help='teacher temperature (after warmup)')
     parser.add_argument('--teacher_temp_warmup_epochs', type=int, default=30, help='epochs to linearly warm up teacher temperature')
     parser.add_argument('--ema_momentum_base', type=float, default=0.992, help='EMA momentum for teacher (initial)')
-    parser.add_argument('--ema_momentum_final', type=float, default=1.0, help='EMA momentum for teacher (final)')
+    parser.add_argument('--ema_momentum_final', type=float, default=0.9995, help='EMA momentum for teacher (final)')
     parser.add_argument('--dino_loss_weight', type=float, default=1.0, help='weight for DINO CLS-token distillation loss')
     parser.add_argument('--ibot_loss_weight', type=float, default=1.0, help='weight for iBOT masked-patch distillation loss')
     parser.add_argument('--koleo_loss_weight', type=float, default=0.1, help='weight for KoLeo diversity loss')
@@ -81,6 +89,8 @@ def main():
     parser.add_argument('--freq_n_bands', type=int, default=5, help='number of frequency bands to divide the spectrum into')
     parser.add_argument('--freq_min_bands', type=int, default=1, help='minimum number of bands to keep in sub-band view')
     parser.add_argument('--freq_max_bands', type=int, default=None, help='maximum number of bands to keep (default: all)')
+    parser.add_argument('--last_layer_freeze_iters', type=int, default=1250, help='freeze weight-norm magnitude of prototype layer for this many initial iterations (0 = never freeze)')
+    parser.add_argument('--lr_warmup_iters', type=int, default=0, help='linear LR warmup iterations (0 = disabled)')
     # Multi-crop
     parser.add_argument('--n_local_crops', type=int, default=4, help='number of local EEG crops for DINO CLS loss (0 = single-view)')
     parser.add_argument('--local_crop_time_scale', type=str, default='(0.3, 0.7)', help='(min, max) fraction of time patches in local crops')

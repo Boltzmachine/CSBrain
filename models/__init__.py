@@ -36,6 +36,9 @@ def get_model(params, brain_regions, sorted_indices):
         )
     elif params.model == 'Align':
         from .alignment import CSBrainAlign
+        _mbp = getattr(params, 'mamba_band_periods', None)
+        if isinstance(_mbp, str) and _mbp:
+            _mbp = eval(_mbp)
         model = CSBrainAlign(
             params.in_dim, params.out_dim, params.d_model, params.dim_feedforward, params.seq_len, params.n_layer,
             params.nhead,
@@ -50,6 +53,12 @@ def get_model(params, brain_regions, sorted_indices):
             equivariance_weight=getattr(params, 'equivariance_weight', 0.0),
             info_max_weight=getattr(params, 'info_max_weight', 0.0),
             alignment_weight=getattr(params, 'alignment_weight', 1.0),
+            patch_embed_type=getattr(params, 'patch_embed_type', 'cnn'),
+            mamba_band_periods=_mbp,
+            n_mamba_layers=getattr(params, 'n_mamba_layers', 2),
+            mamba_d_state=getattr(params, 'mamba_d_state', 16),
+            mamba_d_conv=getattr(params, 'mamba_d_conv', 4),
+            mamba_expand=getattr(params, 'mamba_expand', 2),
         )
     elif params.model == 'Spectral':
         from .spectral_alignment import CSBrainSpectral
@@ -89,14 +98,14 @@ def get_model(params, brain_regions, sorted_indices):
             student_backbone=model,
             d_model=getattr(params, 'd_model', params.in_dim),
             dino_head_hidden_dim=getattr(params, 'dino_head_hidden_dim', 256),
-            dino_head_bottleneck_dim=getattr(params, 'dino_head_bottleneck_dim', 64),
+            dino_head_bottleneck_dim=getattr(params, 'dino_head_bottleneck_dim', 256),
             n_prototypes=getattr(params, 'n_prototypes', 4096),
             dino_head_n_layers=getattr(params, 'dino_head_n_layers', 3),
             student_temp=getattr(params, 'student_temp', 0.1),
             teacher_temp_base=getattr(params, 'teacher_temp_base', 0.04),
             teacher_temp_final=getattr(params, 'teacher_temp_final', 0.07),
             ema_momentum_base=getattr(params, 'ema_momentum_base', 0.992),
-            ema_momentum_final=getattr(params, 'ema_momentum_final', 1.0),
+            ema_momentum_final=getattr(params, 'ema_momentum_final', 0.9995),
             dino_loss_weight=getattr(params, 'dino_loss_weight', 1.0),
             ibot_loss_weight=getattr(params, 'ibot_loss_weight', 1.0),
             koleo_loss_weight=getattr(params, 'koleo_loss_weight', 0.1),
@@ -107,6 +116,7 @@ def get_model(params, brain_regions, sorted_indices):
             n_local_crops=getattr(params, 'n_local_crops', 4),
             local_crop_time_scale=eval(getattr(params, 'local_crop_time_scale', '(0.3, 0.7)')),
             local_crop_channel_scale=eval(getattr(params, 'local_crop_channel_scale', '(0.5, 1.0)')),
+            last_layer_freeze_iters=getattr(params, 'last_layer_freeze_iters', 1250),
         )
 
     return model

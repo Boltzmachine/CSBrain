@@ -312,7 +312,10 @@ class CSBrainAlign(nn.Module):
                  source_projector_ckpt=None, freeze_source_projector=True,
                  adversarial_weight=0.0, num_sessions=256,
                  equivariance_weight=0.0, info_max_weight=0.0,
-                 alignment_weight=1.0):
+                 alignment_weight=1.0,
+                 patch_embed_type='cnn',
+                 mamba_band_periods=None, n_mamba_layers=2,
+                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2):
         super().__init__()
         self.causal = causal
         self.project_to_source = project_to_source # Does not work
@@ -320,6 +323,7 @@ class CSBrainAlign(nn.Module):
         self.equivariance_weight = equivariance_weight
         self.info_max_weight = info_max_weight
         self.alignment_weight = alignment_weight
+        self.patch_embed_type = patch_embed_type
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
         self.source_projector = SourceProjector(
@@ -335,7 +339,18 @@ class CSBrainAlign(nn.Module):
                 p.requires_grad = False
             print("Source projector weights frozen")
 
-        self.patch_embedding = PatchEmbedding(in_dim, out_dim, d_model, seq_len, causal=causal)
+        if patch_embed_type == 'mamba':
+            self.patch_embedding = MambaPatchEmbedding(
+                in_dim, out_dim, d_model, seq_len,
+                band_periods=mamba_band_periods,
+                n_mamba_layers=n_mamba_layers,
+                d_state=mamba_d_state, d_conv=mamba_d_conv,
+                expand=mamba_expand, causal=causal,
+            )
+        elif patch_embed_type == 'cnn':
+            self.patch_embedding = PatchEmbedding(in_dim, out_dim, d_model, seq_len, causal=causal)
+        else:
+            raise ValueError(f"Unknown patch_embed_type: {patch_embed_type}")
 
         self.TemEmbed_kernel_sizes = TemEmbed_kernel_sizes
         kernel_sizes = self.TemEmbed_kernel_sizes
@@ -545,6 +560,8 @@ class CSBrainAlign(nn.Module):
             patch_emb = patch_emb + coord_emb.unsqueeze(2)
             vcm = valid_channel_mask
         vlm = valid_length_mask
+        if self.patch_embed_type == 'mamba':
+            vlm = self.patch_embedding.adapt_valid_length_mask(vlm)
 
         # --- global tokens ---
         if self.add_global:
@@ -667,7 +684,14 @@ class CSBrainAlign(nn.Module):
             branch_time = torch.fft.irfft(branch_spectral, norm='forward') # (n_branch, B, n_ch, seq_len)
             x = branch_time.view_as(x)
 
+        # Remember base N before patch embedding so we can map the
+        # interleaved multi-band tokens back to per-patch reconstructions.
+        base_N = x.size(2)
         patch_emb = self.patch_embedding(x, mask)
+
+        if self.patch_embed_type == 'mamba' and 'valid_length_mask' in batch:
+            batch['valid_length_mask'] = self.patch_embedding.adapt_valid_length_mask(
+                batch['valid_length_mask'])
 
         if self.project_to_source:
             # Sources are always valid (no padding in source dim)
@@ -764,6 +788,14 @@ class CSBrainAlign(nn.Module):
             if self.add_global:
                 out = out[:, 1:, 1:, :]
 
+        # For mamba patch embed, the token axis is multi-band interleaved.
+        # Keep only the base-band (f1) positions so downstream reconstruction
+        # indexing (mask has shape (B, C, N)) still lines up.
+        if self.patch_embed_type == 'mamba':
+            f1_pos = self.patch_embedding.base_band_positions(base_N)
+            f1_idx = torch.tensor(f1_pos, device=out.device, dtype=torch.long)
+            out = out.index_select(2, f1_idx)
+
         rep = branch_embs # (B, K, N, d)
         #     rep = torch.cat([self.global_token.expand(out.size(0), -1, -1, -1), out], dim=2)
 
@@ -821,6 +853,175 @@ class CSBrainAlign(nn.Module):
     def training_step(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
+
+
+class MambaPatchEmbedding(nn.Module):
+    """Multi-frequency SSM/Mamba tokenizer.
+
+    A stack of Mamba layers encodes the raw per-channel EEG samples to a
+    sequence of the same length T. Tokens are extracted at several stride
+    intervals ("bands") and interleaved in chronological order:
+
+        X_{f1,1}, X_{f1,2}, X_{f1,3}, X_{f2,1}, X_{f1,4}, X_{f1,5},
+        X_{f1,6}, X_{f2,2}, X_{f3,1}, ...
+
+    band_periods holds the sample-level stride for each band (finest
+    first). All periods must be integer multiples of band_periods[0]
+    so higher-frequency tokens align with coarser-band boundaries.
+    Default [in_dim, 3*in_dim, 6*in_dim] gives ratio 1 : 3 : 6 which
+    reproduces the user-specified interleaving pattern.
+    """
+
+    def __init__(self, in_dim, out_dim, d_model, seq_len,
+                 band_periods=None, n_mamba_layers=2,
+                 d_state=16, d_conv=4, expand=2, causal=False):
+        super().__init__()
+        from mamba_ssm import Mamba
+
+        self.d_model = d_model
+        self.in_dim = in_dim
+        self.causal = causal
+        self.bidirectional = not causal
+
+        if band_periods is None:
+            band_periods = [in_dim, 3 * in_dim, 6 * in_dim]
+        base = band_periods[0]
+        for p in band_periods:
+            assert p % base == 0, (
+                "band_periods must all be integer multiples of "
+                "band_periods[0] so tokens interleave cleanly")
+        self.band_periods = list(band_periods)
+        self.band_ratios = [p // base for p in band_periods]
+        self.num_bands = len(band_periods)
+
+        self.sample_proj = nn.Sequential(
+            nn.Conv1d(1, d_model, kernel_size=7, padding=3),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=1),
+        )
+
+        self.fwd_mamba = nn.ModuleList([
+            Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(n_mamba_layers)
+        ])
+        self.fwd_norms = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(n_mamba_layers)
+        ])
+
+        if self.bidirectional:
+            self.bwd_mamba = nn.ModuleList([
+                Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+                for _ in range(n_mamba_layers)
+            ])
+            self.bwd_norms = nn.ModuleList([
+                nn.LayerNorm(d_model) for _ in range(n_mamba_layers)
+            ])
+            self.fuse = nn.Linear(2 * d_model, d_model)
+
+        self.band_embeddings = nn.Parameter(torch.zeros(self.num_bands, d_model))
+        nn.init.normal_(self.band_embeddings, std=0.02)
+
+        self.band_proj = nn.ModuleList([
+            nn.Linear(d_model, d_model) for _ in range(self.num_bands)
+        ])
+
+        self.mask_encoding = nn.Parameter(torch.zeros(in_dim), requires_grad=False)
+
+        if causal:
+            self.positional_encoding = nn.Conv2d(
+                d_model, d_model, kernel_size=(19, 7),
+                stride=1, padding=(9, 0), groups=d_model,
+            )
+            self.pos_time_pad = 6
+        else:
+            self.positional_encoding = nn.Conv2d(
+                d_model, d_model, kernel_size=(19, 7),
+                stride=1, padding=(9, 3), groups=d_model,
+            )
+
+    def _interleave_events(self, N_base):
+        events = []
+        for step in range(1, N_base + 1):
+            base_idx = step - 1
+            for k, r_k in enumerate(self.band_ratios):
+                if step % r_k == 0:
+                    within_k = step // r_k - 1
+                    events.append((base_idx, k, within_k))
+        return events
+
+    def expected_seq_len(self, N_base):
+        return sum(N_base // r for r in self.band_ratios)
+
+    def adapt_valid_length_mask(self, valid_length_mask):
+        if valid_length_mask is None:
+            return None
+        N_base = valid_length_mask.size(-1)
+        events = self._interleave_events(N_base)
+        idx = torch.tensor([ev[0] for ev in events],
+                           device=valid_length_mask.device, dtype=torch.long)
+        return valid_length_mask.index_select(-1, idx)
+
+    def base_band_positions(self, N_base):
+        events = self._interleave_events(N_base)
+        return [pos for pos, (_, k, _) in enumerate(events) if k == 0]
+
+    def _run_mamba(self, feats):
+        h = feats
+        for mamba, norm in zip(self.fwd_mamba, self.fwd_norms):
+            h = h + mamba(norm(h))
+        if not self.bidirectional:
+            return h
+        h_b = torch.flip(feats, dims=[1])
+        for mamba, norm in zip(self.bwd_mamba, self.bwd_norms):
+            h_b = h_b + mamba(norm(h_b))
+        h_b = torch.flip(h_b, dims=[1])
+        return self.fuse(torch.cat([h, h_b], dim=-1))
+
+    def forward(self, x, mask=None):
+        B, C, N, P = x.shape
+        assert P == self.in_dim, f"Expected patch_size={self.in_dim}, got {P}"
+        T = N * P
+
+        if mask is None:
+            mask_x = x
+        else:
+            mask_x = x.clone()
+            mask_x[mask == 1] = self.mask_encoding
+
+        ts = mask_x.reshape(B * C, 1, T)
+
+        feats = self.sample_proj(ts)
+        feats = feats.transpose(1, 2).contiguous()
+        feats = self._run_mamba(feats)
+
+        band_tokens = []
+        for k, p_k in enumerate(self.band_periods):
+            n_k = T // p_k
+            positions = torch.arange(n_k, device=feats.device) * p_k + (p_k - 1)
+            tokens_k = feats.index_select(1, positions)
+            tokens_k = self.band_proj[k](tokens_k) + self.band_embeddings[k]
+            band_tokens.append(tokens_k)
+
+        events = self._interleave_events(N)
+        offsets = [0]
+        for toks in band_tokens[:-1]:
+            offsets.append(offsets[-1] + toks.size(1))
+        flat = torch.cat(band_tokens, dim=1)
+        flat_indices = torch.tensor(
+            [offsets[k] + i for (_, k, i) in events],
+            device=feats.device, dtype=torch.long)
+        interleaved = flat.index_select(1, flat_indices)
+        N_total = interleaved.size(1)
+
+        patch_emb = interleaved.view(B, C, N_total, self.d_model)
+
+        pe_input = patch_emb.permute(0, 3, 1, 2)
+        if self.causal:
+            pe_input = F.pad(pe_input, (self.pos_time_pad, 0))
+        pos_emb = self.positional_encoding(pe_input).permute(0, 2, 3, 1)
+        patch_emb = patch_emb + pos_emb
+
+        return patch_emb
 
 
 class PatchEmbedding(nn.Module):

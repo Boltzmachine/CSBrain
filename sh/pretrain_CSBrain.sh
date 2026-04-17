@@ -63,23 +63,21 @@
 # ============================================================
 # Adversarial session-agnostic pretraining
 # ============================================================
-# python pretrain_main.py \
-#     --model Align \
-#     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
-#     --model_dir outputs/ \
-#     --dataset_dir mix \
-#     --n_layer 24 \
-#     --in_dim 40 \
-#     --out_dim 40 \
-#     --d_model 40 \
-#     --seq_len 20 \
-#     --nhead 4 \
-#     --equivariance_weight 1.0 \
-#     --info_max_weight 0.0 \
-#     --adversarial_weight 0.0 \
-#     --samples_per_session 8 \
-#     --sessions_per_batch 16 \
-#     --run_name alljoined-swap-1e-8
+python pretrain_main.py \
+    --model Align \
+    --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
+    --model_dir outputs/ \
+    --dataset_dir mix \
+    --n_layer 24 \
+    --in_dim 40 \
+    --out_dim 40 \
+    --d_model 40 \
+    --seq_len 20 \
+    --nhead 4 \
+    --patch_embed_type mamba \
+    --samples_per_session 8 \
+    --sessions_per_batch 16 \
+    --run_name alljoined-mamba
 
 # ============================================================
 # DINOv2 Self-Distillation Pretraining
@@ -99,21 +97,23 @@
 #     --mask_ratio 0.5 \
 #     --n_prototypes 4096 \
 #     --dino_head_hidden_dim 256 \
-#     --dino_head_bottleneck_dim 64 \
+#     --dino_head_bottleneck_dim 256 \
 #     --dino_head_n_layers 3 \
 #     --student_temp 0.1 \
 #     --teacher_temp_base 0.04 \
 #     --teacher_temp_final 0.07 \
 #     --teacher_temp_warmup_epochs 30 \
 #     --ema_momentum_base 0.992 \
-#     --ema_momentum_final 1.0 \
+#     --ema_momentum_final 0.9995 \
 #     --dino_loss_weight 1.0 \
 #     --ibot_loss_weight 1.0 \
 #     --koleo_loss_weight 0.1 \
 #     --alignment_weight 0.0 \
 #     --equivariance_weight 0.0 \
+#     --last_layer_freeze_iters 1250 \
+#     --lr_warmup_iters 5000 \
 #     --use_freq_subband \
 #     --n_local_crops 4 \
 #     --local_crop_time_scale "(0.3, 0.7)" \
 #     --local_crop_channel_scale "(0.5, 1.0)" \
-#     --run_name dino-v2-multicrop
+#     --run_name dino-v2-multicrop-v2

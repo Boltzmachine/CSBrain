@@ -90,6 +90,8 @@ class Trainer(object):
             getattr(self.params, 'teacher_temp_warmup_epochs', 30)
             * self.data_length
         )
+        lr_warmup_iters = getattr(self.params, 'lr_warmup_iters', 0)
+        base_lr = self.params.lr
 
         for epoch in range(self.params.epochs):
             losses = []
@@ -240,18 +242,29 @@ class Trainer(object):
                 loss.backward()
                 if self.params.clip_value > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
+
+                # --- Linear LR warmup (overrides scheduler during warmup) ---
+                iteration = epoch * self.data_length + batch_idx
+                if lr_warmup_iters > 0 and iteration < lr_warmup_iters:
+                    warmup_lr = base_lr * (iteration + 1) / lr_warmup_iters
+                    for pg in self.optimizer.param_groups:
+                        pg['lr'] = warmup_lr
+
                 self.optimizer.step()
-                self.optimizer_scheduler.step()
+                # Only step the cosine scheduler after warmup ends so the
+                # schedule isn't consumed during the warmup phase.
+                if iteration >= lr_warmup_iters:
+                    self.optimizer_scheduler.step()
 
                 # --- DINOv2 EMA teacher update & schedule step ---
                 dino_model = self._get_dino_model()
                 if dino_model is not None:
-                    iteration = epoch * self.data_length + batch_idx
                     momentum = dino_model.get_ema_momentum(
                         iteration, total_iters)
                     dino_model.update_teacher(momentum)
                     dino_model.update_schedules(
                         iteration, total_iters, teacher_temp_warmup_iters)
+                    dino_model.maybe_unfreeze_last_layer(iteration)
                     logs["ema_momentum"] = momentum
                     logs["teacher_temp"] = dino_model.dino_criterion.teacher_temp
 

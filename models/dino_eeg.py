@@ -35,7 +35,7 @@ class DINOHead(nn.Module):
     linear projection to *n_prototypes* dimensions.
     """
 
-    def __init__(self, in_dim, hidden_dim=256, bottleneck_dim=64,
+    def __init__(self, in_dim, hidden_dim=256, bottleneck_dim=256,
                  n_prototypes=4096, n_layers=3, use_bn=True):
         super().__init__()
         layers = []
@@ -51,6 +51,18 @@ class DINOHead(nn.Module):
 
         self.last_layer = nn.Linear(bottleneck_dim, n_prototypes, bias=False)
         nn.utils.parametrizations.weight_norm(self.last_layer, name='weight')
+
+    def freeze_last_layer(self, freeze: bool):
+        """Freeze/unfreeze the weight-norm magnitude of the prototype layer.
+
+        DINOv2 keeps the magnitude frozen for the first ~1 epoch to stabilise
+        training and prevent uniform collapse. With
+        torch.nn.utils.parametrizations.weight_norm, the magnitude is stored
+        at ``.parametrizations.weight.original0``.
+        """
+        for name, p in self.last_layer.named_parameters():
+            if 'original0' in name:
+                p.requires_grad = not freeze
 
     def forward(self, x):
         """
@@ -256,14 +268,14 @@ class DINOEEGModel(nn.Module):
         student_backbone: nn.Module,
         d_model: int = 40,
         dino_head_hidden_dim: int = 256,
-        dino_head_bottleneck_dim: int = 64,
+        dino_head_bottleneck_dim: int = 256,
         n_prototypes: int = 4096,
         dino_head_n_layers: int = 3,
         student_temp: float = 0.1,
         teacher_temp_base: float = 0.04,
         teacher_temp_final: float = 0.07,
         ema_momentum_base: float = 0.992,
-        ema_momentum_final: float = 1.0,
+        ema_momentum_final: float = 0.9995,
         dino_loss_weight: float = 1.0,
         ibot_loss_weight: float = 1.0,
         koleo_loss_weight: float = 0.1,
@@ -275,6 +287,8 @@ class DINOEEGModel(nn.Module):
         n_local_crops: int = 4,
         local_crop_time_scale: tuple = (0.3, 0.7),
         local_crop_channel_scale: tuple = (0.5, 1.0),
+        # Last-layer freeze
+        last_layer_freeze_iters: int = 1250,
     ):
         super().__init__()
         self.d_model = d_model
@@ -286,6 +300,7 @@ class DINOEEGModel(nn.Module):
         self.ema_momentum_final = ema_momentum_final
         self.teacher_temp_base = teacher_temp_base
         self.teacher_temp_final = teacher_temp_final
+        self.last_layer_freeze_iters = last_layer_freeze_iters
 
         # ---- student backbone (trainable) ----
         self.student = student_backbone
@@ -317,6 +332,14 @@ class DINOEEGModel(nn.Module):
         self.teacher_ibot_head = copy.deepcopy(self.student_ibot_head)
         for p in self.teacher_ibot_head.parameters():
             p.requires_grad = False
+
+        # Freeze the weight-norm magnitude of the prototype layers for the
+        # first ``last_layer_freeze_iters`` iterations. Unfreezed later by
+        # ``maybe_unfreeze_last_layer``.
+        if last_layer_freeze_iters > 0:
+            self.student_dino_head.freeze_last_layer(True)
+            self.student_ibot_head.freeze_last_layer(True)
+        self._last_layer_unfrozen = last_layer_freeze_iters <= 0
 
         # ---- loss functions ----
         self.dino_criterion = DINOLoss(
@@ -397,6 +420,15 @@ class DINOEEGModel(nn.Module):
         t_temp = self.get_teacher_temp(iteration, total_iters, warmup_iters)
         self.dino_criterion.teacher_temp = t_temp
         self.ibot_criterion.teacher_temp = t_temp
+
+    def maybe_unfreeze_last_layer(self, iteration: int):
+        """Unfreeze the prototype-layer magnitude once warmup has elapsed."""
+        if self._last_layer_unfrozen:
+            return
+        if iteration >= self.last_layer_freeze_iters:
+            self.student_dino_head.freeze_last_layer(False)
+            self.student_ibot_head.freeze_last_layer(False)
+            self._last_layer_unfrozen = True
 
     # ------------------------------------------------------------------
     # Training step

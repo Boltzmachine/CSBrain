@@ -1,6 +1,7 @@
 wandb/
 outputs/
 data/
+CineBrain/
 
 .codex
 .vscode/

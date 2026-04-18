@@ -1,0 +1,233 @@
+# EEG World-Model / Video-Prediction Extension of CSBrainAlign
+
+## 1. Motivation
+
+Cognitive neuroscience suggests the brain continuously predicts upcoming
+sensory states; recent World-Action Models (WAM) and V-JEPA are
+instantiations of this idea that learn a forward predictor in a latent space
+rather than reconstructing pixels. We want to carry that inductive bias into
+EEG: the EEG recorded *now* should (a) explain the current video frame and
+(b) carry information to predict the *next* latent state. That same
+forward-looking representation should then transfer to motor-imagery
+decoding, where anticipatory preparatory signals are the thing we want to
+read out.
+
+## 2. Notation
+
+| Symbol | Meaning |
+|---|---|
+| `x_t ∈ R^{C×N×d}` | EEG segment aligned to time `t` (current patching) |
+| `y_t` | Video frame at time `t` |
+| `s_t = (s_t^{cls}, s_t^{patch})` | Latent "world state" at time `t`. CLS token `s_t^{cls} ∈ R^{D}` and patch tokens `s_t^{patch} ∈ R^{C×N×D}` — both come from `CSBrainAlign.encode`. |
+| `f_θ` | EEG encoder (the current `CSBrainAlign`, re-purposed) |
+| `g_ξ` | Frame encoder — this is `CSBrainAlign.pretrained_image_encoder`, already loaded and frozen today |
+| `p_φ` | Latent predictor: `(s_t, x_t) → ŝ_{t+1}^{patch}` (predicts patch tokens; see §4) |
+| `h_ψ` | Contrastive / alignment projector (reuses `contrastive_proj`) |
+
+## 3. Architecture
+
+```
+                          s_t^{cls}  ───▶ h_ψ ───▶ align(·, g_ξ(y_t)[CLS])
+        ┌──────────────┐       │
+ x_t ──▶│  f_θ (EEG)   │───────┤
+        └──────────────┘       │
+                          s_t^{patch} ───┐
+                                         ▼
+                                ┌────────────────┐
+                                │ p_φ predictor  │── ŝ^{patch}_{t+1} ──▶ L1 vs.
+                                │ inputs:        │    sg[f_θ(x_{t+1})^{patch}]
+                                │   s_t (all     │
+                                │   tokens), x_t │
+                                └────────────────┘
+```
+
+Three modules:
+
+1. **EEG encoder `f_θ`** — `CSBrainAlign` returns a CLS token we
+   treat as `s_t`. Keep the patch-embed / transformer stack as-is. We are
+   *not* touching the equivariance branch at all.
+2. **Frame encoder `g_ξ`** — the `self.pretrained_image_encoder` already
+   inside `CSBrainAlign` (it happens to be DINOv2-base, but that is just the
+   choice of weights; we use it as a black-box frozen feature extractor, the
+   same way the current alignment loss already does).
+3. **Predictor `p_φ`** — new, small transformer (≈4–6 layers, `d_model=512`),
+   lives in `models/world_model.py`. Inputs: `s_t` (CLS + patch tokens from
+   `f_θ`) concatenated with patch-embedded `x_t` tokens; output:
+   `ŝ_{t+1}^{patch}`. Kept intentionally narrow so the encoder carries the
+   representational load (V-JEPA design choice).
+
+### CLS vs patch tokens for `s_t`
+
+We keep **both**. The two heads use different slices:
+
+- **Alignment** operates on the CLS token only: `h_ψ(s_t^{cls}) ↔ g_ξ(y_t)[CLS]`.
+  This matches the current `CSBrainAlign` code; CLS is the natural summary
+  to match a single frame-level ViT feature.
+- **Prediction** operates on the *patch tokens*: `p_φ` predicts
+  `ŝ_{t+1}^{patch}` against `sg[f_θ(x_{t+1})^{patch}]`. This follows V-JEPA
+  (which predicts patch embeddings, not a scalar summary) and — crucially
+  for the downstream motor-imagery story — preserves per-channel / per-time
+  structure. MI relies on spatially-localised mu/β patterns over C3/C4;
+  collapsing to a single CLS destroys that information.
+
+`CSBrainAlign.encode` at [alignment.py:596-602](models/alignment.py#L596-L602)
+already returns both `cls_token` and `patch_tokens`, so no plumbing change.
+
+### Why both `s_t` and `x_t` feed the predictor
+
+`s_t` encodes the brain's model of the *current* world state — the part of
+the latent that is explicitly tied to `y_t` via the alignment loss. `x_t`,
+on the other hand, carries the raw anticipatory/preparatory signals the
+brain produces *before* the next frame is observed. Those signals are
+exactly what we want the predictor to exploit: the human's intuition about
+what comes next is already physically present in the EEG, but the
+frame-aligned bottleneck `s_t` may squeeze it out. Feeding `x_t` (via the
+encoder's `patch_embedding` tokens, not raw samples) gives `p_φ` direct
+access to that predictive EEG content.
+
+## 4. Objectives
+
+Total loss = α·L_align + β·L_recon + γ·L_pred .
+
+No EMA teacher, no DINO-style self-distillation on the EEG side, no
+VICReg on the predictor — those were tried and did not help in this
+codebase.
+
+1. **Alignment (existing)** — symmetric InfoNCE between `h_ψ(s_t)` and
+   `g_ξ(y_t)[CLS]`. Already implemented in
+   [alignment.py:742-754](models/alignment.py#L742-L754); kept verbatim.
+2. **Masked patch reconstruction (existing)** — the current pretraining
+   objective in `pretrain_trainer.py` that reconstructs masked EEG patches
+   from `CSBrainAlign.forward`'s `out`. Kept verbatim. This is what keeps
+   `f_θ` grounded in raw EEG content; the alignment loss alone is too weak
+   to train a foundation-quality encoder.
+3. **Latent prediction** — **L1 loss** between `p_φ(s_t, x_t)` and
+   `sg[f_θ(x_{t+1})^{patch}]` (patch-token target — see §3). Same online
+   encoder, stop-grad on the target only (no EMA). Averaged over valid
+   channel × time-patch positions. Also regress the predicted
+   CLS to `g_ξ(y_{t+1})` as an auxiliary cross-modal term.
+
+Multi-step rollout: at training time pick a random horizon `k ∈ {1,…,K_max}`
+and supervise `ŝ_{t+k}^{patch}` against `sg[f_θ(x_{t+k})^{patch}]`. Start
+with `K_max=1`, ramp to 4 once losses are stable.
+
+## 5. Data Pipeline — CineBrain
+
+- Add `datasets/cinebrain_dataset.py` producing
+  `{timeseries (C,N,d), ch_coords, frame_t, frame_{t+1..t+K}, valid_*}`.
+- A single `__getitem__` returns temporally-consecutive EEG windows *and*
+  the raw frame tensors they are aligned to. Frames are fed through the
+  in-model `self.pretrained_image_encoder` at train time, the same path
+  the current alignment loss uses — no separate cache file.
+
+### Window size / stride (reconsidered with EEG domain knowledge)
+
+Constraints from EEG:
+- Visual ERPs peak in the 100–300 ms range post-stimulus (P100, N170,
+  P300); object-category information is maximal around 150–250 ms. So a
+  "per-frame" window must *at least* cover ~400 ms after the nominal
+  frame onset for the response to be represented.
+- CineBrain presents continuous video (24–30 fps, i.e. one frame every
+  33–42 ms), so frame-locked epoching is not possible in the ERP sense;
+  we need a sliding window over a continuous stream.
+- The existing `CSBrainAlign` uses `event_window_len = 240`, which at the
+  repo's typical 200 Hz sampling rate is **1.2 s**. That is the effective
+  "alignment unit" the current model was designed around — we should stay
+  close to it.
+
+Proposed defaults:
+- **Window**: 2.0 s (≈400 samples @ 200 Hz). Long enough to span multiple
+  frame responses and to give the transformer enough patches (`N ≥ 10`
+  with `d = 40`, or kept compatible with `in_dim=200` by using larger
+  windows). Shorter than the 30 s global-spectral context the backbone
+  was trained on, but the alignment loss already operates on
+  sub-second-scale content.
+- **Stride**: 1.0 s (50 % overlap). Gives a 1 s horizon between
+  consecutive windows — well matched to the timescale over which
+  anticipatory EEG is informative.
+- **Frame alignment inside a window**: the target frame `y_t` is the frame
+  displayed at the window's *center*, shifted by +150 ms to roughly
+  account for visual-ERP latency. The exact offset should be swept once
+  we have Stage-A training running; this is a hyperparameter, not a
+  load-bearing design choice.
+- **Prediction horizon**: default `k=1` (predict the next 1 s window).
+  Ramp `K_max → 4` (2–4 s ahead) later.
+
+These values should be revisited once we inspect the CineBrain metadata
+(sampling rate, exact video timing) — nothing above is so firmly justified
+that it shouldn't move.
+
+## 6. Training Recipe
+
+One pretraining stage (no warmup split, no EMA, no equivariance):
+
+- Loss: `L_align + L_recon + γ · L_pred`, all three live from step 0.
+- `γ` schedule: linear ramp 0 → 1 over the first 2 epochs so the
+  untrained predictor cannot push noise gradients back through `f_θ`
+  while the encoder is still finding the alignment+recon basin.
+- Optimiser / LR / batch size: inherit from the existing
+  `pretrain_main.py` configuration for `CSBrainAlign` (no reason to
+  change; the added parameters are in a small side-network).
+- Logging: track `L_align`, `L_recon`, `L_pred`, predictor target-cosine
+  similarity on the patch tokens, and a rank-based next-window retrieval
+  metric (mean-pooled `ŝ_{t+1}^{patch}` vs a batch bank of true
+  `s_{t+1}^{patch}`).
+
+### Downstream
+
+Fine-tuning for motor imagery is **deliberately deferred** until the
+pretraining behaviour looks right. Plan to revisit once we have
+Stage-B checkpoints and per-epoch curves. When we do, `f_θ` is the only
+thing to load; `p_φ` and `h_ψ` are discarded.
+
+## 7. Concrete Code Changes
+
+| File | Change |
+|---|---|
+| `models/world_model.py` *(new)* | `LatentPredictor` (transformer), `WorldModelWrapper` wrapping `CSBrainAlign` + `p_φ` and producing the loss dict. |
+| `models/alignment.py` | Expose `patch_embedding` output + the final `encode` pathway in a way the predictor can reuse without re-running the full transformer. No change to the existing `forward` behaviour. |
+| `datasets/cinebrain_dataset.py` *(new)* | Loader returning `(EEG window, frame_t, frame_{t+1..t+K_max})` tuples. No caching layer in v1. |
+| `datasets/__init__.py` | Register CineBrain. |
+| `pretrain_main.py` / `pretrain_trainer.py` | Add a `world_model` branch; the loss dict already supports multiple weighted terms via the `(weight, tensor)` tuple convention, so no trainer surgery is needed. |
+| `sh/pretrain_worldmodel.sh` *(new)* | Launch script (`conda run -n cbramod`). |
+
+Fine-tuning files are untouched for now.
+
+
+## 8. Open Questions
+
+1. **Predictor context length**: should `p_φ` see only `(s_t, x_t)` or a
+   window `(s_{t-H..t}, x_{t-H..t})`? Default `H=1`; extend to a short
+   context (4–8 steps) once the `H=1` model trains stably.
+2. **Auxiliary frame target**: do we also regress `ŝ_{t+1}` to
+   `g_ξ(y_{t+1})`? Cheap to add but couples two losses.
+3. **Frame rate vs EEG rate**: confirm CineBrain's exact sampling rate
+   and video timing before finalising window/stride. The §5 numbers are
+   provisional.
+
+## 9. Milestones
+
+1. `LatentPredictor` + gradient-flow unit test on a random batch. *(½ day)*
+2. `CineBrainDataset` verified on one subject; a dataloader iteration
+   returns correctly-aligned EEG/frame tuples. *(1 day)*
+3. Joint pretraining run with `L_align + L_recon + L_pred`; confirm all
+   three losses decrease and that `L_align` does not regress relative to
+   the current `CSBrainAlign`-only run. *(2 days)*
+4. Ablations: `L_pred` on/off; horizon `K_max ∈ {1,2,4}`; causal vs
+   non-causal `f_θ`. *(2+ days)*
+5. *(deferred)* Downstream motor-imagery protocol — to be specified.
+
+## 10. Pretraining Success Criterion
+
+Joint-objective pretraining must (a) leave the image-alignment metric on
+our existing THINGS-EEG2 evaluation within noise of the current
+`CSBrainAlign` numbers, and (b) produce a non-trivial predictor —
+`ŝ_{t+1}` retrieves the true `s_{t+1}` above chance on a held-out CineBrain
+split. Downstream MI criteria will be defined when fine-tuning is scoped.
+
+## Other Important Things
+1. Keep your code back-compatible.
+2. For some hyperparameters, especially the timing alignment or offset, window or stride size, you should **carefully** investigate the dataset's paper or the corresponding method proposed along with the paper to find out the optimal and reasonable choice.
+
+## Dataset
+The dataset is downloaded into `data/CineBrain`. Refer to the official codebase `./CineBrain` for potential data loading pipeline.

@@ -69,7 +69,15 @@ def main():
     parser.add_argument('--hemisphere_flip_aug', action='store_true', default=False,
                         help='hemisphere-flip data augmentation with label swap (motor imagery)')
 
-        
+    # --- SSM/Mamba multi-frequency patch embedding ---
+    parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'],
+                        help='patch embedder: CNN (default) or multi-frequency Mamba SSM')
+    parser.add_argument('--mamba_band_periods', type=str, default=None,
+                        help='list of band sample periods, e.g. "[200,600,1200]"; default [in_dim, 3*in_dim, 6*in_dim]')
+    parser.add_argument('--n_mamba_layers', type=int, default=2, help='number of stacked Mamba blocks in the patch embedder')
+    parser.add_argument('--mamba_d_state', type=int, default=16, help='Mamba state dimension')
+    parser.add_argument('--mamba_d_conv', type=int, default=4, help='Mamba depthwise conv width')
+    parser.add_argument('--mamba_expand', type=int, default=2, help='Mamba expansion factor')
 
     params = parser.parse_args()
     if os.environ.get("DEBUG", "0") == "1":

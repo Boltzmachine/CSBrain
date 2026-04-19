@@ -74,10 +74,10 @@ python pretrain_main.py \
     --d_model 40 \
     --seq_len 20 \
     --nhead 4 \
-    --patch_embed_type mamba \
     --samples_per_session 8 \
     --sessions_per_batch 16 \
-    --run_name alljoined-mamba
+    --run_name cinebrain
+
 
 # ============================================================
 # DINOv2 Self-Distillation Pretraining

@@ -186,7 +186,7 @@ thing to load; `p_φ` and `h_ψ` are discarded.
 |---|---|
 | `models/world_model.py` *(new)* | `LatentPredictor` (transformer), `WorldModelWrapper` wrapping `CSBrainAlign` + `p_φ` and producing the loss dict. |
 | `models/alignment.py` | Expose `patch_embedding` output + the final `encode` pathway in a way the predictor can reuse without re-running the full transformer. No change to the existing `forward` behaviour. |
-| `datasets/cinebrain_dataset.py` *(new)* | Loader returning `(EEG window, frame_t, frame_{t+1..t+K_max})` tuples. No caching layer in v1. |
+| `datasets/cinebrain_dataset.py` *(new)* | Loader returning `(EEG window, frame_t, frame_{t+1..t+K_max})` tuples. No caching layer in v1. Apply necessary preprocessing. |
 | `datasets/__init__.py` | Register CineBrain. |
 | `pretrain_main.py` / `pretrain_trainer.py` | Add a `world_model` branch; the loss dict already supports multiple weighted terms via the `(weight, tensor)` tuple convention, so no trainer surgery is needed. |
 | `sh/pretrain_worldmodel.sh` *(new)* | Launch script (`conda run -n cbramod`). |
@@ -194,40 +194,18 @@ thing to load; `p_φ` and `h_ψ` are discarded.
 Fine-tuning files are untouched for now.
 
 
-## 8. Open Questions
-
-1. **Predictor context length**: should `p_φ` see only `(s_t, x_t)` or a
-   window `(s_{t-H..t}, x_{t-H..t})`? Default `H=1`; extend to a short
-   context (4–8 steps) once the `H=1` model trains stably.
-2. **Auxiliary frame target**: do we also regress `ŝ_{t+1}` to
-   `g_ξ(y_{t+1})`? Cheap to add but couples two losses.
-3. **Frame rate vs EEG rate**: confirm CineBrain's exact sampling rate
-   and video timing before finalising window/stride. The §5 numbers are
-   provisional.
-
-## 9. Milestones
-
-1. `LatentPredictor` + gradient-flow unit test on a random batch. *(½ day)*
-2. `CineBrainDataset` verified on one subject; a dataloader iteration
-   returns correctly-aligned EEG/frame tuples. *(1 day)*
-3. Joint pretraining run with `L_align + L_recon + L_pred`; confirm all
-   three losses decrease and that `L_align` does not regress relative to
-   the current `CSBrainAlign`-only run. *(2 days)*
-4. Ablations: `L_pred` on/off; horizon `K_max ∈ {1,2,4}`; causal vs
-   non-causal `f_θ`. *(2+ days)*
-5. *(deferred)* Downstream motor-imagery protocol — to be specified.
-
-## 10. Pretraining Success Criterion
-
-Joint-objective pretraining must (a) leave the image-alignment metric on
-our existing THINGS-EEG2 evaluation within noise of the current
-`CSBrainAlign` numbers, and (b) produce a non-trivial predictor —
-`ŝ_{t+1}` retrieves the true `s_{t+1}` above chance on a held-out CineBrain
-split. Downstream MI criteria will be defined when fine-tuning is scoped.
-
 ## Other Important Things
 1. Keep your code back-compatible.
 2. For some hyperparameters, especially the timing alignment or offset, window or stride size, you should **carefully** investigate the dataset's paper or the corresponding method proposed along with the paper to find out the optimal and reasonable choice.
+3. Preprocessing should be conducted including some band filtering and resampling (EEG should be resampled to 200Hz if necessary). For example, in `tueg_dataset.py`, we have
+```
+raw.resample(200)
+raw.filter(l_freq=0.3, h_freq=75)
+raw.notch_filter((60))
+```
+4. Add the training script to `sh.pretrain_CSBrain.sh`.
+5. Conduct necessary unit test and end-to-end-test if necessary.
+
 
 ## Dataset
 The dataset is downloaded into `data/CineBrain`. Refer to the official codebase `./CineBrain` for potential data loading pipeline.

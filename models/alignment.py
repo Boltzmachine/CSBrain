@@ -664,6 +664,7 @@ class CSBrainAlign(nn.Module):
 
         # --- Apply mask in sensor space, then project to source space ---
         if self.project_to_source:
+            raise NotImplementedError("Source projection with patch-based masking is not currently supported.")
             valid_ch = batch.get('valid_channel_mask', None)
             if mask is not None:
                 # Apply mask in original sensor space before source projection
@@ -675,14 +676,15 @@ class CSBrainAlign(nn.Module):
             # Don't pass mask to patch_embedding — already applied
             mask = None
 
-        if not self.causal:
-            # Spectral filtering mixes all time steps — skip in causal mode
-            timeseries = x.view(x.size(0), x.size(1), -1)
-            spectral = torch.fft.rfft(timeseries, dim=-1, norm='forward')
-            masks = torch.sigmoid(self.freq_mask_logits[:1, :spectral.size(-1)]) # (num_visual_levels, n_freq_bins)
-            branch_spectral = spectral * masks.unsqueeze(0) # (n_branch, B, n_ch, n_freq_bins)
-            branch_time = torch.fft.irfft(branch_spectral, norm='forward') # (n_branch, B, n_ch, seq_len)
-            x = branch_time.view_as(x)
+        ## DEPRECATED spectral branch
+        # if not self.causal:
+        #     # Spectral filtering mixes all time steps — skip in causal mode
+        #     timeseries = x.view(x.size(0), x.size(1), -1)
+        #     spectral = torch.fft.rfft(timeseries, dim=-1, norm='forward')[..., :self.freq_mask_logits.size(-1)]
+        #     masks = torch.sigmoid(self.freq_mask_logits[:1, :spectral.size(-1)]) # (num_visual_levels, n_freq_bins)
+        #     branch_spectral = spectral * masks.unsqueeze(0) # (n_branch, B, n_ch, n_freq_bins)
+        #     branch_time = torch.fft.irfft(branch_spectral, norm='forward', n=timeseries.size(-1)) # (n_branch, B, n_ch, seq_len)
+        #     x = branch_time.view_as(x)
 
         # Remember base N before patch embedding so we can map the
         # interleaved multi-band tokens back to per-patch reconstructions.

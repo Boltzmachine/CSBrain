@@ -94,6 +94,10 @@ class Trainer(object):
         base_lr = self.params.lr
 
         for epoch in range(self.params.epochs):
+            # Let world-model wrappers ramp their prediction weight.
+            m = self.model.module if hasattr(self.model, 'module') else self.model
+            if hasattr(m, 'current_epoch'):
+                m.current_epoch.fill_(float(epoch))
             losses = []
             for batch_idx, x in enumerate(tqdm(self.data_loader, mininterval=10)):
                 self.optimizer.zero_grad()
@@ -149,7 +153,6 @@ class Trainer(object):
                                     logs[key] = lss.data.cpu().numpy()
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
-
                         if info.get('dino_mode', False):
                             # DINO + iBOT replace the masked reconstruction loss
                             loss = sum(loss_dict.values())

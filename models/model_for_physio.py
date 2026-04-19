@@ -78,6 +78,20 @@ class Model(nn.Module):
             # DataParallel wrapping
             state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
+            # --- Handle WorldModelWrapper checkpoints ---
+            # WorldModelWrapper wraps a CSBrainAlign under "encoder." and
+            # (optionally) a LatentPredictor under "predictor.". Finetuning
+            # only uses the encoder: strip the prefix and drop anything that
+            # doesn't belong to it. CSBrainAlign has no top-level "encoder"
+            # submodule, so the prefix is an unambiguous wrapper marker.
+            is_world_model_ckpt = any(k.startswith("encoder.") for k in state_dict)
+            if is_world_model_ckpt:
+                state_dict = {
+                    k[len("encoder."):]: v
+                    for k, v in state_dict.items()
+                    if k.startswith("encoder.")
+                }
+
             # --- Handle DINO-pretrained checkpoints ---
             # The teacher (EMA-smoothed) produces better representations than
             # the student, so we load teacher weights for finetuning.
@@ -114,13 +128,15 @@ class Model(nn.Module):
                         delattr(self.backbone, attr)
 
             missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
-            
-            for unexpected_key in unexpected_keys:
-                if "equiv_projector" not in unexpected_key:
-                    raise ValueError(f"UNEXPECTED KEY {unexpected_key}")
-            
-            if len(missing_keys) > 0:
-                raise
+
+            # ``equiv_projector`` is an optional pretraining-only head; tolerate
+            # it in the checkpoint but fail loudly on anything else.
+            unexpected_keys = [k for k in unexpected_keys
+                               if "equiv_projector" not in k]
+            if unexpected_keys:
+                raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
+            if missing_keys:
+                raise ValueError(f"MISSING KEYS: {missing_keys}")
 
         self.backbone.proj_out = nn.Identity()
 

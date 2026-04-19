@@ -96,6 +96,23 @@ def main():
     parser.add_argument('--local_crop_time_scale', type=str, default='(0.3, 0.7)', help='(min, max) fraction of time patches in local crops')
     parser.add_argument('--local_crop_channel_scale', type=str, default='(0.5, 1.0)', help='(min, max) fraction of channels in local crops')
 
+    # --- World model (EEG video-prediction) ---
+    parser.add_argument('--cinebrain_subjects', type=str, default='sub-0001', help='comma-separated list of CineBrain subject directories')
+    parser.add_argument('--cinebrain_root', type=str, default='data/CineBrain', help='root directory for the CineBrain dataset')
+    parser.add_argument('--cinebrain_n_windows', type=int, default=3, help='number of windows to emit per 4 s CineBrain clip')
+    parser.add_argument('--cinebrain_window_s', type=float, default=2.0, help='EEG window length in seconds (must give window_samples divisible by in_dim)')
+    parser.add_argument('--cinebrain_stride_s', type=float, default=1.0, help='stride between consecutive EEG windows in seconds')
+    parser.add_argument('--cinebrain_erp_latency_s', type=float, default=0.0, help='time shift added to the frame-lookup timestamp (paper default: 0; sweep +/-0.15 to probe visual-ERP lag)')
+    parser.add_argument('--cinebrain_load_frames', type=int, default=1, help='whether to decode raw video frames (0 disables the alignment term)')
+    parser.add_argument('--predictor_d_model', type=int, default=512)
+    parser.add_argument('--predictor_n_layers', type=int, default=4)
+    parser.add_argument('--predictor_n_heads', type=int, default=8)
+    parser.add_argument('--predictor_dim_feedforward', type=int, default=1024)
+    parser.add_argument('--max_horizon', type=int, default=1, help='maximum prediction horizon k (in windows)')
+    parser.add_argument('--latent_pred_weight', type=float, default=1.0)
+    parser.add_argument('--cls_pred_weight', type=float, default=0.1)
+    parser.add_argument('--pred_ramp_epochs', type=int, default=2, help='linearly ramp latent-prediction weight 0→1 over this many epochs')
+
     params = parser.parse_args()
     print(params)
     setup_seed(params.seed)
@@ -183,6 +200,41 @@ def main():
                 pin_memory=True,
             )
        
+    elif params.dataset_dir == 'cinebrain':
+        from datasets.cinebrain_dataset import CineBrainDataset, collate_cinebrain
+        subjects = [s.strip() for s in params.cinebrain_subjects.split(',') if s.strip()]
+        pretrained_dataset = CineBrainDataset(
+            data_dir=params.cinebrain_root,
+            subjects=subjects,
+            in_dim=params.in_dim,
+            n_windows=params.cinebrain_n_windows,
+            window_s=params.cinebrain_window_s,
+            stride_s=params.cinebrain_stride_s,
+            erp_latency_s=params.cinebrain_erp_latency_s,
+            load_frames=bool(params.cinebrain_load_frames),
+        )
+        print('CineBrain clips:', len(pretrained_dataset))
+        num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
+        # Match the 'mix' branch's epoch size so runtime + LR schedules stay
+        # comparable. CineBrain has far fewer unique clips, so we sample with
+        # replacement — each clip is visited ~n_samples_per_epoch/len(ds)
+        # times per epoch, which is fine since windows/frames are
+        # deterministic per clip.
+        n_samples_per_epoch = 1109545
+        sampler = torch.utils.data.RandomSampler(
+            pretrained_dataset,
+            replacement=True,
+            num_samples=n_samples_per_epoch,
+        )
+        data_loader = DataLoader(
+            pretrained_dataset,
+            batch_size=params.batch_size,
+            num_workers=num_workers,
+            sampler=sampler,
+            collate_fn=collate_cinebrain,
+            pin_memory=True,
+            drop_last=True,
+        )
     else:
         pretrained_dataset = PretrainingDataset(
             dataset_dir=params.dataset_dir,

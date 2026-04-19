@@ -60,6 +60,58 @@ def get_model(params, brain_regions, sorted_indices):
             mamba_d_conv=getattr(params, 'mamba_d_conv', 4),
             mamba_expand=getattr(params, 'mamba_expand', 2),
         )
+    elif params.model == 'WorldModel':
+        from .alignment import CSBrainAlign
+        from .world_model import LatentPredictor, WorldModelWrapper
+        _mbp = getattr(params, 'mamba_band_periods', None)
+        if isinstance(_mbp, str) and _mbp:
+            _mbp = eval(_mbp)
+        encoder = CSBrainAlign(
+            params.in_dim, params.out_dim, params.d_model, params.dim_feedforward, params.seq_len, params.n_layer,
+            params.nhead,
+            eval(params.TemEmbed_kernel_sizes),
+            brain_regions=None,
+            causal=getattr(params, 'causal', False),
+            project_to_source=getattr(params, 'project_to_source', False),
+            num_sources=getattr(params, 'num_sources', 32),
+            source_projector_ckpt=getattr(params, 'source_projector_ckpt', None),
+            freeze_source_projector=getattr(params, 'freeze_source_projector', True),
+            adversarial_weight=0.0,
+            equivariance_weight=0.0,
+            info_max_weight=0.0,
+            alignment_weight=getattr(params, 'alignment_weight', 1.0),
+            patch_embed_type=getattr(params, 'patch_embed_type', 'cnn'),
+            mamba_band_periods=_mbp,
+            n_mamba_layers=getattr(params, 'n_mamba_layers', 2),
+            mamba_d_state=getattr(params, 'mamba_d_state', 16),
+            mamba_d_conv=getattr(params, 'mamba_d_conv', 4),
+            mamba_expand=getattr(params, 'mamba_expand', 2),
+        )
+        max_horizon = getattr(params, 'max_horizon', 1)
+        # ``max_horizon == 0`` short-circuits the world-model components:
+        # the wrapper reduces to plain CSBrainAlign (masked recon + image
+        # alignment) so no predictor parameters enter the optimiser.
+        if max_horizon > 0:
+            predictor = LatentPredictor(
+                d_model=params.d_model,
+                predictor_d_model=getattr(params, 'predictor_d_model', 512),
+                n_layers=getattr(params, 'predictor_n_layers', 4),
+                n_heads=getattr(params, 'predictor_n_heads', 8),
+                dim_feedforward=getattr(params, 'predictor_dim_feedforward', 1024),
+                dropout=getattr(params, 'dropout', 0.1),
+                max_horizon=max(max_horizon, 1),
+            )
+        else:
+            predictor = None
+        model = WorldModelWrapper(
+            encoder=encoder,
+            predictor=predictor,
+            latent_pred_weight=getattr(params, 'latent_pred_weight', 1.0),
+            cls_pred_weight=getattr(params, 'cls_pred_weight', 0.1),
+            max_horizon=max_horizon,
+            ramp_epochs=getattr(params, 'pred_ramp_epochs', 2),
+        )
+        return model
     elif params.model == 'Spectral':
         from .spectral_alignment import CSBrainSpectral
         model = CSBrainSpectral(

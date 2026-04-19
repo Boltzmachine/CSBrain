@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-gpu=6
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --time=1-00:00:00
 #SBATCH --job-name=csbrain-finetune
 #SBATCH --output=outputs/slurms/%j.out
@@ -41,7 +41,7 @@ echo "Job started at $(date)" | tee -a "$LOG_FILE"
 #     --weight_decay  0.01 \
 #     --lr 0.00005 
 
-FOUNDATION_DIR="outputs/dino-v2-multicrop/epoch14_loss6.481423377990723.pth"
+FOUNDATION_DIR="outputs/worldmodel-cinebrain-v1-20-maskonly/epoch15_loss0.01979984901845455.pth"
 CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
 EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
 WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}"
@@ -57,12 +57,12 @@ python finetune_main.py \
     --results_csv outputs/finetune_results.csv \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --use_pretrained_weights \
-    --in_dim 40 \
-    --out_dim 40 \
-    --d_model 40 \
-    --seq_len 20 \
+    --in_dim 20 \
+    --out_dim 20 \
+    --d_model 20 \
+    --seq_len 10 \
     --nhead 4 \
-    --n_layer 24 \
+    --n_layer 12 \
     --dropout 0.3 \
     --weight_decay  0.01 \
     --lr 0.00005 

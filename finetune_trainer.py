@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
 from finetune_evaluator import Evaluator
+from utils.util import build_muon_optimizer
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss, MSELoss
 from timeit import default_timer as timer
 import numpy as np
@@ -69,6 +70,15 @@ class Trainer(object):
             else:
                 self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.params.lr,
                                                    weight_decay=self.params.weight_decay)
+        elif self.params.optimizer == 'Muon':
+            # Muon handles backbone (2D weights) vs head/embed/biases
+            # split internally, so multi_lr is implicit and ignored.
+            self.optimizer = build_muon_optimizer(
+                self.model,
+                lr=self.params.lr,
+                weight_decay=self.params.weight_decay,
+                muon_lr=getattr(self.params, 'muon_lr', 0.02),
+            )
         else:
             if self.params.multi_lr:
                 self.optimizer = torch.optim.SGD([

@@ -107,6 +107,7 @@ class LLMEmbeddingVQ(nn.Module):
 
         return self.out_proj(quantized).view(B, C, N, -1), {
             "indices": indices,
+            "quantized": quantized.view(B, C, N, -1),
             # "projected_states": projected_states,
             "aux_loss": vq_aux_loss,
         }

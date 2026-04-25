@@ -32,6 +32,10 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=5e-2, help='weight_decay')
     parser.add_argument('--clip_value', type=float, default=1, help='clip_value')
     parser.add_argument('--lr_scheduler', type=str, default='CosineAnnealingLR', help='lr_scheduler')
+    parser.add_argument('--optimizer', type=str, default='AdamW', choices=['AdamW', 'Muon'],
+                        help='optimizer; Muon uses SingleDeviceMuonWithAuxAdam (Muon for 2D hidden weights, AdamW for embeddings/heads/biases)')
+    parser.add_argument('--muon_lr', type=float, default=0.02,
+                        help='learning rate for the Muon parameter group (only used when --optimizer Muon); --lr is used for the AdamW group')
 
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--in_dim', type=int, default=200, help='in_dim')
@@ -48,6 +52,12 @@ def main():
     parser.add_argument('--TemEmbed_kernel_sizes', type=str, default="[(1,), (3,), (5,)]")
     parser.add_argument('--use_SmallerToken', type=bool, default=False, help='SmallerToken->dataset.py')
     parser.add_argument('--model', type=str, default='CSBrain', help='CSBrain')
+    parser.add_argument('--vision_encoder', type=str, default='facebook/dinov2-base',
+                        help='HF model id of the frozen vision encoder used by the Spectral model for alignment (e.g. facebook/dinov2-base, facebook/dino-vitb8). Must match the preprocessing used to cache image_encoder_inputs.')
+    parser.add_argument('--use_saliency', action='store_true', default=False,
+                        help='Enable the saliency-alignment branch on the Spectral model (KL between band-mixed saliency prediction and DINO attention rollout).')
+    parser.add_argument('--saliency_rollout_skip_layers', type=int, default=2,
+                        help='Number of initial vision-encoder layers to exclude from the saliency rollout target (Spectral model).')
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--causal', action='store_true', default=False, help='use causal (next-patch prediction) instead of masked reconstruction')
     parser.add_argument('--project_to_source', action='store_true', default=False, help='project sensors to source space before transformer')
@@ -61,6 +71,12 @@ def main():
     parser.add_argument('--equivariance_weight', type=float, default=0.0, help='weight for hemispheric equivariance loss (0 = disabled)')
     parser.add_argument('--info_max_weight', type=float, default=0.0, help='weight for VICReg-style info-max regulariser on inv/eq subspaces (0 = disabled)')
     parser.add_argument('--alignment_weight', type=float, default=1.0, help='weight for EEG-image contrastive alignment loss (0 = disabled)')
+
+    # --- LLM-embedding VQ tokenization for contrastive path ---
+    parser.add_argument('--use_llm_vq', action='store_true', default=False, help='tokenize the global token into K language tokens via a frozen LLM-embedding codebook before contrastive alignment')
+    parser.add_argument('--num_language_tokens', type=int, default=8, help='number of LLM-vocab tokens produced from the global token (K)')
+    parser.add_argument('--max_llm_codebook_size', type=int, default=4096, help='max codebook size (top-K most frequent LLM tokens kept)')
+    parser.add_argument('--llm_vq_aux_weight', type=float, default=0.1, help='weight for the VQ commitment / entropy auxiliary loss')
 
     # --- SSM/Mamba multi-frequency patch embedding ---
     parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'], help='patch embedder: CNN (default) or multi-frequency Mamba SSM')
@@ -112,6 +128,9 @@ def main():
     parser.add_argument('--latent_pred_weight', type=float, default=1.0)
     parser.add_argument('--cls_pred_weight', type=float, default=0.1)
     parser.add_argument('--pred_ramp_epochs', type=int, default=2, help='linearly ramp latent-prediction weight 0→1 over this many epochs')
+    parser.add_argument('--target_momentum', type=float, default=0.998, help='EMA momentum for WorldModel target encoder (0 disables EMA — targets come from the online encoder)')
+    parser.add_argument('--mix_alljoined_weight', type=float, default=1.0, help='sampling weight for Alljoined-1.6M in the mix+cinebrain dataset')
+    parser.add_argument('--mix_cinebrain_weight', type=float, default=1.0, help='sampling weight for CineBrain in the mix+cinebrain dataset')
 
     params = parser.parse_args()
     print(params)
@@ -200,6 +219,70 @@ def main():
                 pin_memory=True,
             )
        
+    elif params.dataset_dir == 'mix+cinebrain':
+        from datasets.cached_dataset import (
+            get_webdataset, collate_cached, collate_cached_with_future,
+        )
+        from datasets.cinebrain_dataset import (
+            CineBrainDataset, CineBrainIterableWrapper, WeightedSampleMix,
+        )
+
+        # Crop the Alljoined event window to seq_len * in_dim so each
+        # Alljoined sample lines up shape-for-shape with a CineBrain
+        # window (C, seq_len, in_dim) and they can ride in the same batch.
+        target_event_len = params.seq_len * params.in_dim
+
+        alljoined_ds = get_webdataset(
+            ["Alljoined-1.6M/*.tar"],
+            params,
+            event_window_target_len=target_event_len,
+        )
+
+        # When the latent predictor is on we need at least max_horizon+1
+        # CineBrain windows per clip; otherwise a single window suffices
+        # and we skip the extra preprocessing.
+        n_windows_cb = max(1, params.max_horizon + 1)
+        subjects = [s.strip() for s in params.cinebrain_subjects.split(',')
+                    if s.strip()]
+        cinebrain_inner = CineBrainDataset(
+            data_dir=params.cinebrain_root,
+            subjects=subjects,
+            in_dim=params.in_dim,
+            n_windows=n_windows_cb,
+            window_s=params.cinebrain_window_s,
+            stride_s=params.cinebrain_stride_s,
+            erp_latency_s=params.cinebrain_erp_latency_s,
+            load_frames=bool(params.cinebrain_load_frames),
+        )
+        print('CineBrain clips:', len(cinebrain_inner))
+        cinebrain_iter = CineBrainIterableWrapper(cinebrain_inner)
+
+        # Match the 'mix' branch's epoch size for runtime/LR comparability.
+        n_samples_per_epoch = 1109545
+        pretrained_dataset = WeightedSampleMix(
+            sources=[alljoined_ds, cinebrain_iter],
+            weights=[params.mix_alljoined_weight,
+                     params.mix_cinebrain_weight],
+            samples_per_epoch=n_samples_per_epoch,
+        )
+
+        num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
+        # max_horizon>0 requires the future-aware collate so CineBrain
+        # samples' future stacks survive collation and the world-model
+        # wrapper can route the prediction loss through cinebrain_idx.
+        collate_fn = (
+            collate_cached_with_future if params.max_horizon > 0
+            else collate_cached
+        )
+        data_loader = DataLoader(
+            pretrained_dataset,
+            batch_size=params.batch_size,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            drop_last=True,
+        )
+
     elif params.dataset_dir == 'cinebrain':
         from datasets.cinebrain_dataset import CineBrainDataset, collate_cinebrain
         subjects = [s.strip() for s in params.cinebrain_subjects.split(',') if s.strip()]

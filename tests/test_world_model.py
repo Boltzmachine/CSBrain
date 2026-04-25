@@ -186,5 +186,182 @@ class TestCineBrainDataset(unittest.TestCase):
         self.assertEqual(batch['timeseries_future'].shape[1], 3)  # W
 
 
+class TestWorldModelMixMode(unittest.TestCase):
+    """Simulate ``collate_cached_with_future``: batch of size B, but future
+    stacks only contain the M<B CineBrain rows. Before the fix, the wrapper
+    would index ``patch_emb`` (B rows) with ``has_image_future[:, 0]`` (M
+    rows), crashing at alignment.py:784.
+    """
+
+    def test_mix_mode_future_is_M_rows(self):
+        in_dim, n_ch, n_patches = 40, 8, 2
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+        pred = LatentPredictor(d_model=in_dim, predictor_d_model=64,
+                               n_layers=2, n_heads=4, dim_feedforward=128,
+                               max_horizon=4)
+        wrapper = WorldModelWrapper(encoder=enc, predictor=pred,
+                                    latent_pred_weight=1.0,
+                                    cls_pred_weight=0.1,
+                                    max_horizon=2, ramp_epochs=0)
+        wrapper.train()
+
+        B, M, W = 5, 2, 3  # mix batch: 5 rows total, only 2 from CineBrain
+        cb_idx = torch.tensor([1, 3], dtype=torch.long)
+
+        from datasets.cinebrain_dataset import _BIOSEMI64_COORDS
+        coords = torch.from_numpy(
+            _BIOSEMI64_COORDS[:n_ch]
+        ).unsqueeze(0).expand(B, -1, -1).contiguous()
+
+        ts_full = torch.randn(B, n_ch, n_patches, in_dim) / 100.0
+        # Future stacks only carry the M CineBrain rows — mirror what
+        # collate_cached_with_future produces.
+        ts_future_M = torch.randn(M, W, n_ch, n_patches, in_dim)
+        pv_future_M = torch.zeros(M, W, 3, 224, 224)
+        has_image_future_M = torch.zeros(M, W, dtype=torch.bool)
+
+        # Full-batch image fields at B rows (from collate_cached).
+        pv_B = torch.zeros(B, 3, 224, 224)
+        has_image_B = torch.zeros(B, dtype=torch.bool)
+
+        batch = {
+            'timeseries': ts_full,
+            'ch_coords': coords,
+            'valid_channel_mask': torch.ones(B, n_ch, dtype=torch.bool),
+            'valid_length_mask': torch.ones(B, n_patches, dtype=torch.bool),
+            'image_encoder_inputs': {'pixel_values': pv_B},
+            'has_image': has_image_B,
+            'cinebrain_idx': cb_idx,
+            'timeseries_future': ts_future_M,
+            'pixel_values_future': pv_future_M,
+            'has_image_future': has_image_future_M,
+            'source': ['alljoined', 'cinebrain', 'alljoined',
+                       'cinebrain', 'alljoined'],
+            'session_id': [f'sess-{i}' for i in range(B)],
+        }
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+
+        out, info = wrapper.training_step(batch, mask=mask)
+        self.assertEqual(out.shape, batch['timeseries'].shape)
+        # Prediction branch should fire and use the M-row future stacks.
+        self.assertIn('latent_pred_loss', info)
+        self.assertIn('latent_cls_loss', info)
+        # Sanity: loss is finite and scalar
+        for key in ('latent_pred_loss', 'latent_cls_loss'):
+            coef, val = info[key]
+            self.assertTrue(torch.isfinite(val).item(),
+                            f'{key} not finite: {val}')
+
+        # Backward works end-to-end
+        loss_terms = [v[0] * v[1] for k, v in info.items()
+                      if isinstance(v, tuple) and 'loss' in k]
+        mask_loss = (
+            out[mask == 1] - batch['timeseries'][mask == 1]
+        ).pow(2).mean()
+        (mask_loss + sum(loss_terms)).backward()
+
+    def test_real_collate_cached_with_future(self):
+        """End-to-end: feed the real ``collate_cached_with_future`` a
+        mixed list of Alljoined-like + CineBrain-like per-sample dicts and
+        push the result through the wrapper. Pins down the collate
+        output shapes the wrapper relies on.
+        """
+        in_dim, n_ch, n_patches = 40, 8, 2
+        from datasets.cached_dataset import collate_cached_with_future
+        from datasets.cinebrain_dataset import _BIOSEMI64_COORDS
+
+        coords = torch.from_numpy(_BIOSEMI64_COORDS[:n_ch]).float()
+        sfreq = torch.tensor(200.0, dtype=torch.float32)
+
+        def _aj(with_image: bool):
+            d = {
+                'timeseries': torch.randn(n_ch, n_patches, in_dim),
+                'ch_coords': coords.clone(),
+                'ch_names': ['pad'] * n_ch,
+                'source': 'alljoined',
+                'session_id': 'sess-aj',
+                'sfreq': sfreq,
+            }
+            if with_image:
+                d['pixel_values'] = torch.zeros(3, 224, 224)
+            return d
+
+        def _cb(W: int):
+            d = _aj(with_image=True)
+            d['source'] = 'cinebrain'
+            d['session_id'] = 'sub-0001'
+            d['timeseries_future'] = torch.randn(W, n_ch, n_patches, in_dim)
+            d['pixel_values_future'] = torch.zeros(W, 3, 224, 224)
+            d['has_image_future'] = torch.zeros(W, dtype=torch.bool)
+            return d
+
+        W = 3
+        raw_batch = [_aj(False), _cb(W), _aj(True), _cb(W), _aj(False)]
+        batch = collate_cached_with_future(raw_batch)
+
+        B = len(raw_batch)
+        self.assertEqual(batch['timeseries'].shape[0], B)
+        self.assertEqual(batch['has_image'].shape[0], B)
+        # Future stacks at M=2, not B=5
+        self.assertEqual(batch['cinebrain_idx'].tolist(), [1, 3])
+        self.assertEqual(batch['timeseries_future'].shape[0], 2)
+        self.assertEqual(batch['pixel_values_future'].shape[0], 2)
+        self.assertEqual(batch['has_image_future'].shape[0], 2)
+
+        # Trainer normally divides by 100 before calling the wrapper;
+        # mirror that here.
+        batch['timeseries'] = batch['timeseries'] / 100.0
+
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+        pred = LatentPredictor(d_model=in_dim, predictor_d_model=64,
+                               n_layers=2, n_heads=4, dim_feedforward=128,
+                               max_horizon=4)
+        wrapper = WorldModelWrapper(encoder=enc, predictor=pred,
+                                    max_horizon=2, ramp_epochs=0)
+        wrapper.train()
+
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+        out, info = wrapper.training_step(batch, mask=mask)
+        self.assertEqual(out.shape, batch['timeseries'].shape)
+        self.assertIn('latent_pred_loss', info)
+
+    def test_mix_mode_no_cinebrain_rows_this_step(self):
+        """If the mix sampler drew only Alljoined rows, the future-aware
+        collate returns no future keys and no ``cinebrain_idx``. The
+        wrapper should fall back to plain CSBrainAlign (no prediction
+        losses) without crashing."""
+        in_dim, n_ch, n_patches = 40, 8, 2
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+        pred = LatentPredictor(d_model=in_dim, predictor_d_model=64,
+                               n_layers=2, n_heads=4, dim_feedforward=128,
+                               max_horizon=4)
+        wrapper = WorldModelWrapper(encoder=enc, predictor=pred,
+                                    max_horizon=2, ramp_epochs=0)
+        wrapper.train()
+
+        B = 3
+        from datasets.cinebrain_dataset import _BIOSEMI64_COORDS
+        coords = torch.from_numpy(
+            _BIOSEMI64_COORDS[:n_ch]
+        ).unsqueeze(0).expand(B, -1, -1).contiguous()
+        batch = {
+            'timeseries': torch.randn(B, n_ch, n_patches, in_dim) / 100.0,
+            'ch_coords': coords,
+            'valid_channel_mask': torch.ones(B, n_ch, dtype=torch.bool),
+            'valid_length_mask': torch.ones(B, n_patches, dtype=torch.bool),
+            'image_encoder_inputs': {
+                'pixel_values': torch.zeros(B, 3, 224, 224)},
+            'has_image': torch.zeros(B, dtype=torch.bool),
+            'source': ['alljoined'] * B,
+        }
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+        out, info = wrapper.training_step(batch, mask=mask)
+        self.assertEqual(out.shape, batch['timeseries'].shape)
+        self.assertNotIn('latent_pred_loss', info)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

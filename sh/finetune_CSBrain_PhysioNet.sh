@@ -41,7 +41,7 @@ echo "Job started at $(date)" | tee -a "$LOG_FILE"
 #     --weight_decay  0.01 \
 #     --lr 0.00005 
 
-FOUNDATION_DIR="outputs/worldmodel-cinebrain-v1-20-maskonly/epoch15_loss0.01979984901845455.pth"
+FOUNDATION_DIR="outputs/worldmodel-mix-cinebrain-v4/epoch13_loss0.5890316367149353.pth"
 CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
 EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
 WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}"
@@ -55,17 +55,32 @@ python finetune_main.py \
     --foundation_dir "$FOUNDATION_DIR" \
     --wandb_run_name "$WANDB_RUN_NAME" \
     --results_csv outputs/finetune_results.csv \
-    --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --use_pretrained_weights \
-    --in_dim 20 \
-    --out_dim 20 \
-    --d_model 20 \
-    --seq_len 10 \
-    --nhead 4 \
-    --n_layer 12 \
     --dropout 0.3 \
     --weight_decay  0.01 \
-    --lr 0.00005 
+    --lr 0.00005
+
+
+# VISION_ENCODER="facebook/dinov2-base"   # swap to DINOv3 id once access is granted
+# IMAGE_MODE="raw"                        # 'raw' matches the paper; 'spectrogram' = STFT grid
+# WANDB_RUN_NAME="dinov3eeg_$(basename ${VISION_ENCODER})_${IMAGE_MODE}_lora"
+
+# python finetune_main.py \
+#     --model DINOv3EEG \
+#     --downstream_dataset PhysioNet-MI \
+#     --datasets_dir data/preprocessed/physionet_mi \
+#     --num_of_classes 4 \
+#     --model_dir outputs/CSBrain/finetune_DINOv3EEG_PhysioNet \
+#     --vision_encoder "$VISION_ENCODER" \
+#     --image_mode "$IMAGE_MODE" \
+#     --use_lora \
+#     --lora_rank 256 \
+#     --lora_alpha 32 \
+#     --wandb_run_name "$WANDB_RUN_NAME" \
+#     --results_csv outputs/finetune_results.csv \
+#     --dropout 0.1 \
+#     --weight_decay 0.01 \
+#     --lr 0.0001
 
 wait
 

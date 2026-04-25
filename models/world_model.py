@@ -13,6 +13,7 @@ See ``plans/world_model.md`` for the design rationale. Two modules live here:
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Optional
 
@@ -140,6 +141,7 @@ class WorldModelWrapper(nn.Module):
         cls_pred_weight: float = 0.1,
         max_horizon: int = 1,
         ramp_epochs: int = 2,
+        target_momentum: float = 0.998,
     ):
         super().__init__()
         self.encoder = encoder
@@ -152,10 +154,32 @@ class WorldModelWrapper(nn.Module):
         self.cls_pred_weight = cls_pred_weight
         self.max_horizon = max_horizon
         self.ramp_epochs = ramp_epochs
+        self.target_momentum = target_momentum
         # The trainer writes ``current_epoch`` before each epoch so the
         # wrapper can ramp its loss weights without needing its own hook.
         self.register_buffer(
             'current_epoch', torch.tensor(0.0), persistent=False)
+
+        # EMA target encoder — used only when the predictor is active.
+        # Why: the regression target ``s_{t+k}`` is a function of the
+        # encoder weights; if it's computed by the online encoder, every
+        # optimizer step shifts the target in the same direction as the
+        # online net just moved, so there's no fixed point for the
+        # predictor to chase. The EMA copy keeps the target quasi-static
+        # across steps, which is what actually anchors the dynamic
+        # (mask-recon prevents trivial-constant collapse, but leaves a
+        # drift direction in the null-space of reconstruction).
+        if self.predictor is not None and self.max_horizon >= 1:
+            self.target_encoder = copy.deepcopy(encoder)
+            # ``encode()`` does not invoke the DINOv2 image encoder, so
+            # drop it from the target to avoid doubling that memory.
+            if hasattr(self.target_encoder, 'pretrained_image_encoder'):
+                del self.target_encoder.pretrained_image_encoder
+            for p in self.target_encoder.parameters():
+                p.requires_grad = False
+            self.target_encoder.eval()
+        else:
+            self.target_encoder = None
 
     # ------------------------------------------------------------------
 
@@ -167,8 +191,83 @@ class WorldModelWrapper(nn.Module):
     def _encode_future(self, batch_future: dict) -> tuple[torch.Tensor, torch.Tensor]:
         # encode() mutates its batch argument (global-token concat); pass
         # a shallow copy so the caller's ``batch`` dict is unaffected.
-        with torch.no_grad():
-            return self.encoder.encode({**batch_future})
+        # Route through the EMA target_encoder in eval() mode — this
+        # (a) decouples the target from same-step online updates, and
+        # (b) suppresses dropout/BN updates in the target path so the
+        # regression target is deterministic.
+        target = self.target_encoder if self.target_encoder is not None else self.encoder
+        was_training = target.training
+        target.eval()
+        try:
+            with torch.no_grad():
+                return target.encode({**batch_future})
+        finally:
+            if was_training:
+                target.train()
+
+    @torch.no_grad()
+    def update_target_encoder(self, momentum: Optional[float] = None) -> None:
+        """EMA update of ``target_encoder`` from ``encoder``. Call after
+        ``optimizer.step()``. No-op when no target encoder is configured.
+
+        Iterates by name because ``target_encoder`` drops
+        ``pretrained_image_encoder`` — zipping by positional order would
+        mis-align parameters past that module.
+        """
+        if self.target_encoder is None:
+            return
+        m = self.target_momentum if momentum is None else float(momentum)
+        online_params = dict(self.encoder.named_parameters())
+        for name, p_target in self.target_encoder.named_parameters():
+            p_online = online_params.get(name)
+            if p_online is None:
+                continue
+            p_target.data.mul_(m).add_(p_online.data, alpha=1.0 - m)
+        # Buffers (e.g. BN running stats if present) should track the
+        # online encoder — copy directly, momentum is unnecessary.
+        online_bufs = dict(self.encoder.named_buffers())
+        for name, b_target in self.target_encoder.named_buffers():
+            b_online = online_bufs.get(name)
+            if b_online is None:
+                continue
+            b_target.data.copy_(b_online.data)
+
+    def _build_future_subbatch(
+        self,
+        batch: dict,
+        cb_idx: torch.Tensor,
+        window_idx: int,
+    ) -> dict:
+        """Build an encoder batch for a future window, restricted to the
+        rows in ``cb_idx`` (samples that carry a future stack).
+
+        ``timeseries_future`` and friends in ``batch`` are expected to be
+        already filtered to those rows (M = len(cb_idx)) — this matches
+        ``collate_cached_with_future`` (mix mode) and ``collate_cinebrain``
+        (pure CineBrain mode, where every row is a CineBrain row).
+
+        Per-sample fields keyed on the full batch dimension B
+        (``ch_coords``, masks, lists) are sliced via ``cb_idx``.
+        """
+        ts_f = batch['timeseries_future']  # (M, W, C, N, d)
+        out = {
+            'timeseries': ts_f[:, window_idx] / 100.0,
+            'ch_coords': batch['ch_coords'][cb_idx],
+        }
+        for k in ('valid_channel_mask', 'valid_length_mask'):
+            if k in batch:
+                out[k] = batch[k][cb_idx]
+        cb_list = cb_idx.tolist()
+        if 'ch_names' in batch:
+            out['ch_names'] = [batch['ch_names'][i] for i in cb_list]
+        if 'source' in batch:
+            out['source'] = [batch['source'][i] for i in cb_list]
+        pv_f = batch.get('pixel_values_future')
+        has_f = batch.get('has_image_future')
+        if pv_f is not None and has_f is not None:
+            out['image_encoder_inputs'] = {'pixel_values': pv_f[:, window_idx]}
+            out['has_image'] = has_f[:, window_idx]
+        return out
 
     def _build_alignment_batch(
         self,
@@ -203,18 +302,33 @@ class WorldModelWrapper(nn.Module):
                   'source'):
             if k in batch:
                 out[k] = batch[k]
-        pv_f = batch.get('pixel_values_future')
-        has_f = batch.get('has_image_future')
-        if pv_f is not None and has_f is not None:
-            out['image_encoder_inputs'] = {'pixel_values': pv_f[:, window_idx]}
-            out['has_image'] = has_f[:, window_idx]
+        if window_idx == 0:
+            # Every collate that feeds this wrapper (collate_cached,
+            # collate_cached_with_future, collate_cinebrain) populates
+            # ``image_encoder_inputs`` / ``has_image`` at full batch B,
+            # aligned with ``batch['timeseries']``. The future stacks
+            # (``pixel_values_future``, ``has_image_future``) may be
+            # sliced to only the M CineBrain rows in mix mode, so do NOT
+            # use them here — that would mismatch the B rows of ``ts``.
+            if 'image_encoder_inputs' in batch:
+                out['image_encoder_inputs'] = batch['image_encoder_inputs']
+            if 'has_image' in batch:
+                out['has_image'] = batch['has_image']
+        else:
+            pv_f = batch.get('pixel_values_future')
+            has_f = batch.get('has_image_future')
+            if pv_f is not None and has_f is not None:
+                out['image_encoder_inputs'] = {'pixel_values': pv_f[:, window_idx]}
+                out['has_image'] = has_f[:, window_idx]
         return out
 
     # ------------------------------------------------------------------
 
     def training_step(self, batch: dict, mask: Optional[torch.Tensor] = None):
         # 1. Primary forward on window t — produces the existing
-        #    reconstruction output + alignment/recon loss terms.
+        #    reconstruction output + alignment/recon loss terms. Runs on
+        #    the full mixed batch (CineBrain + Alljoined) so masked recon
+        #    and image alignment train on every sample.
         encoder_batch = self._build_alignment_batch(batch, window_idx=0)
         out, info = self.encoder(encoder_batch, mask=mask)
 
@@ -224,25 +338,44 @@ class WorldModelWrapper(nn.Module):
         if self.predictor is None or self.max_horizon < 1:
             return out, info
 
-        # With a predictor wired up, the dataset MUST supply future
-        # windows; otherwise the run is misconfigured and we want to
-        # crash loudly instead of silently degrading to no-prediction.
-        ts_future = batch['timeseries_future']
+        # Determine which rows in the batch carry a future-window stack:
+        #   - ``collate_cached_with_future`` (mix mode) sets cinebrain_idx
+        #     and packs only those rows into ``timeseries_future``.
+        #   - ``collate_cinebrain`` (pure CineBrain mode) packs every row
+        #     into ``timeseries_future`` and does not set cinebrain_idx;
+        #     in that case the prediction loss applies to the whole batch.
+        if 'cinebrain_idx' in batch:
+            cb_idx = batch['cinebrain_idx']
+        elif 'timeseries_future' in batch:
+            cb_idx = torch.arange(
+                batch['timeseries_future'].size(0),
+                device=batch['timeseries_future'].device,
+                dtype=torch.long,
+            )
+        else:
+            # Mixed batch with no CineBrain rows this step (or a config
+            # that supplies no futures at all) — no prediction to compute.
+            return out, info
+
+        if cb_idx.numel() == 0:
+            return out, info
+
+        ts_future = batch['timeseries_future']  # (M, W, C, N, d)
         W = ts_future.size(1)
         assert W >= self.max_horizon + 1, (
             f"timeseries_future has W={W} windows but max_horizon="
             f"{self.max_horizon} needs at least {self.max_horizon + 1}")
-        k = torch.randint(1, self.max_horizon + 1, ()).item()
+        k = int(torch.randint(1, self.max_horizon + 1, ()).item())
 
         # CSBrainAlign.forward always populates ``patch_tokens``; if it
         # doesn't, the contract is broken and we want to know.
-        s_t_patch = info['patch_tokens']
+        s_t_patch = info['patch_tokens'][cb_idx]
 
-        x_t = encoder_batch['timeseries']  # (B, C, N, d)
+        x_t = encoder_batch['timeseries'][cb_idx]  # (M, C, N, d)
         x_t_patch_emb = self.encoder.patch_embedding(x_t, None)
 
-        future_batch = self._build_alignment_batch(
-            batch, window_idx=k)
+        future_batch = self._build_future_subbatch(
+            batch, cb_idx, window_idx=k)
         s_tpk_cls, s_tpk_patch = self._encode_future(future_batch)
         s_tpk_patch = s_tpk_patch.detach()
         s_tpk_cls = s_tpk_cls.detach()
@@ -267,12 +400,24 @@ class WorldModelWrapper(nn.Module):
         info['latent_cls_loss'] = (
             self.cls_pred_weight * scale, aux_cls_loss)
 
-        # Diagnostic: patch-token cosine similarity between prediction
-        # and target (averaged over all positions in the batch).
+        # Diagnostics. ``diag_`` prefix lets the trainer pick them up
+        # without confusing them for loss terms. Needed to distinguish the
+        # "scale runaway" failure mode (all norms grow together) from the
+        # "predictor-only" failure mode (norms stable, cosine collapses).
         with torch.no_grad():
             a = F.normalize(pred_patch.flatten(end_dim=-2), dim=-1)
             b = F.normalize(s_tpk_patch.flatten(end_dim=-2), dim=-1)
-            info['latent_pred_cos'] = (a * b).sum(-1).mean()
+            info['diag_latent_pred_cos'] = (a * b).sum(-1).mean()
+            info['diag_s_t_patch_norm'] = s_t_patch.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_s_tpk_patch_norm'] = s_tpk_patch.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_pred_patch_norm'] = pred_patch.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_pred_cls_norm'] = pred_cls.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_s_tpk_cls_norm'] = s_tpk_cls.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_predictor_out_w_norm'] = (
+                self.predictor.out_proj_patch.weight.detach().norm()
+            )
+            info['diag_pred_ramp_scale'] = torch.tensor(
+                scale, device=pred_patch.device)
 
         return out, info
 

@@ -76,7 +76,8 @@ python pretrain_main.py \
     --nhead 4 \
     --samples_per_session 8 \
     --sessions_per_batch 16 \
-    --run_name cinebrain
+    --optimizer Muon \
+    --run_name alljoined-muon
 
 
 # ============================================================

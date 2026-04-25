@@ -3,6 +3,7 @@ import torch.nn as nn
 from functools import partial
 from .CSBrain import *
 from models import get_model
+from utils.util import load_pretrain_checkpoint
 
 
 class Model(nn.Module):
@@ -72,7 +73,9 @@ class Model(nn.Module):
 
         if param.use_pretrained_weights:
             map_location = "cuda" if torch.cuda.is_available() else "cpu"
-            state_dict = torch.load(param.foundation_dir, map_location=map_location)
+            state_dict, _ = load_pretrain_checkpoint(
+                param.foundation_dir, map_location=map_location
+            )
 
             # --- Normalise key prefixes ---
             # DataParallel wrapping
@@ -82,41 +85,40 @@ class Model(nn.Module):
             # WorldModelWrapper wraps a CSBrainAlign under "encoder." and
             # (optionally) a LatentPredictor under "predictor.". Finetuning
             # only uses the encoder: strip the prefix and drop anything that
-            # doesn't belong to it. CSBrainAlign has no top-level "encoder"
-            # submodule, so the prefix is an unambiguous wrapper marker.
-            is_world_model_ckpt = any(k.startswith("encoder.") for k in state_dict)
+            # doesn't belong to it. CSBrainAlign itself has a top-level
+            # ``encoder`` submodule (the transformer stack), so we can't key
+            # off ``encoder.`` alone -- look for keys that only exist under
+            # the wrapper, e.g. ``encoder.patch_embed.`` or ``predictor.``.
+            is_world_model_ckpt = any(
+                k.startswith("encoder.patch_embed.")
+                or k.startswith("encoder.TemEmbedEEGLayer.")
+                or k.startswith("predictor.")
+                for k in state_dict
+            )
             if is_world_model_ckpt:
+                use_prefix = "encoder."
                 state_dict = {
-                    k[len("encoder."):]: v
+                    k[len(use_prefix):]: v
                     for k, v in state_dict.items()
-                    if k.startswith("encoder.")
+                    if k.startswith(use_prefix)
                 }
+
+                # del self.backbone.pretrained_image_encoder
 
             # --- Handle DINO-pretrained checkpoints ---
             # The teacher (EMA-smoothed) produces better representations than
             # the student, so we load teacher weights for finetuning.
             is_dino_ckpt = any(k.startswith("teacher.") for k in state_dict)
             if is_dino_ckpt:
-                # Extract teacher backbone weights and strip the "teacher." prefix
+                # Extract teacher backbone weights and strip the "teacher." prefix.
+                # Sibling top-level modules (student.*, *_dino_head.*, *_ibot_head.*,
+                # *_criterion.*, freq_subband_view.*) are dropped implicitly by
+                # the filter below.
                 teacher_dict = {}
                 for k, v in state_dict.items():
-                    if k.startswith("teacher."):
-                        teacher_dict[k[len("teacher."):]] = v
+                    if k.startswith("student."):
+                        teacher_dict[k[len("student."):]] = v
                 state_dict = teacher_dict
-
-                # Remove DINO-only keys that don't belong to the backbone
-                dino_prefixes = (
-                    "student_dino_head.",
-                    "teacher_dino_head.",
-                    "student_ibot_head.",
-                    "teacher_ibot_head.",
-                    "dino_criterion.",
-                    "ibot_criterion.",
-                    "freq_subband_view.",
-                )
-                for prefix in dino_prefixes:
-                    for k in [k for k in state_dict if k.startswith(prefix)]:
-                        del state_dict[k]
 
             if is_dino_ckpt:
                 # The teacher had these modules deleted to save GPU memory
@@ -126,9 +128,7 @@ class Model(nn.Module):
                              'contrastive_proj', 'equiv_projector'):
                     if hasattr(self.backbone, attr):
                         delattr(self.backbone, attr)
-
             missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
-
             # ``equiv_projector`` is an optional pretraining-only head; tolerate
             # it in the checkpoint but fail loudly on anything else.
             unexpected_keys = [k for k in unexpected_keys
@@ -154,12 +154,42 @@ class Model(nn.Module):
         x = batch.pop('x')
         x = x.reshape(x.size(0), x.size(1), -1, self.param.in_dim)
         bz, ch_num, seq_len, patch_size = x.shape
-        batch['timeseries'] = x
-        feats = self.backbone(batch)
-        if isinstance(feats, tuple):
-            feats = feats[1]["rep"]
+
+        self.param.segment_forward = True
+        if getattr(self.param, 'segment_forward', False) and seq_len > self.param.seq_len:
+            # Pretrained encoder expects seq_len=self.param.seq_len; the finetune
+            # input is longer, so split along time and encode each segment
+            # independently. Segments are packed into the batch dim so the
+            # encoder runs in a single forward call.
+            seg_len = self.param.seq_len
+            assert seq_len % seg_len == 0, (
+                f"time dim {seq_len} not divisible by pretrained seq_len {seg_len}")
+            n_seg = seq_len // seg_len
+
+            x_seg = x.view(bz, ch_num, n_seg, seg_len, patch_size) \
+                     .permute(0, 2, 1, 3, 4).contiguous() \
+                     .view(bz * n_seg, ch_num, seg_len, patch_size)
+
+            seg_batch = {'timeseries': x_seg}
+            for k, v in batch.items():
+                if torch.is_tensor(v):
+                    seg_batch[k] = v.repeat_interleave(n_seg, dim=0)
+
+            feats = self.backbone(seg_batch)
+            if not isinstance(feats, tuple):
+                raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
+            feats = feats[1]["rep"]  # (bz*n_seg, C', N', D)
+            _, Cp, Np, D = feats.shape
+            feats = feats.view(bz, n_seg, Cp, Np, D) \
+                         .permute(0, 2, 1, 3, 4).contiguous() \
+                         .view(bz, Cp, n_seg * Np, D)
         else:
-            raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
+            batch['timeseries'] = x
+            feats = self.backbone(batch)
+            if not isinstance(feats, tuple):
+                raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
+            feats = feats[1]["rep"]
+
         out = feats.contiguous().view(bz, -1)
         out = self.classifier(out)
         return out

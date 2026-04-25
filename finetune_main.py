@@ -12,6 +12,7 @@ from datasets import tusl_dataset, siena_dataset, hmc_dataset
 from finetune_trainer import Trainer
 from models import model_for_seedv,model_for_bciciv2a, model_for_tuab, model_for_tuev,model_for_faced,model_for_chb,model_for_speech,model_for_tusl,model_for_shu,model_for_seedvig,model_for_physio,model_for_isruc
 from models import model_for_siena, model_for_hmc,model_for_stress,model_for_mumtaz
+from utils.util import load_pretrain_checkpoint, apply_arch_params
 import wandb
 
 def main():
@@ -22,7 +23,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=64, help='batch size for training (default: 32)')
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate (default: 1e-3)')
     parser.add_argument('--weight_decay', type=float, default=5e-2, help='weight decay (default: 1e-2)')
-    parser.add_argument('--optimizer', type=str, default='AdamW', help='optimizer (AdamW, SGD)')
+    parser.add_argument('--optimizer', type=str, default='AdamW', help='optimizer (AdamW, SGD, Muon)')
+    parser.add_argument('--muon_lr', type=float, default=0.02,
+                        help='learning rate for the Muon parameter group (only used when --optimizer Muon); --lr is used for the AdamW group')
     parser.add_argument('--clip_value', type=float, default=1, help='clip_value')
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
 
@@ -68,6 +71,13 @@ def main():
     parser.add_argument('--results_csv', type=str, default=None, help='path to CSV file for logging results')
     parser.add_argument('--hemisphere_flip_aug', action='store_true', default=False,
                         help='hemisphere-flip data augmentation with label swap (motor imagery)')
+    parser.add_argument('--segment_forward', action='store_true', default=False,
+                        help='split the input time dim into segments of size seq_len, '
+                             'encode each with the pretrained encoder, and concat the '
+                             'resulting representations along the time axis. Use when '
+                             'the finetune time dim exceeds the pretrained seq_len '
+                             '(e.g. world-model pretraining with seq_len=5 applied '
+                             'to PhysioNet with time dim 20).')
 
     # --- SSM/Mamba multi-frequency patch embedding ---
     parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'],
@@ -79,9 +89,29 @@ def main():
     parser.add_argument('--mamba_d_conv', type=int, default=4, help='Mamba depthwise conv width')
     parser.add_argument('--mamba_expand', type=int, default=2, help='Mamba expansion factor')
 
+    # --- DINOv3/v2 EEG-to-image classifier ---
+    parser.add_argument('--vision_encoder', type=str, default='facebook/dinov2-base',
+                        help='HuggingFace model id for the DINO image encoder (used by --model DINOv3EEG)')
+    parser.add_argument('--image_mode', type=str, default='raw',
+                        choices=['raw', 'spectrogram'],
+                        help="EEG->image transform: 'raw' (C,T) 2D layout (paper default) "
+                             "or 'spectrogram' per-channel STFT grid")
+    parser.add_argument('--image_size', type=int, default=0, help='override DINO image size; 0 means use the processor default')
+    parser.add_argument('--stft_n_fft', type=int, default=64, help='STFT n_fft for EEG->image (spectrogram mode only)')
+    parser.add_argument('--stft_hop_length', type=int, default=16, help='STFT hop length for EEG->image (spectrogram mode only)')
+    parser.add_argument('--use_lora', action='store_true', help='attach LoRA adapters to DINO attention Q/K/V')
+    parser.add_argument('--lora_rank', type=int, default=8, help='LoRA rank')
+    parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA alpha')
+    parser.add_argument('--freeze_backbone', action='store_true', help='freeze the DINO encoder (linear probing)')
+
     params = parser.parse_args()
     if os.environ.get("DEBUG", "0") == "1":
         params.batch_size = 2
+
+    if params.use_pretrained_weights and params.foundation_dir:
+        _, saved_params = load_pretrain_checkpoint(params.foundation_dir)
+        apply_arch_params(params, saved_params)
+
     print(params)
 
     setup_seed(params.seed)
@@ -104,7 +134,11 @@ def main():
     elif params.downstream_dataset == 'PhysioNet-MI':
         load_dataset = physio_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
-        model = model_for_physio.Model(params)
+        if params.model == 'DINOv3EEG':
+            from models import dinov3_eeg
+            model = dinov3_eeg.Model(params)
+        else:
+            model = model_for_physio.Model(params)
         t = Trainer(params, data_loader, model)
         results = t.train_for_multiclass()
     elif params.downstream_dataset == 'SHU-MI':

@@ -21,4 +21,6 @@ python pretrain_main.py \
     --d_model 40 \
     --seq_len 20 \
     --nhead 4 \
-    --run_name Spectral-4band-3level-40d
+    --saliency_rollout_skip_layers 2 \
+    --vision_encoder facebook/dinov2-base \
+    --run_name Spectral-4band-3level-40d-dinov2

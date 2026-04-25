@@ -1,3 +1,4 @@
+import json
 import math
 import re
 
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 from models.CSBrain_transformerlayer import *
 from models.CSBrain_transformer import *
 from models.adversarial import SessionDiscriminator
+from models.llm_vq import LLMEmbeddingVQ
 from collections import Counter
 from collections import defaultdict
 
@@ -315,8 +317,11 @@ class CSBrainAlign(nn.Module):
                  alignment_weight=1.0,
                  patch_embed_type='cnn',
                  mamba_band_periods=None, n_mamba_layers=2,
-                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2):
+                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 use_llm_vq=False, num_language_tokens=8,
+                 max_llm_codebook_size=4096, llm_vq_aux_weight=0.1):
         super().__init__()
+        self.d_model = d_model
         self.causal = causal
         self.project_to_source = project_to_source # Does not work
         self.adversarial_weight = adversarial_weight
@@ -324,6 +329,9 @@ class CSBrainAlign(nn.Module):
         self.info_max_weight = info_max_weight
         self.alignment_weight = alignment_weight
         self.patch_embed_type = patch_embed_type
+        self.use_llm_vq = use_llm_vq
+        self.num_language_tokens = num_language_tokens
+        self.llm_vq_aux_weight = llm_vq_aux_weight
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
         self.source_projector = SourceProjector(
@@ -424,6 +432,12 @@ class CSBrainAlign(nn.Module):
             nn.Linear(d_model, 768),
         )
 
+        if self.use_llm_vq:
+            self._build_llm_vq_path(
+                d_model=d_model,
+                max_llm_codebook_size=max_llm_codebook_size,
+            )
+
         # Equivariance projection head — discarded at fine-tuning so the
         # backbone representation stays unconstrained.
         if equivariance_weight > 0:
@@ -437,6 +451,49 @@ class CSBrainAlign(nn.Module):
 
         self.features_by_layer = []
         self.input_features = []
+
+    def _build_llm_vq_path(self, d_model, max_llm_codebook_size):
+        """Project global token -> K language tokens via LLM-embedding VQ,
+        then concat+MLP to produce the contrastive prediction."""
+        from transformers import AutoModel
+
+        llm_id = "meta-llama/Llama-2-7b-hf"
+        llm_model = AutoModel.from_pretrained(llm_id, device_map='cpu')
+        llm_embedding_bank = llm_model.get_input_embeddings().weight.data.clone()
+        llama_dim = llm_embedding_bank.size(-1)
+        del llm_model
+        torch.cuda.empty_cache()
+
+        self.global_to_k_tokens = nn.Linear(
+            d_model, self.num_language_tokens * d_model,
+        )
+        self.llm_vq = LLMEmbeddingVQ(
+            input_dim=d_model,
+            llm_embedding_dim=llama_dim,
+            max_codebook_size=max_llm_codebook_size,
+        )
+
+        token_freq_entries = json.load(open("data/llama2_token_frequencies.json", "r"))
+        llm_token_frequencies = torch.zeros(
+            llm_embedding_bank.size(0), dtype=torch.long,
+        )
+        for i, item in enumerate(token_freq_entries):
+            token_id = int(item["token_id"])
+            assert i == token_id, (
+                "Token IDs in the frequency file should match their index."
+            )
+            llm_token_frequencies[token_id] = int(item["count"])
+
+        self.llm_vq.set_llm_embedding_bank(
+            llm_embedding_bank=llm_embedding_bank,
+            token_frequencies=llm_token_frequencies,
+        )
+
+        self.llm_contrastive_proj = nn.Sequential(
+            nn.Linear(self.num_language_tokens * llama_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 768),
+        )
 
     def compute_zero_lag_sync_loss(self, source_emb):
         # Zero-lag synchronization regularizer on projected sources.
@@ -729,11 +786,28 @@ class CSBrainAlign(nn.Module):
                     branch_embs = patch_emb
                 if 'image_encoder_inputs' in batch and has_image.any() and self.alignment_weight > 0:
                     image_encoder_inputs = {k: v[has_image] for k, v in batch['image_encoder_inputs'].items()}
-                    if self.add_global:
-                        semantic_emb = self.semantic_readout(branch_embs[:, 0, 0, :])
+                    if self.use_llm_vq:
+                        assert self.add_global, "LLM VQ path requires add_global=True."
+                        global_branch = branch_embs[:, 0, 0, :]  # (B_img, d_model)
+                        k_tokens = self.global_to_k_tokens(global_branch).view(
+                            global_branch.size(0), self.num_language_tokens, self.d_model,
+                        )
+                        _, vq_info = self.llm_vq(k_tokens.unsqueeze(2))  # (B, K, 1, d_model)
+                        quantized = vq_info["quantized"].view(
+                            global_branch.size(0), self.num_language_tokens, -1,
+                        )  # (B_img, K, llama_dim)
+                        pred_flatten = self.llm_contrastive_proj(
+                            quantized.reshape(quantized.size(0), -1)
+                        )
+                        contrastive_loss["llm_vq_aux_loss"] = (
+                            self.llm_vq_aux_weight, vq_info["aux_loss"],
+                        )
                     else:
-                        semantic_emb = self.semantic_readout(branch_embs.view(branch_embs.size(0), branch_embs.size(1), -1))
-                    pred_flatten = self.contrastive_proj(semantic_emb) # (B, n_events, d_model) <- does not work
+                        if self.add_global:
+                            semantic_emb = self.semantic_readout(branch_embs[:, 0, 0, :])
+                        else:
+                            semantic_emb = self.semantic_readout(branch_embs.view(branch_embs.size(0), branch_embs.size(1), -1))
+                        pred_flatten = self.contrastive_proj(semantic_emb) # (B, n_events, d_model) <- does not work
 
                     image_hidden_states = self.get_image_hidden_states(**image_encoder_inputs) # (B, n_events, n_branch, d_model)
                     image_hidden_states_branch = image_hidden_states[:, i_branch] # (B, n_events, d_model)

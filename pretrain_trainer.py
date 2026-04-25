@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn import MSELoss
 from tqdm import tqdm
-from utils.util import generate_mask
+from utils.util import generate_mask, save_pretrain_checkpoint, build_muon_optimizer
 import os
 import wandb
 import time
@@ -38,10 +38,23 @@ class Trainer(object):
 
         # Only optimise parameters that require gradients (teacher params
         # in DINOEEGModel are frozen).
-        trainable_params = [p for p in self.model.parameters()
-                            if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(trainable_params, lr=self.params.lr,
-                                           weight_decay=self.params.weight_decay)
+        optimizer_name = getattr(self.params, 'optimizer', 'AdamW')
+        if optimizer_name == 'Muon':
+            self.optimizer = build_muon_optimizer(
+                self.model,
+                lr=self.params.lr,
+                weight_decay=self.params.weight_decay,
+                muon_lr=getattr(self.params, 'muon_lr', 0.02),
+            )
+        else:
+            trainable_params = [p for p in self.model.parameters()
+                                if p.requires_grad]
+            self.optimizer = torch.optim.AdamW(trainable_params, lr=self.params.lr,
+                                               weight_decay=self.params.weight_decay)
+        # Cache initial LRs so the linear warmup below scales each
+        # param group proportionally rather than slamming them to a
+        # single value (Muon + AdamW have different base LRs).
+        self._base_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
 
         # --- Adversarial session discriminator ---
         self.adversarial_weight = getattr(self.params, 'adversarial_weight', 0.0)
@@ -91,7 +104,7 @@ class Trainer(object):
             * self.data_length
         )
         lr_warmup_iters = getattr(self.params, 'lr_warmup_iters', 0)
-        base_lr = self.params.lr
+        base_lrs = self._base_lrs
 
         for epoch in range(self.params.epochs):
             # Let world-model wrappers ramp their prediction weight.
@@ -125,6 +138,10 @@ class Trainer(object):
                                     logs[key] = lss.data.cpu().numpy()
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
+                                elif key.startswith('diag_'):
+                                    logs[key] = (
+                                        value.detach().cpu().numpy()
+                                        if torch.is_tensor(value) else value)
 
                         if info.get('dino_mode', False):
                             # DINO replaces the primary causal loss
@@ -153,6 +170,10 @@ class Trainer(object):
                                     logs[key] = lss.data.cpu().numpy()
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
+                                elif key.startswith('diag_'):
+                                    logs[key] = (
+                                        value.detach().cpu().numpy()
+                                        if torch.is_tensor(value) else value)
                         if info.get('dino_mode', False):
                             # DINO + iBOT replace the masked reconstruction loss
                             loss = sum(loss_dict.values())
@@ -176,6 +197,10 @@ class Trainer(object):
                                     logs[key] = lss.data.cpu().numpy()
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
+                                elif key.startswith('diag_'):
+                                    logs[key] = (
+                                        value.detach().cpu().numpy()
+                                        if torch.is_tensor(value) else value)
 
                         loss = sum(loss_dict.values())
                 else:
@@ -244,20 +269,28 @@ class Trainer(object):
 
                 loss.backward()
                 if self.params.clip_value > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
+                logs["grad_norm"] = grad_norm.data.cpu().numpy()
 
                 # --- Linear LR warmup (overrides scheduler during warmup) ---
                 iteration = epoch * self.data_length + batch_idx
                 if lr_warmup_iters > 0 and iteration < lr_warmup_iters:
-                    warmup_lr = base_lr * (iteration + 1) / lr_warmup_iters
-                    for pg in self.optimizer.param_groups:
-                        pg['lr'] = warmup_lr
+                    factor = (iteration + 1) / lr_warmup_iters
+                    for pg, base in zip(self.optimizer.param_groups, base_lrs):
+                        pg['lr'] = base * factor
 
                 self.optimizer.step()
                 # Only step the cosine scheduler after warmup ends so the
                 # schedule isn't consumed during the warmup phase.
                 if iteration >= lr_warmup_iters:
                     self.optimizer_scheduler.step()
+
+                # --- World-model EMA target encoder update ---
+                wm_model = self.model.module if hasattr(self.model, 'module') else self.model
+                if hasattr(wm_model, 'update_target_encoder'):
+                    wm_model.update_target_encoder()
 
                 # --- DINOv2 EMA teacher update & schedule step ---
                 dino_model = self._get_dino_model()
@@ -280,11 +313,11 @@ class Trainer(object):
             mean_loss = np.mean(losses)
             learning_rate = self.optimizer.state_dict()['param_groups'][0]['lr']
             print(f'Epoch {epoch+1}: Training Loss: {mean_loss:.6f}, Learning Rate: {learning_rate:.6f}')
-            if mean_loss < best_loss:
+            if True: #mean_loss < best_loss:
                 # if self.params.model != 'OurModel' or (self.params.model == 'OurModel' and epoch % 10 == 0):
                 model_path = rf'{self.params.model_dir}/epoch{epoch+1}_loss{mean_loss}.pth'
                 os.makedirs(os.path.dirname(model_path), exist_ok=True)
-                torch.save(self.model.state_dict(), model_path)
+                save_pretrain_checkpoint(model_path, self.model, self.params)
                 print("Model saved at " + model_path)
                 best_loss = mean_loss
 

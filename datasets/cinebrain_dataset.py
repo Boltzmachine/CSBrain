@@ -30,7 +30,7 @@ from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 
 # ---------------------------------------------------------------------------
@@ -370,3 +370,117 @@ def collate_cinebrain(batch):
         'source': [b['source'] for b in batch],
         'session_id': [b.get('session_id', 'unknown') for b in batch],
     }
+
+
+# ---------------------------------------------------------------------------
+# Iterable adapter — yield single-window CineBrain samples in the dict format
+# consumed by ``datasets.cached_dataset.collate_cached``. Used to mix
+# CineBrain with the Alljoined webdataset under a single dataloader.
+#
+# Requires ``n_windows=1`` upstream so we don't waste preprocessing on windows
+# that would just be discarded; mixed batches don't carry a future stack.
+# ---------------------------------------------------------------------------
+
+class CineBrainIterableWrapper(IterableDataset):
+    """Adapt :class:`CineBrainDataset` to an IterableDataset whose items
+    match the schema expected by ``collate_cached``.
+
+    When the underlying dataset has ``n_windows > 1`` we additionally
+    emit per-sample future-window fields (``timeseries_future``,
+    ``pixel_values_future``, ``has_image_future``) so a future-aware
+    collate can route them to the world-model predictor without
+    touching the Alljoined samples in the same batch.
+
+    Iteration is infinite — the outer mixer / DataLoader bounds the epoch.
+    Each worker draws independent random indices from its own RNG.
+    """
+
+    def __init__(self, dataset: CineBrainDataset, seed: Optional[int] = None):
+        super().__init__()
+        assert dataset.n_windows >= 1
+        self.dataset = dataset
+        self.seed = seed
+        self.has_future = dataset.n_windows > 1
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if self.seed is not None:
+            base_seed = self.seed + (
+                worker_info.id if worker_info is not None else 0)
+        elif worker_info is not None:
+            base_seed = worker_info.seed
+        else:
+            base_seed = None
+        rng = np.random.default_rng(base_seed)
+        n = len(self.dataset)
+        sfreq = torch.tensor(self.dataset.fs_out, dtype=torch.float32)
+        while True:
+            idx = int(rng.integers(0, n))
+            sample = self.dataset[idx]
+            out = {
+                'timeseries': sample['timeseries'][0],   # (C, N, d)
+                'ch_coords': sample['ch_coords'],        # (C, 3)
+                'ch_names': sample['ch_names'],          # list[str]
+                'source': sample['source'],
+                'session_id': sample['session_id'],
+                'sfreq': sfreq,
+            }
+            if bool(sample['has_image'][0].item()):
+                out['pixel_values'] = sample['pixel_values'][0]  # (3, H, W)
+            if self.has_future:
+                out['timeseries_future'] = sample['timeseries']      # (W, C, N, d)
+                out['pixel_values_future'] = sample['pixel_values']  # (W, 3, H, W)
+                out['has_image_future'] = sample['has_image']        # (W,)
+            yield out
+
+
+class WeightedSampleMix(IterableDataset):
+    """Sample from multiple iterable sources by fixed probabilities.
+
+    The mixer yields raw per-sample dicts; downstream batching and collation
+    happen in ``DataLoader``. Sources are expected to be infinite (or to
+    restart cleanly on ``StopIteration``); the mixer bounds the epoch via
+    ``samples_per_epoch`` so ``DataLoader`` knows when to stop.
+    """
+
+    def __init__(self, sources: Sequence,
+                 weights: Sequence[float],
+                 samples_per_epoch: Optional[int] = None):
+        super().__init__()
+        assert len(sources) == len(weights), (
+            "sources and weights must have the same length")
+        self.sources = list(sources)
+        w = np.asarray(weights, dtype=np.float64)
+        assert (w > 0).all(), "all mix weights must be > 0"
+        self.probs = (w / w.sum()).tolist()
+        self.samples_per_epoch = samples_per_epoch
+
+    def __len__(self):
+        if self.samples_per_epoch is None:
+            raise TypeError(
+                "WeightedSampleMix has no length unless samples_per_epoch "
+                "is set")
+        return self.samples_per_epoch
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        seed = (worker_info.seed
+                if worker_info is not None else None)
+        rng = np.random.default_rng(seed)
+        iters = [iter(s) for s in self.sources]
+        if self.samples_per_epoch is None:
+            n_per_worker = None
+        elif worker_info is not None:
+            n_per_worker = math.ceil(
+                self.samples_per_epoch / worker_info.num_workers)
+        else:
+            n_per_worker = self.samples_per_epoch
+        count = 0
+        while n_per_worker is None or count < n_per_worker:
+            i = int(rng.choice(len(iters), p=self.probs))
+            try:
+                yield next(iters[i])
+            except StopIteration:
+                iters[i] = iter(self.sources[i])
+                yield next(iters[i])
+            count += 1

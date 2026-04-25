@@ -59,6 +59,10 @@ def get_model(params, brain_regions, sorted_indices):
             mamba_d_state=getattr(params, 'mamba_d_state', 16),
             mamba_d_conv=getattr(params, 'mamba_d_conv', 4),
             mamba_expand=getattr(params, 'mamba_expand', 2),
+            use_llm_vq=getattr(params, 'use_llm_vq', False),
+            num_language_tokens=getattr(params, 'num_language_tokens', 8),
+            max_llm_codebook_size=getattr(params, 'max_llm_codebook_size', 4096),
+            llm_vq_aux_weight=getattr(params, 'llm_vq_aux_weight', 0.1),
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
@@ -86,6 +90,10 @@ def get_model(params, brain_regions, sorted_indices):
             mamba_d_state=getattr(params, 'mamba_d_state', 16),
             mamba_d_conv=getattr(params, 'mamba_d_conv', 4),
             mamba_expand=getattr(params, 'mamba_expand', 2),
+            use_llm_vq=getattr(params, 'use_llm_vq', False),
+            num_language_tokens=getattr(params, 'num_language_tokens', 8),
+            max_llm_codebook_size=getattr(params, 'max_llm_codebook_size', 4096),
+            llm_vq_aux_weight=getattr(params, 'llm_vq_aux_weight', 0.1),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
         # ``max_horizon == 0`` short-circuits the world-model components:
@@ -110,6 +118,7 @@ def get_model(params, brain_regions, sorted_indices):
             cls_pred_weight=getattr(params, 'cls_pred_weight', 0.1),
             max_horizon=max_horizon,
             ramp_epochs=getattr(params, 'pred_ramp_epochs', 2),
+            target_momentum=getattr(params, 'target_momentum', 0.998),
         )
         return model
     elif params.model == 'Spectral':
@@ -122,6 +131,9 @@ def get_model(params, brain_regions, sorted_indices):
             num_bands=getattr(params, 'num_bands', 4),
             num_visual_levels=getattr(params, 'num_visual_levels', 3),
             dino_layer_indices=getattr(params, 'dino_layer_indices', (3, 7, 12)),
+            vision_encoder=getattr(params, 'vision_encoder', 'facebook/dinov2-base'),
+            use_saliency=getattr(params, 'use_saliency', False),
+            saliency_rollout_skip_layers=getattr(params, 'saliency_rollout_skip_layers', 2),
         )
     elif params.model == 'SourceProjector':
         from .alignment import SourceProjector

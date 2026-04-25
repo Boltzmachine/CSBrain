@@ -50,7 +50,7 @@ from models.CSBrain_transformer import (
     TemEmbedEEGLayer,
     _get_clones,
 )
-from transformers import Dinov2Model
+from transformers import AutoModel
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +211,10 @@ class CSBrainSpectral(nn.Module):
         num_bands: int = 4,
         num_visual_levels: int = 3,
         dino_layer_indices: tuple = (3, 7, 12),
+        text_embed_dim: int | None = None,
+        use_saliency: bool = False,
+        saliency_rollout_skip_layers: int = 2,
+        vision_encoder: str = "facebook/dinov2-base",
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -219,6 +223,9 @@ class CSBrainSpectral(nn.Module):
         self.num_bands = num_bands
         self.num_visual_levels = num_visual_levels
         self.dino_layer_indices = dino_layer_indices
+        self.text_embed_dim = text_embed_dim
+        self.use_text = text_embed_dim is not None
+        self.num_alignment_levels = num_visual_levels + (1 if self.use_text else 0)
 
         # ---- Shared components ------------------------------------------------
         self.patch_embedding = PatchEmbedding(in_dim, out_dim, d_model, seq_len)
@@ -266,6 +273,17 @@ class CSBrainSpectral(nn.Module):
         max_freq_bins = seq_len * in_dim // 2 + 1
         self.mask_bank = SpectralMaskBank(num_bands, max_freq_bins)
 
+        # ---- Frozen image encoder ---------------------------------------------
+        # eager attn_implementation is required to expose attention weights,
+        # which the saliency branch reads for the rollout target.
+        # Works for DINOv2 (Dinov2Model) and DINO v1 (ViTModel) via AutoModel.
+        # Note: whichever encoder you pick must match the preprocessing used
+        # when generating the cached pixel_values / image_encoder_inputs.
+        self.pretrained_image_encoder = AutoModel.from_pretrained(
+            'facebook/dino-vitb8', attn_implementation="eager",
+        ).eval()
+        vision_hidden = self.pretrained_image_encoder.config.hidden_size
+
         # ---- Branch-specific band adapters ------------------------------------
         self.band_adapters = nn.ModuleList([
             BandAdapter(d_model) for _ in range(num_bands)
@@ -276,28 +294,51 @@ class CSBrainSpectral(nn.Module):
             nn.Sequential(
                 nn.Linear(d_model, d_model),
                 nn.GELU(),
-                nn.Linear(d_model, 768),  # DINOv2-base hidden size
+                nn.Linear(d_model, vision_hidden),
             ) for _ in range(num_bands)
         ])
 
         # ---- Learned band-to-level assignment ---------------------------------
-        # Soft assignment matrix: (num_bands, num_visual_levels)
-        # Each band contributes to each visual level with a learned weight.
+        # Soft assignment matrix: (num_bands, num_alignment_levels)
+        # Alignment levels = vision hidden states [+ text embedding if enabled].
         self.band_level_logits = nn.Parameter(
-            torch.zeros(num_bands, num_visual_levels)
+            torch.zeros(num_bands, self.num_alignment_levels)
         )
+
+        # ---- Text embedding projection (optional) -----------------------------
+        if self.use_text:
+            self.text_proj = nn.Sequential(
+                nn.Linear(text_embed_dim, vision_hidden),
+                nn.GELU(),
+                nn.Linear(vision_hidden, vision_hidden),
+            )
 
         # ---- Semantic readout (from global token of fused representation) -----
         self.semantic_readout = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, 768),
+            nn.Linear(d_model, vision_hidden),
         )
 
-        # ---- Frozen image encoder ---------------------------------------------
-        self.pretrained_image_encoder = Dinov2Model.from_pretrained(
-            "facebook/dinov2-base"
-        ).eval()
+        # ---- Saliency alignment branch (optional) -----------------------------
+        # When enabled, target = attention rollout over vision-encoder layers
+        # (skipping the first few which carry mostly low-level, texture-like
+        # attention). The predicted map is a softmax-mixed combination of
+        # per-band linear heads on each band's global vector, trained with KL
+        # divergence against the rollout.
+        self.use_saliency = False#use_saliency
+        self.saliency_rollout_skip_layers = saliency_rollout_skip_layers
+        if self.use_saliency:
+            dino_cfg = self.pretrained_image_encoder.config
+            self.saliency_grid = dino_cfg.image_size // dino_cfg.patch_size
+            self.band_saliency_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, d_model),
+                    nn.GELU(),
+                    nn.Linear(d_model, self.saliency_grid ** 2),
+                ) for _ in range(num_bands)
+            ])
+            self.band_saliency_logits = nn.Parameter(torch.zeros(num_bands))
 
         self.apply(_weights_init)
 
@@ -323,11 +364,46 @@ class CSBrainSpectral(nn.Module):
     @torch.inference_mode()
     def get_image_hidden_states(self, **image_encoder_inputs):
         outputs = self.pretrained_image_encoder(
-            **image_encoder_inputs, output_hidden_states=True
+            **image_encoder_inputs,
+            output_hidden_states=True,
+            output_attentions=self.use_saliency,
         )
         hs = outputs.hidden_states
         selected = [hs[idx][:, 0] for idx in self.dino_layer_indices]
-        return torch.stack(selected, dim=1)  # (B, num_visual_levels, 768)
+        hidden = torch.stack(selected, dim=1)  # (B, num_visual_levels, vision_hidden)
+        if self.use_saliency:
+            rollout = self._attention_rollout(
+                outputs.attentions, skip_layers=self.saliency_rollout_skip_layers,
+            )  # (B, grid, grid)
+        else:
+            rollout = None
+        return hidden, rollout
+
+    @staticmethod
+    def _attention_rollout(attentions, skip_layers: int = 0):
+        """
+        Abnar & Zuidema (2020) attention rollout.
+        attentions: tuple of L tensors, each (B, heads, seq, seq).
+        Returns (B, grid, grid) CLS-to-patch flow, min-max normalised per sample.
+        """
+        attentions = attentions[skip_layers:]
+        B, _, seq, _ = attentions[0].shape
+        device = attentions[0].device
+        eye = torch.eye(seq, device=device).unsqueeze(0)
+        result = eye.expand(B, -1, -1).contiguous()
+        for attn in attentions:
+            a = attn.mean(dim=1) + eye  # residual
+            a = a / a.sum(dim=-1, keepdim=True)
+            result = a @ result
+        cls_to_patches = result[:, 0, 1:]  # (B, Np)
+        grid = int(round(cls_to_patches.shape[-1] ** 0.5))
+        rollout = cls_to_patches.reshape(B, grid, grid)
+        # Min-max normalise per sample so the map is in [0, 1].
+        flat = rollout.flatten(1)
+        mn = flat.min(dim=-1, keepdim=True).values
+        mx = flat.max(dim=-1, keepdim=True).values
+        rollout = ((flat - mn) / (mx - mn + 1e-8)).reshape(B, grid, grid)
+        return rollout
 
     # ------------------------------------------------------------------
     # Spectral decomposition (on raw input, before embedding)
@@ -433,17 +509,18 @@ class CSBrainSpectral(nn.Module):
         total_loss = torch.tensor(0.0, device=band_globals[0].device)
         total_acc = torch.tensor(0.0, device=band_globals[0].device)
 
-        for level_idx in range(self.num_visual_levels):
-            # Weighted combination of band projections for this visual level
+        for level_idx in range(self.num_alignment_levels):
+            # Weighted combination of band projections for this alignment level
             image_feat = image_hidden_states[:, level_idx]  # (B_img, 768)
 
-            # Compute weighted EEG embedding for this level (768-dim, matching DINOv2)
+            # Compute weighted EEG embedding for this level (matches vision hidden size)
+            vision_hidden = image_hidden_states.shape[-1]
             eeg_level_embed = torch.zeros(
-                band_globals[0].size(0), 768,
+                band_globals[0].size(0), vision_hidden,
                 device=band_globals[0].device, dtype=band_globals[0].dtype,
             )
             for k in range(self.num_bands):
-                proj_k = self.band_align_projs[k](band_globals[k])  # (B_img, 768)
+                proj_k = self.band_align_projs[k](band_globals[k])
                 eeg_level_embed = eeg_level_embed + assignment[k, level_idx] * proj_k
 
             # InfoNCE
@@ -467,12 +544,46 @@ class CSBrainSpectral(nn.Module):
             loss_dict[f"align_acc_level{level_idx}"] = acc.mean()
 
         # Average over levels
-        total_loss = total_loss / self.num_visual_levels
-        total_acc = total_acc / self.num_visual_levels
+        total_loss = total_loss / self.num_alignment_levels
+        total_acc = total_acc / self.num_alignment_levels
         loss_dict["align_loss_total"] = (1.0, total_loss)
         loss_dict["align_acc_total"] = total_acc
 
         return loss_dict
+
+    # ------------------------------------------------------------------
+    # Saliency alignment loss
+    # ------------------------------------------------------------------
+    def _saliency_alignment_loss(self, band_globals, rollout_target):
+        """
+        Align a softmax-mixed combination of per-band saliency heads with the
+        DINOv2 attention rollout via KL divergence.
+
+        band_globals: list of K tensors (B_img, d_model)
+        rollout_target: (B_img, grid, grid) — rollout map in [0, 1]
+        """
+        mix = F.softmax(self.band_saliency_logits, dim=0)  # (K,)
+        pred_logits = 0
+        for k in range(self.num_bands):
+            pred_k = self.band_saliency_heads[k](band_globals[k])  # (B, G*G)
+            pred_logits = pred_logits + mix[k] * pred_k
+
+        pred_log_prob = F.log_softmax(pred_logits, dim=-1)  # (B, G*G)
+
+        # Runtime grid depends on the processor's output size, which may not
+        # match config.image_size // patch_size. Resize target to the head's grid.
+        if rollout_target.shape[-1] != self.saliency_grid:
+            rollout_target = F.interpolate(
+                rollout_target.unsqueeze(1),
+                size=(self.saliency_grid, self.saliency_grid),
+                mode="bilinear", align_corners=False,
+            ).squeeze(1)
+
+        target_flat = rollout_target.flatten(1)
+        target_prob = target_flat / (target_flat.sum(-1, keepdim=True) + 1e-8)
+
+        kl = F.kl_div(pred_log_prob, target_prob, reduction="batchmean")
+        return kl
 
     # ------------------------------------------------------------------
     # Forward
@@ -561,13 +672,29 @@ class CSBrainSpectral(nn.Module):
             img_inputs = {
                 k: v[has_image] for k, v in batch['image_encoder_inputs'].items()
             }
-            image_hs = self.get_image_hidden_states(**img_inputs)  # (B_img, L, 768)
+            image_hs, rollout_target = self.get_image_hidden_states(**img_inputs)
+
+            if self.use_text and batch.get('text_embedding') is not None:
+                text_emb = batch['text_embedding'][has_image]  # (B_img, text_embed_dim)
+                text_emb = self.text_proj(text_emb).unsqueeze(1)  # (B_img, 1, 768)
+                image_hs = torch.cat([image_hs, text_emb], dim=1)  # (B_img, L+1, 768)
 
             band_globals_img = [bg[has_image] for bg in band_globals]  # K × (B_img, d)
             align_losses = self._multi_band_alignment_loss(
                 band_globals_img, image_hs, batch,
             )
             info.update(align_losses)
+
+            if self.use_saliency:
+                saliency_loss = self._saliency_alignment_loss(
+                    band_globals_img, rollout_target,
+                )
+                info["saliency_align_loss"] = (1.0, saliency_loss)
+                with torch.no_grad():
+                    info["saliency_band_mix"] = F.softmax(
+                        self.band_saliency_logits, dim=0
+                    ).detach()
+                    info["saliency_rollout_target"] = rollout_target.detach()
 
             # Also compute per-source accuracy breakdown
             sources = batch.get('source', [])

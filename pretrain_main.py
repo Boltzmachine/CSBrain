@@ -102,7 +102,8 @@ def main():
   
     trainer = Trainer(params, data_loader, model)
     trainer.train()
-    pretrained_dataset.db.close()
+    if pretrained_dataset.db is not None:
+        pretrained_dataset.db.close()
 
 
 if __name__ == '__main__':

@@ -11,12 +11,12 @@ LOG_FILE="${LOG_DIR}/${LOG_FILE_NAME}.log"
 
 echo "Job started at $(date)" | tee -a "$LOG_FILE"
 
-CUDA_VISIBLE_DEVICES=4 python finetune_main.py  \
+CUDA_VISIBLE_DEVICES=0 python finetune_main.py  \
     --downstream_dataset PhysioNet-MI \
-    --datasets_dir <path_to_datasets> \
+    --datasets_dir data/preprocessed/physionet_mi \
     --num_of_classes 4 \
-    --model_dir "pth_downtasks/finetune_CSBrain_PhysioNet" \
-    --foundation_dir "pth/CSBrain.pth" \
+    --model_dir outputs/CSBrain/finetune_CSBrain_PhysioNet \
+    --foundation_dir outputs/pretrain_CSBrain/epoch26_loss0.0015017741825431585.pth \
     --model CSBrain \
     --use_pretrained_weights \
     --dropout 0.3 \

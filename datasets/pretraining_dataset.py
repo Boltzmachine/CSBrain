@@ -12,15 +12,26 @@ class PretrainingDataset(Dataset):
             SmallerToken
     ):
         super(PretrainingDataset, self).__init__()
-        self.db = lmdb.open(dataset_dir, readonly=True, lock=False, readahead=True, meminit=False)
-        with self.db.begin(write=False) as txn:
-            self.keys = pickle.loads(txn.get('__keys__'.encode()))
+        self.dataset_dir = dataset_dir
         self.SmallerToken = SmallerToken
+        self.db = None
+        env = lmdb.open(dataset_dir, readonly=True, lock=False, readahead=False, meminit=False)
+        with env.begin(write=False) as txn:
+            self.keys = pickle.loads(txn.get('__keys__'.encode()))
+        env.close()
+
+    def _init_db(self):
+        self.db = lmdb.open(
+            self.dataset_dir, readonly=True, lock=False,
+            readahead=False, meminit=False,
+        )
 
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, idx):
+        if self.db is None:
+            self._init_db()
         key = self.keys[idx]
 
         with self.db.begin(write=False) as txn:

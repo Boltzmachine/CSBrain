@@ -46,8 +46,7 @@ class TestLatentPredictor(unittest.TestCase):
         p = LatentPredictor(d_model=D, predictor_d_model=64, n_layers=2,
                             n_heads=4, dim_feedforward=128, max_horizon=4)
         s = torch.randn(B, C, N, D)
-        x = torch.randn(B, C, N, D)
-        pred, cls = p(s, x, horizon=2)
+        pred, cls = p(s, horizon=2)
         self.assertEqual(pred.shape, (B, C, N, D))
         self.assertEqual(cls.shape, (B, D))
 

@@ -455,8 +455,10 @@ class DINOEEGModel(nn.Module):
         self.teacher_dino_head.eval()
         self.teacher_ibot_head.eval()
         with torch.no_grad():
-            teacher_cls, teacher_patches = self.teacher.encode(
-                batch, mask=None)
+            _, teacher_info = self.teacher(
+                batch, mask=None, encoder_only=True)
+            teacher_cls = teacher_info['global_rep']
+            teacher_patches = teacher_info['patch_tokens']
             teacher_cls_out = self.teacher_dino_head(teacher_cls)
             teacher_patch_out = self.teacher_ibot_head(teacher_patches)
         self.teacher.train()
@@ -496,7 +498,9 @@ class DINOEEGModel(nn.Module):
             if self.use_freq_subband and self.training:
                 local_batch['timeseries'] = self.freq_subband_view(
                     local_batch['timeseries'])
-            local_cls, _ = self.student.encode(local_batch, mask=None)
+            _, local_info = self.student(
+                local_batch, mask=None, encoder_only=True)
+            local_cls = local_info['global_rep']
             local_cls_list.append(local_cls)
             local_cls_out = self.student_dino_head(local_cls)
             dino_loss = dino_loss + self.dino_criterion.loss_from_targets(
@@ -541,9 +545,15 @@ class DINOEEGModel(nn.Module):
         """Delegate to student backbone for inference."""
         return self.student.forward(*args, **kwargs)
 
-    def encode(self, *args, **kwargs):
-        """Delegate to student backbone."""
-        return self.student.encode(*args, **kwargs)
+    def encode(self, batch, mask=None):
+        """Encoder-only pass returning ``(global_rep, patch_tokens)``.
+
+        Thin shim over ``student.forward(..., encoder_only=True)`` —
+        kept so external callers that used the old ``.encode()`` API
+        still work.
+        """
+        _, info = self.student(batch, mask=mask, encoder_only=True)
+        return info['global_rep'], info['patch_tokens']
 
     def _load_weights(self, *args, **kwargs):
         """Delegate weight loading to student."""

@@ -3,8 +3,7 @@
 See ``plans/world_model.md`` for the design rationale. Two modules live here:
 
 * :class:`LatentPredictor` — a small transformer that predicts the latent
-  patch tokens of the next EEG window from the current latent tokens plus
-  the current window's patch embedding.
+  patch tokens of the next EEG window from the current latent tokens.
 * :class:`WorldModelWrapper` — wraps an existing ``CSBrainAlign`` encoder,
   composes alignment + masked reconstruction + latent prediction into a
   single loss dict, and follows the ``(weight, tensor)`` convention that the
@@ -29,12 +28,12 @@ from utils.util import generate_mask
 # ---------------------------------------------------------------------------
 
 class LatentPredictor(nn.Module):
-    """Predict ``ŝ_{t+k}^{patch}`` from ``s_t`` tokens and ``x_t`` patches.
+    """Predict ``ŝ_{t+k}^{patch}`` from ``s_t`` latent tokens.
 
-    Inputs are flattened into a single token sequence with learned
-    token-type and horizon embeddings. We keep the network intentionally
-    narrow (V-JEPA design choice) so the encoder — not the predictor —
-    carries the representational load.
+    Latents are flattened into a token sequence with a learned horizon
+    embedding added. We keep the network intentionally narrow (V-JEPA
+    design choice) so the encoder — not the predictor — carries the
+    representational load.
     """
 
     def __init__(
@@ -53,10 +52,7 @@ class LatentPredictor(nn.Module):
         self.predictor_d_model = predictor_d_model
 
         self.in_proj_latent = nn.Linear(d_model, predictor_d_model)
-        self.in_proj_patch = nn.Linear(d_model, predictor_d_model)
 
-        # Token-type embeddings: 0 = current latent (s_t), 1 = current patch (x_t).
-        self.type_embed = nn.Embedding(2, predictor_d_model)
         self.horizon_embed = nn.Embedding(max_horizon + 1, predictor_d_model)
         self.pos_embed = nn.Parameter(
             torch.zeros(1, max_tokens, predictor_d_model))
@@ -82,20 +78,12 @@ class LatentPredictor(nn.Module):
     def forward(
         self,
         s_t_patch: torch.Tensor,   # (B, C, N, D)
-        x_t_patch: torch.Tensor,   # (B, C, N, D)
         horizon: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (ŝ_{t+k}^{patch}, ŝ_{t+k}^{cls})."""
         B, C, N, D = s_t_patch.shape
 
-        lat = self.in_proj_latent(s_t_patch.reshape(B, C * N, D))
-        pat = self.in_proj_patch(x_t_patch.reshape(B, C * N, D))
-        lat = lat + self.type_embed(torch.zeros(
-            1, dtype=torch.long, device=lat.device))
-        pat = pat + self.type_embed(torch.ones(
-            1, dtype=torch.long, device=pat.device))
-
-        tokens = torch.cat([lat, pat], dim=1)              # (B, 2*C*N, D_p)
+        tokens = self.in_proj_latent(s_t_patch.reshape(B, C * N, D))
         seq_len = tokens.size(1)
         assert seq_len <= self.pos_embed.size(1), (
             f"LatentPredictor received sequence length {seq_len}, larger "
@@ -110,12 +98,9 @@ class LatentPredictor(nn.Module):
         h = self.encoder(tokens)
         h = self.norm_out(h)
 
-        # Read out the first C*N tokens (those that "carry" the latent
-        # slots) and reshape back to (B, C, N, D).
-        h_patch = h[:, :C * N]
-        pred_patch = self.out_proj_patch(h_patch).reshape(B, C, N, D)
+        pred_patch = self.out_proj_patch(h).reshape(B, C, N, D)
         # CLS readout: mean-pool over the latent tokens.
-        pred_cls = self.out_proj_cls(h_patch.mean(dim=1))
+        pred_cls = self.out_proj_cls(h.mean(dim=1))
         return pred_patch, pred_cls
 
 
@@ -189,18 +174,21 @@ class WorldModelWrapper(nn.Module):
         return float(min(1.0, self.current_epoch.item() / self.ramp_epochs))
 
     def _encode_future(self, batch_future: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        # encode() mutates its batch argument (global-token concat); pass
+        # forward() mutates its batch argument (global-token concat); pass
         # a shallow copy so the caller's ``batch`` dict is unaffected.
-        # Route through the EMA target_encoder in eval() mode — this
-        # (a) decouples the target from same-step online updates, and
-        # (b) suppresses dropout/BN updates in the target path so the
-        # regression target is deterministic.
+        # Route through the EMA target_encoder in eval() mode with
+        # ``encoder_only=True`` — this (a) decouples the target from
+        # same-step online updates, (b) suppresses dropout/BN updates in
+        # the target path so the regression target is deterministic, and
+        # (c) reuses the main forward pipeline so changes to the encoder
+        # don't need a parallel update to a separate ``encode`` path.
         target = self.target_encoder if self.target_encoder is not None else self.encoder
         was_training = target.training
         target.eval()
         try:
             with torch.no_grad():
-                return target.encode({**batch_future})
+                _, info = target({**batch_future}, encoder_only=True)
+            return info['global_rep'], info['patch_tokens']
         finally:
             if was_training:
                 target.train()
@@ -371,17 +359,13 @@ class WorldModelWrapper(nn.Module):
         # doesn't, the contract is broken and we want to know.
         s_t_patch = info['patch_tokens'][cb_idx]
 
-        x_t = encoder_batch['timeseries'][cb_idx]  # (M, C, N, d)
-        x_t_patch_emb = self.encoder.patch_embedding(x_t, None)
-
         future_batch = self._build_future_subbatch(
             batch, cb_idx, window_idx=k)
         s_tpk_cls, s_tpk_patch = self._encode_future(future_batch)
         s_tpk_patch = s_tpk_patch.detach()
         s_tpk_cls = s_tpk_cls.detach()
 
-        pred_patch, pred_cls = self.predictor(
-            s_t_patch, x_t_patch_emb, horizon=k)
+        pred_patch, pred_cls = self.predictor(s_t_patch, horizon=k)
 
         # CineBrain uses a fixed montage with no channel padding, so a
         # plain L1 is correct. If a future dataset needs per-channel

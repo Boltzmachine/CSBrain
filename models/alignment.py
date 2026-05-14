@@ -102,8 +102,13 @@ class SourceProjector(nn.Module):
     Input:  x (B, C, N, d), ch_coords (B, C, 3)  — raw sensor signals + spherical coords
     Output: (B, K, N, d)  — source-space signals
 
-    Mixing weights depend only on electrode coordinates (not data),
-    analogous to a learned lead-field matrix.
+    Forward path is MLP + cross-attention + MLP, applied independently per
+    patch index. Queries are K learnable source embeddings, keys come from
+    a per-channel coordinate positional encoding, and values come from the
+    per-channel, per-patch timeseries — so each source attends across
+    sensors with weights driven by electrode geometry plus signal content.
+    The inverse path mirrors this with channel-coord queries and learnable
+    per-source keys.
 
     Pre-trainable with reconstruction + decorrelation (see training_step).
     """
@@ -112,11 +117,15 @@ class SourceProjector(nn.Module):
         in_dim: int,
         num_sources: int = 32,
         decorr_weight: float = 0.1,
+        attn_dim: int = 128,
+        num_heads: int = 4,
     ):
         super().__init__()
         self.in_dim = in_dim
         self.num_sources = num_sources
         self.decorr_weight = decorr_weight
+        self.attn_dim = attn_dim
+        self.num_heads = num_heads
 
         # --- spherical positional encoding ---
         self.spherical_r_scale = 0.1
@@ -131,18 +140,46 @@ class SourceProjector(nn.Module):
 
         pe_dim = 3 * 2 * self.spherical_num_freqs  # 192
 
-        # coord -> forward mixing weights  (sensors -> sources)
-        self.forward_mix = nn.Sequential(
-            nn.Linear(pe_dim, in_dim),
+        # --- Forward path: MLP + cross-attention + MLP (sensors -> sources) ---
+        self.forward_queries = nn.Parameter(torch.randn(num_sources, attn_dim) * 0.02)
+        self.forward_key_mlp = nn.Sequential(
+            nn.Linear(pe_dim, attn_dim),
             nn.GELU(),
-            nn.Linear(in_dim, num_sources),
+            nn.Linear(attn_dim, attn_dim),
+        )
+        self.forward_value_mlp = nn.Sequential(
+            nn.Linear(in_dim, attn_dim),
+            nn.GELU(),
+            nn.Linear(attn_dim, attn_dim),
+        )
+        self.forward_attn = nn.MultiheadAttention(
+            embed_dim=attn_dim, num_heads=num_heads, batch_first=True,
+        )
+        self.forward_out_mlp = nn.Sequential(
+            nn.Linear(attn_dim, attn_dim),
+            nn.GELU(),
+            nn.Linear(attn_dim, in_dim),
         )
 
-        # coord -> inverse mixing weights  (sources -> sensors, for reconstruction)
-        self.inverse_mix = nn.Sequential(
-            nn.Linear(pe_dim, in_dim),
+        # --- Inverse path: MLP + cross-attention + MLP (sources -> sensors) ---
+        self.inverse_keys = nn.Parameter(torch.randn(num_sources, attn_dim) * 0.02)
+        self.inverse_query_mlp = nn.Sequential(
+            nn.Linear(pe_dim, attn_dim),
             nn.GELU(),
-            nn.Linear(in_dim, num_sources),
+            nn.Linear(attn_dim, attn_dim),
+        )
+        self.inverse_value_mlp = nn.Sequential(
+            nn.Linear(in_dim, attn_dim),
+            nn.GELU(),
+            nn.Linear(attn_dim, attn_dim),
+        )
+        self.inverse_attn = nn.MultiheadAttention(
+            embed_dim=attn_dim, num_heads=num_heads, batch_first=True,
+        )
+        self.inverse_out_mlp = nn.Sequential(
+            nn.Linear(attn_dim, attn_dim),
+            nn.GELU(),
+            nn.Linear(attn_dim, in_dim),
         )
 
     def _spherical_positional_encoding(self, ch_coords):
@@ -176,31 +213,51 @@ class SourceProjector(nn.Module):
         valid_channel_mask: (B, C) bool — False for padded/invalid channels
         Returns:   (B, K, N, d) source signals
         """
-        coord_pe, _ = self._spherical_positional_encoding(ch_coords)
-        b, c, n, d = x.shape
+        B, C, N, d = x.shape
+        K = self.num_sources
 
-        w_fwd = self.forward_mix(coord_pe)        # (B, C, K)
+        coord_pe, _ = self._spherical_positional_encoding(ch_coords)         # (B, C, pe_dim)
+        keys = self.forward_key_mlp(coord_pe)                                # (B, C, attn_dim)
 
-        # Zero out weights for invalid/padded channels
-        valid = self._valid_channel_mask(ch_coords, valid_channel_mask)  # (B, C)
-        w_fwd = w_fwd * valid.unsqueeze(-1).float()
+        x_perm = x.permute(0, 2, 1, 3).contiguous().view(B * N, C, d)        # (B*N, C, d)
+        values = self.forward_value_mlp(x_perm)                              # (B*N, C, attn_dim)
 
-        x_flat = x.permute(0, 2, 3, 1).contiguous().view(b, n * d, c)
-        s = (x_flat @ w_fwd).view(b, n, d, self.num_sources)
-        s = s.permute(0, 3, 1, 2).contiguous()    # (B, K, N, d)
+        keys_exp = keys.unsqueeze(1).expand(B, N, C, self.attn_dim).reshape(B * N, C, self.attn_dim)
+        queries = self.forward_queries.unsqueeze(0).expand(B * N, K, self.attn_dim)
+
+        valid = self._valid_channel_mask(ch_coords, valid_channel_mask)      # (B, C)
+        key_padding_mask = ~valid.unsqueeze(1).expand(B, N, C).reshape(B * N, C)
+
+        attn_out, _ = self.forward_attn(
+            queries, keys_exp, values, key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )                                                                    # (B*N, K, attn_dim)
+        out = self.forward_out_mlp(attn_out)                                 # (B*N, K, d)
+        s = out.view(B, N, K, d).permute(0, 2, 1, 3).contiguous()            # (B, K, N, d)
         return s
 
     def inverse(self, s: torch.Tensor, ch_coords: torch.Tensor,
                 valid_channel_mask: torch.Tensor = None):
         """Reconstruct sensors from sources: (B, K, N, d) -> (B, C, N, d)."""
-        coord_pe, _ = self._spherical_positional_encoding(ch_coords)
-        w_inv = self.inverse_mix(coord_pe)         # (B, C, K)
+        B, K_, N, d = s.shape
 
-        valid = self._valid_channel_mask(ch_coords, valid_channel_mask)  # (B, C)
-        w_inv = w_inv * valid.unsqueeze(-1).float()
+        coord_pe, _ = self._spherical_positional_encoding(ch_coords)         # (B, C, pe_dim)
+        C = coord_pe.size(1)
+        queries = self.inverse_query_mlp(coord_pe)                           # (B, C, attn_dim)
 
-        recon = torch.einsum('bck,bknd->bcnd', w_inv, s)
-        return recon
+        s_perm = s.permute(0, 2, 1, 3).contiguous().view(B * N, K_, d)       # (B*N, K, d)
+        values = self.inverse_value_mlp(s_perm)                              # (B*N, K, attn_dim)
+
+        queries_exp = queries.unsqueeze(1).expand(B, N, C, self.attn_dim).reshape(B * N, C, self.attn_dim)
+        keys = self.inverse_keys.unsqueeze(0).expand(B * N, K_, self.attn_dim)
+
+        attn_out, _ = self.inverse_attn(queries_exp, keys, values, need_weights=False)  # (B*N, C, attn_dim)
+        out = self.inverse_out_mlp(attn_out)                                 # (B*N, C, d)
+        out = out.view(B, N, C, d).permute(0, 2, 1, 3).contiguous()          # (B, C, N, d)
+
+        valid = self._valid_channel_mask(ch_coords, valid_channel_mask)      # (B, C)
+        out = out * valid.unsqueeze(-1).unsqueeze(-1).to(out.dtype)
+        return out
 
     def compute_decorr_loss(self, sources):
         """Penalise cross-source instantaneous correlation."""
@@ -334,10 +391,11 @@ class CSBrainAlign(nn.Module):
         self.llm_vq_aux_weight = llm_vq_aux_weight
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
-        self.source_projector = SourceProjector(
-            in_dim=in_dim,
-            num_sources=num_sources,
-        )
+        if self.project_to_source:
+            self.source_projector = SourceProjector(
+                in_dim=in_dim,
+                num_sources=num_sources,
+            )
         if source_projector_ckpt is not None:
             ckpt = torch.load(source_projector_ckpt, map_location='cpu')
             self.source_projector.load_state_dict(ckpt, strict=True)
@@ -561,104 +619,6 @@ class CSBrainAlign(nn.Module):
 
 
     # ------------------------------------------------------------------
-    # Encode — lightweight forward returning CLS + patch tokens
-    # ------------------------------------------------------------------
-
-    def encode(self, batch, mask=None):
-        """Encoder-only pass returning CLS token and patch-level tokens.
-
-        Mirrors the main ``forward`` pipeline but skips contrastive
-        learning, reconstruction output, equivariance, and adversarial
-        losses.  Used by the DINOv2 teacher and by the equivariance
-        loss helper.
-
-        Returns:
-            cls_token:    (B, d_model)
-            patch_tokens: (B, C, N, d_model) — global tokens stripped
-        """
-        x = batch['timeseries']
-        ch_coords = batch['ch_coords']
-        valid_channel_mask = batch.get('valid_channel_mask')
-        valid_length_mask = batch.get('valid_length_mask')
-
-        # --- source projection ---
-        if self.project_to_source:
-            if mask is not None:
-                x_in = x.clone()
-                x_in[mask == 1] = 0.0
-                x = self.source_projector(x_in, ch_coords,
-                                          valid_channel_mask=valid_channel_mask)
-            else:
-                x = self.source_projector(x, ch_coords,
-                                          valid_channel_mask=valid_channel_mask)
-            mask = None  # already applied
-
-        # --- spectral filtering ---
-        if not self.causal:
-            ts = x.view(x.size(0), x.size(1), -1)
-            spectral = torch.fft.rfft(ts, dim=-1, norm='forward')
-            freq_mask = torch.sigmoid(
-                self.freq_mask_logits[:1, :spectral.size(-1)])
-            ts = torch.fft.irfft(spectral * freq_mask.unsqueeze(0),
-                                 norm='forward')
-            x = ts.view_as(x)
-
-        # --- patch embedding ---
-        patch_emb = self.patch_embedding(x, mask)
-
-        # --- coordinate enhancement / source-space bookkeeping ---
-        if self.project_to_source:
-            b = patch_emb.size(0)
-            vcm = torch.ones(b, self.source_projector.num_sources,
-                             dtype=torch.bool, device=patch_emb.device)
-        else:
-            coord_pe, _ = self._spherical_positional_encoding(ch_coords)
-            coord_emb = self.coord_enhancement(coord_pe)
-            patch_emb = patch_emb + coord_emb.unsqueeze(2)
-            vcm = valid_channel_mask
-        vlm = valid_length_mask
-        if self.patch_embed_type == 'mamba':
-            vlm = self.patch_embedding.adapt_valid_length_mask(vlm)
-
-        # --- global tokens ---
-        if self.add_global:
-            patch_emb = torch.cat([
-                self.global_channel.expand(
-                    patch_emb.size(0), -1, patch_emb.size(2), -1),
-                patch_emb], dim=1)
-            patch_emb = torch.cat([
-                self.global_token.expand(
-                    patch_emb.size(0), patch_emb.size(1), -1, -1),
-                patch_emb], dim=2)
-            if vcm is not None:
-                vcm = torch.cat([
-                    torch.ones_like(vcm[:, :1], dtype=torch.bool), vcm
-                ], dim=1)
-            if vlm is not None:
-                vlm = torch.cat([
-                    torch.ones_like(vlm[:, :1], dtype=torch.bool), vlm
-                ], dim=1)
-
-        # --- transformer encoder (no contrastive branch) ---
-        for layer_idx in range(self.encoder.num_layers):
-            patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
-            patch_emb = self.encoder.layers[layer_idx](
-                patch_emb, self.area_config,
-                inter_window_attn_mask=(
-                    ~vlm if vlm is not None else None),
-                inter_region_attn_mask=(
-                    ~vcm if vcm is not None else None),
-            )
-
-        cls_token = (patch_emb[:, 0, 0, :]
-                     if self.add_global
-                     else patch_emb.mean(dim=(1, 2)))
-        patch_tokens = (patch_emb[:, 1:, 1:, :]
-                        if self.add_global
-                        else patch_emb)
-        return cls_token, patch_tokens
-
-    # ------------------------------------------------------------------
     # Hemispheric equivariance helpers
     # ------------------------------------------------------------------
 
@@ -666,14 +626,19 @@ class CSBrainAlign(nn.Module):
                               valid_channel_mask=None,
                               valid_length_mask=None,
                               mask=None):
-        """Return only the global-token representation (backward compat)."""
+        """Return only the global-token representation (backward compat).
+
+        Routes through ``forward(encoder_only=True)`` so this helper and
+        the main encoder share a single code path. ``encoder_only`` also
+        prevents the recursive call into the equivariance branch.
+        """
         _batch = {'timeseries': x, 'ch_coords': ch_coords}
         if valid_channel_mask is not None:
             _batch['valid_channel_mask'] = valid_channel_mask
         if valid_length_mask is not None:
             _batch['valid_length_mask'] = valid_length_mask
-        cls_token, _ = self.encode(_batch, mask=mask)
-        return cls_token
+        _, info = self.forward(_batch, mask=mask, encoder_only=True)
+        return info['global_rep']
 
     @staticmethod
     def _info_max_loss(z_inv, z_eq):
@@ -709,7 +674,18 @@ class CSBrainAlign(nn.Module):
 
     # ------------------------------------------------------------------
 
-    def forward(self, batch, mask=None):
+    def forward(self, batch, mask=None, encoder_only=False):
+        """Encode ``batch`` and (unless ``encoder_only``) compute losses.
+
+        When ``encoder_only=True`` the patch-embed → transformer body
+        still runs, but the contrastive, equivariance, and reconstruction
+        branches are skipped and the return is
+        ``(None, {'global_rep': ..., 'patch_tokens': ...})``. Used by the
+        DINO teacher/student crops, the equivariance helper, and the
+        world-model future-window encode — all of which need only the
+        latent tokens, and several of which sit inside a ``no_grad``
+        block where loss computation would be wasted.
+        """
         x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
         ch_coords = batch['ch_coords']
 
@@ -721,7 +697,6 @@ class CSBrainAlign(nn.Module):
 
         # --- Apply mask in sensor space, then project to source space ---
         if self.project_to_source:
-            raise NotImplementedError("Source projection with patch-based masking is not currently supported.")
             valid_ch = batch.get('valid_channel_mask', None)
             if mask is not None:
                 # Apply mask in original sensor space before source projection
@@ -732,16 +707,6 @@ class CSBrainAlign(nn.Module):
                 x = self.source_projector(x, ch_coords, valid_channel_mask=valid_ch)
             # Don't pass mask to patch_embedding — already applied
             mask = None
-
-        ## DEPRECATED spectral branch
-        # if not self.causal:
-        #     # Spectral filtering mixes all time steps — skip in causal mode
-        #     timeseries = x.view(x.size(0), x.size(1), -1)
-        #     spectral = torch.fft.rfft(timeseries, dim=-1, norm='forward')[..., :self.freq_mask_logits.size(-1)]
-        #     masks = torch.sigmoid(self.freq_mask_logits[:1, :spectral.size(-1)]) # (num_visual_levels, n_freq_bins)
-        #     branch_spectral = spectral * masks.unsqueeze(0) # (n_branch, B, n_ch, n_freq_bins)
-        #     branch_time = torch.fft.irfft(branch_spectral, norm='forward', n=timeseries.size(-1)) # (n_branch, B, n_ch, seq_len)
-        #     x = branch_time.view_as(x)
 
         # Remember base N before patch embedding so we can map the
         # interleaved multi-band tokens back to per-patch reconstructions.
@@ -784,7 +749,10 @@ class CSBrainAlign(nn.Module):
                     branch_embs = patch_emb[has_image] # (B_with_image, K, N, d)
                 else:
                     branch_embs = patch_emb
-                if 'image_encoder_inputs' in batch and has_image.any() and self.alignment_weight > 0:
+                if (not encoder_only
+                        and 'image_encoder_inputs' in batch
+                        and has_image.any()
+                        and self.alignment_weight > 0):
                     image_encoder_inputs = {k: v[has_image] for k, v in batch['image_encoder_inputs'].items()}
                     if self.use_llm_vq:
                         assert self.add_global, "LLM VQ path requires add_global=True."
@@ -852,6 +820,15 @@ class CSBrainAlign(nn.Module):
         # Extract global token and patch-level representations
         global_rep = patch_emb[:, 0, 0, :] if self.add_global else patch_emb.mean(dim=(1, 2))
         patch_tokens = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
+
+        if encoder_only:
+            # Skip reconstruction output and equivariance — callers
+            # (DINO teacher/student, equivariance helper, world-model
+            # future encode) only need the latent tokens.
+            return None, {
+                "global_rep": global_rep,
+                "patch_tokens": patch_tokens,
+            }
 
         if self.project_to_source:
             source_emb = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb

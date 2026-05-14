@@ -134,7 +134,9 @@ class Model(nn.Module):
             unexpected_keys = [k for k in unexpected_keys
                                if "equiv_projector" not in k]
             if unexpected_keys:
-                raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
+                for unexpected_key in unexpected_keys:
+                    if not 'source_projector' in unexpected_key: #FIXME
+                        raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
             if missing_keys:
                 raise ValueError(f"MISSING KEYS: {missing_keys}")
 
@@ -155,8 +157,15 @@ class Model(nn.Module):
         x = x.reshape(x.size(0), x.size(1), -1, self.param.in_dim)
         bz, ch_num, seq_len, patch_size = x.shape
 
-        self.param.segment_forward = True
-        if getattr(self.param, 'segment_forward', False) and seq_len > self.param.seq_len:
+        if getattr(self.param, 'use_initial_segment_only', False):
+            seg_len = self.param.seq_len
+            x = x[:, :, :seg_len, :].contiguous()
+            batch['timeseries'] = x
+            feats = self.backbone(batch)
+            if not isinstance(feats, tuple):
+                raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
+            feats = feats[1]["rep"]
+        elif getattr(self.param, 'segment_forward', False) and seq_len > self.param.seq_len:
             # Pretrained encoder expects seq_len=self.param.seq_len; the finetune
             # input is longer, so split along time and encode each segment
             # independently. Segments are packed into the batch dim so the

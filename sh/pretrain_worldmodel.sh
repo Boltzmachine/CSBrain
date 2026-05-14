@@ -26,6 +26,7 @@ python pretrain_main.py \
     --cinebrain_n_windows 1 \
     --cinebrain_window_s 1.0 \
     --cinebrain_stride_s 1.0 \
+    --cinebrain_erp_latency_s 0.5 \
     --in_dim 40 \
     --out_dim 40 \
     --d_model 40 \
@@ -44,4 +45,4 @@ python pretrain_main.py \
     --predictor_d_model 512 \
     --predictor_n_layers 4 \
     --model_dir outputs/ \
-    --run_name worldmodel-mix-cinebrain-v4
+    --run_name worldmodel-mix-cinebrain-v7-tueg

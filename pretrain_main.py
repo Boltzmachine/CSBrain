@@ -233,7 +233,10 @@ def main():
         target_event_len = params.seq_len * params.in_dim
 
         alljoined_ds = get_webdataset(
-            ["Alljoined-1.6M/*.tar"],
+            [
+                "Alljoined-1.6M/*.tar",
+                "tueg/*.tar",
+            ],
             params,
             event_window_target_len=target_event_len,
         )

@@ -78,6 +78,11 @@ def main():
                              'the finetune time dim exceeds the pretrained seq_len '
                              '(e.g. world-model pretraining with seq_len=5 applied '
                              'to PhysioNet with time dim 20).')
+    parser.add_argument('--use_initial_segment_only', action='store_true', default=False,
+                        help='truncate the finetune input to the first seq_len patches '
+                             '(i.e. the pretrained model native window) instead of '
+                             'processing the full time dim. Takes precedence over '
+                             '--segment_forward when both are set.')
 
     # --- SSM/Mamba multi-frequency patch embedding ---
     parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'],

@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-gpu=6
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --time=1-00:00:00
 #SBATCH --job-name=csbrain-finetune
 #SBATCH --output=outputs/slurms/%j.out
@@ -41,7 +41,7 @@ echo "Job started at $(date)" | tee -a "$LOG_FILE"
 #     --weight_decay  0.01 \
 #     --lr 0.00005 
 
-FOUNDATION_DIR="outputs/worldmodel-mix-cinebrain-v4/epoch13_loss0.5890316367149353.pth"
+FOUNDATION_DIR="outputs/worldmodel-mix-cinebrain-v7/epoch4_loss0.8384905457496643.pth"
 CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
 EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
 WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}"
@@ -56,10 +56,10 @@ python finetune_main.py \
     --wandb_run_name "$WANDB_RUN_NAME" \
     --results_csv outputs/finetune_results.csv \
     --use_pretrained_weights \
+    --use_initial_segment_only \
     --dropout 0.3 \
     --weight_decay  0.01 \
     --lr 0.00005
-
 
 # VISION_ENCODER="facebook/dinov2-base"   # swap to DINOv3 id once access is granted
 # IMAGE_MODE="raw"                        # 'raw' matches the paper; 'spectrogram' = STFT grid

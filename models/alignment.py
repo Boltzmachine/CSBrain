@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import re
@@ -206,11 +207,16 @@ class SourceProjector(nn.Module):
         return finite_mask
 
     def forward(self, x: torch.Tensor, ch_coords: torch.Tensor,
-                valid_channel_mask: torch.Tensor = None):
+                valid_channel_mask: torch.Tensor = None,
+                sensor_mask: torch.Tensor = None):
         """
         x:         (B, C, N, d)  raw sensor timeseries
         ch_coords: (B, C, 3)    spherical coordinates
         valid_channel_mask: (B, C) bool — False for padded/invalid channels
+        sensor_mask: (B, C, N) — 1/True at (channel, patch) positions that
+            should be hidden from the cross-attention (masked patches).
+            Folded per-timestep into the key_padding_mask so source tokens
+            at time n genuinely cannot see masked sensors at time n.
         Returns:   (B, K, N, d) source signals
         """
         B, C, N, d = x.shape
@@ -227,6 +233,15 @@ class SourceProjector(nn.Module):
 
         valid = self._valid_channel_mask(ch_coords, valid_channel_mask)      # (B, C)
         key_padding_mask = ~valid.unsqueeze(1).expand(B, N, C).reshape(B * N, C)
+
+        if sensor_mask is not None:
+            # sensor_mask: (B, C, N) -> (B*N, C). True = masked patch, hide.
+            sm = sensor_mask.bool().permute(0, 2, 1).reshape(B * N, C)
+            combined = key_padding_mask | sm
+            # Guard against all-True rows (softmax over -inf -> NaN): fall back
+            # to the valid-only mask for any (b, n) where every sensor is masked.
+            all_padded = combined.all(dim=-1, keepdim=True)
+            key_padding_mask = torch.where(all_padded, key_padding_mask, combined)
 
         attn_out, _ = self.forward_attn(
             queries, keys_exp, values, key_padding_mask=key_padding_mask,
@@ -294,6 +309,94 @@ class SourceProjector(nn.Module):
             "decorr_loss": (self.decorr_weight, decorr_loss),
         }
 
+
+class TemporalConcatEncoder(nn.Module):
+    """Temporal-only transformer over concatenated source features.
+
+    After the source projector the K sources carry a fixed,
+    montage-independent identity, so spatial (cross-channel) attention is
+    unnecessary. Instead, all K source features at a timestep are
+    concatenated into a single token of width ``num_sources * d_model``
+    and only temporal self-attention is applied — ``num_layers`` of it,
+    matching the criss-cross encoder's depth.
+
+    A learnable global token carries the sequence-level (CLS)
+    representation. In non-causal mode it is prepended; in causal mode it
+    is appended as the *last* position so it can attend over the whole
+    sequence while the per-timestep tokens still never see it (and so
+    never leak future information).
+    """
+
+    def __init__(self, num_sources, d_model, nhead, dim_feedforward,
+                 num_layers, dropout=0.1, causal=False):
+        super().__init__()
+        self.num_sources = num_sources
+        self.d_model = d_model
+        self.width = num_sources * d_model
+        self.num_layers = num_layers
+        self.causal = causal
+        self.global_last = causal
+        assert self.width % nhead == 0, (
+            f"num_sources*d_model={self.width} must be divisible by "
+            f"nhead={nhead}")
+
+        self.global_token = nn.Parameter(torch.randn(1, 1, self.width) * 0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.width, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, activation=F.gelu, batch_first=True,
+            norm_first=True,
+        )
+        self.layers = nn.ModuleList(
+            [copy.deepcopy(layer) for _ in range(num_layers)])
+
+    def split_global(self, seq):
+        """Split (B, N+1, width) into global (B, width) and tokens (B, N, width)."""
+        if self.global_last:
+            return seq[:, -1, :], seq[:, :-1, :]
+        return seq[:, 0, :], seq[:, 1:, :]
+
+    def forward(self, patch_emb, valid_length_mask=None, branch_layer_idx=None):
+        """patch_emb: (B, K, N, d_model). Returns (enc_out, branch).
+
+        ``enc_out`` is (B, N+1, width); the global token sits at index
+        ``-1`` (causal) or ``0`` (non-causal) — use :meth:`split_global`.
+        ``branch`` is the encoder state after layer ``branch_layer_idx``
+        (or ``None`` if not requested).
+        """
+        B, K, N, d = patch_emb.shape
+        x = patch_emb.permute(0, 2, 1, 3).reshape(B, N, K * d)        # (B, N, width)
+        g = self.global_token.expand(B, -1, -1)
+
+        if valid_length_mask is not None:
+            g_valid = torch.ones_like(valid_length_mask[:, :1])
+
+        if self.global_last:
+            x = torch.cat([x, g], dim=1)                              # (B, N+1, width)
+            if valid_length_mask is not None:
+                vlm = torch.cat([valid_length_mask, g_valid], dim=1)
+        else:
+            x = torch.cat([g, x], dim=1)
+            if valid_length_mask is not None:
+                vlm = torch.cat([g_valid, valid_length_mask], dim=1)
+
+        key_padding_mask = None
+        if valid_length_mask is not None:
+            key_padding_mask = ~vlm.bool()                            # (B, N+1)
+
+        attn_mask = None
+        if self.causal:
+            # Pure causal mask over [t0..t_{N-1}, global]: timestep k sees
+            # only timesteps 0..k; the global token (last) sees everything.
+            L = x.size(1)
+            attn_mask = torch.triu(
+                torch.full((L, L), float('-inf'), device=x.device), diagonal=1)
+
+        branch = None
+        for i, layer in enumerate(self.layers):
+            x = layer(x, src_mask=attn_mask, src_key_padding_mask=key_padding_mask)
+            if branch_layer_idx is not None and i == branch_layer_idx:
+                branch = x
+        return x, branch
 
 
 class MLPSemanticReadout(nn.Module):
@@ -368,7 +471,7 @@ class CSBrainAlign(nn.Module):
     def __init__(self, in_dim=200, out_dim=200, d_model=200, dim_feedforward=800, seq_len=30, n_layer=12,
                  nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[],
                  causal=False, project_to_source=False, num_sources=32,
-                 source_projector_ckpt=None, freeze_source_projector=True,
+                 source_projector_ckpt=None, freeze_source_projector=False,
                  adversarial_weight=0.0, num_sessions=256,
                  equivariance_weight=0.0, info_max_weight=0.0,
                  alignment_weight=1.0,
@@ -396,11 +499,21 @@ class CSBrainAlign(nn.Module):
                 in_dim=in_dim,
                 num_sources=num_sources,
             )
+            # Learned sentinel that replaces masked sensor patches in raw
+            # amplitude space (instead of hard zeros — see fix #2).
+            self.sensor_mask_embed = nn.Parameter(torch.zeros(in_dim))
+            # Learned mask-presence embedding added to source-space tokens at
+            # time positions where sensors were masked, so the temporal
+            # transformer can tell "predict me" from "preserve me" (fix #3).
+            self.source_mask_embed = nn.Parameter(torch.zeros(d_model))
         if source_projector_ckpt is not None:
+            raise 
             ckpt = torch.load(source_projector_ckpt, map_location='cpu')
             self.source_projector.load_state_dict(ckpt, strict=True)
             print(f"Loaded pre-trained source projector from {source_projector_ckpt}")
+
         if self.project_to_source and freeze_source_projector:
+            raise
             for p in self.source_projector.parameters():
                 p.requires_grad = False
             print("Source projector weights frozen")
@@ -433,6 +546,15 @@ class CSBrainAlign(nn.Module):
             activation=F.gelu, causal=causal
         )
         self.encoder = CSBrain_TransformerEncoder(encoder_layer, num_layers=n_layer, enable_nested_tensor=False)
+
+        # Source path: temporal-only attention over concatenated sources.
+        if self.project_to_source:
+            self.source_encoder = TemporalConcatEncoder(
+                num_sources=num_sources, d_model=d_model, nhead=nhead,
+                dim_feedforward=dim_feedforward, num_layers=n_layer,
+                causal=causal,
+            )
+            self.source_global_proj = nn.Linear(num_sources * d_model, d_model)
 
         self.proj_out = nn.Sequential(
             nn.Linear(d_model, out_dim),
@@ -674,6 +796,73 @@ class CSBrainAlign(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def _encode_source(self, patch_emb, batch):
+        """Temporal-only encode of concatenated source features.
+
+        ``patch_emb`` is (B, K, N, d_model) in source space. Returns
+        ``(global_rep, patch_tokens, branch_embs, branch_global)`` where
+        ``global_rep``/``branch_global`` are (B, d_model) and
+        ``patch_tokens``/``branch_embs`` are (B, K, N, d_model). The
+        branch tensors are taken from layer ``num_layers - 3`` to feed
+        the contrastive readout, mirroring the criss-cross path.
+        """
+        B, K, N, d = patch_emb.shape
+        vlm = batch.get('valid_length_mask', None)
+        branch_idx = self.source_encoder.num_layers - 3
+        enc_out, branch_x = self.source_encoder(
+            patch_emb, valid_length_mask=vlm, branch_layer_idx=branch_idx)
+
+        def _split(seq):
+            # seq: (B, N+1, width) -> global (B, d_model), tokens (B, K, N, d_model)
+            g_raw, tok_seq = self.source_encoder.split_global(seq)
+            g = self.source_global_proj(g_raw)
+            toks = tok_seq.reshape(B, N, K, d).permute(0, 2, 1, 3).contiguous()
+            return g, toks
+
+        global_rep, patch_tokens = _split(enc_out)
+        branch_global, branch_embs = _split(branch_x)
+        return global_rep, patch_tokens, branch_embs, branch_global
+
+    def _image_contrastive(self, pred_flatten, batch, has_image, i_branch=0):
+        """Symmetric InfoNCE between predicted features and DINOv2 image
+        embeddings. Returns a dict of loss/accuracy entries."""
+        image_encoder_inputs = {k: v[has_image]
+                                for k, v in batch['image_encoder_inputs'].items()}
+        image_hidden_states = self.get_image_hidden_states(**image_encoder_inputs)
+        image_hidden_states_branch = image_hidden_states[:, i_branch]
+        image_flatten = image_hidden_states_branch.reshape(
+            -1, image_hidden_states_branch.size(-1))
+
+        temperature = 0.07
+        pred_norm = F.normalize(pred_flatten, dim=-1)
+        image_norm = F.normalize(image_flatten, dim=-1)
+
+        logits = torch.matmul(pred_norm, image_norm.t()) / temperature
+        targets = torch.arange(logits.size(0), device=logits.device)
+
+        loss_p2i = F.cross_entropy(logits, targets)
+        loss_i2p = F.cross_entropy(logits.t(), targets)
+        branch_loss = 0.5 * (loss_p2i + loss_i2p)
+
+        out = {f"contrastive_loss_{i_branch}": (self.alignment_weight, branch_loss)}
+        with torch.no_grad():
+            pred_to_img = logits.argmax(dim=1)
+            img_to_pred = logits.argmax(dim=0)
+            acc = 0.5 * ((pred_to_img == targets).float()
+                         + (img_to_pred == targets).float())
+        out[f"contrastive_acc_{i_branch}"] = acc.mean()
+
+        contrastive_loss_per_source = defaultdict(list)
+        sources = batch['source']
+        if has_image is not None:
+            mask_list = has_image.detach().cpu().tolist()
+            sources = [s for s, m in zip(sources, mask_list) if m]
+        for i, src in enumerate(sources):
+            contrastive_loss_per_source[src].append(acc[i])
+        for src, acc_list in contrastive_loss_per_source.items():
+            out[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
+        return out
+
     def forward(self, batch, mask=None, encoder_only=False):
         """Encode ``batch`` and (unless ``encoder_only``) compute losses.
 
@@ -696,13 +885,19 @@ class CSBrainAlign(nn.Module):
         _orig_mask = mask
 
         # --- Apply mask in sensor space, then project to source space ---
+        valid_ch = batch.get('valid_channel_mask', None)
         if self.project_to_source:
-            valid_ch = batch.get('valid_channel_mask', None)
             if mask is not None:
-                # Apply mask in original sensor space before source projection
+                # Replace masked patches with a learned sentinel (fix #2) and
+                # also exclude them from the projector's cross-attention key
+                # set (fix #1, via sensor_mask).
                 x_masked = x.clone()
-                x_masked[mask == 1] = 0.0  # zero out masked patches in sensor space
-                x = self.source_projector(x_masked, ch_coords, valid_channel_mask=valid_ch)
+                x_masked[mask == 1] = self.sensor_mask_embed.to(x_masked.dtype)
+                x = self.source_projector(
+                    x_masked, ch_coords,
+                    valid_channel_mask=valid_ch,
+                    sensor_mask=mask,
+                )
             else:
                 x = self.source_projector(x, ch_coords, valid_channel_mask=valid_ch)
             # Don't pass mask to patch_embedding — already applied
@@ -713,113 +908,100 @@ class CSBrainAlign(nn.Module):
         base_N = x.size(2)
         patch_emb = self.patch_embedding(x, mask)
 
+        # Fix #3: tell the temporal transformer which time positions were
+        # masked in sensor space. Aggregate the per-(channel, patch) mask
+        # over channels into a per-patch score and add a learned mask-
+        # presence embedding to every source token at that time.
+        if self.project_to_source and _orig_mask is not None:
+            time_score = _orig_mask.float().mean(dim=1)  # (B, N) in [0, 1]
+            if patch_emb.size(2) == time_score.size(1):
+                patch_emb = patch_emb + (
+                    time_score.unsqueeze(1).unsqueeze(-1)
+                    * self.source_mask_embed.view(1, 1, 1, -1)
+                )
+
         if self.patch_embed_type == 'mamba' and 'valid_length_mask' in batch:
             batch['valid_length_mask'] = self.patch_embedding.adapt_valid_length_mask(
                 batch['valid_length_mask'])
 
+        contrastive_loss = dict()
+        branch_embs = None
+
         if self.project_to_source:
-            # Sources are always valid (no padding in source dim)
-            b = patch_emb.size(0)
-            batch['valid_channel_mask'] = torch.ones(b, self.source_projector.num_sources,
-                                                     dtype=torch.bool, device=patch_emb.device)
+            # Sources carry a fixed, montage-independent identity, so
+            # cross-channel attention is unnecessary: concatenate all K
+            # source features at each timestep and apply temporal-only
+            # attention (see TemporalConcatEncoder).
+            global_rep, patch_tokens, branch_embs, branch_global = \
+                self._encode_source(patch_emb, batch)
+
+            has_image = batch.get('has_image', None)
+            if (not encoder_only
+                    and 'image_encoder_inputs' in batch
+                    and has_image is not None and has_image.any()
+                    and self.alignment_weight > 0):
+                semantic_emb = self.semantic_readout(branch_global[has_image])
+                pred_flatten = self.contrastive_proj(semantic_emb)
+                contrastive_loss.update(
+                    self._image_contrastive(pred_flatten, batch, has_image))
         else:
             coord_pe, finite_coord_mask = self._spherical_positional_encoding(ch_coords)
             coord_emb = self.coord_enhancement(coord_pe)
             patch_emb = patch_emb + coord_emb.unsqueeze(2)
 
-        if self.add_global:
-            patch_emb = torch.cat([self.global_channel.expand(patch_emb.size(0), -1, patch_emb.size(2), -1), patch_emb], dim=1)
-            patch_emb = torch.cat([self.global_token.expand(patch_emb.size(0), patch_emb.size(1), -1, -1), patch_emb], dim=2)
-            if 'valid_channel_mask' in batch:
-                batch['valid_channel_mask'] = torch.cat([torch.ones_like(batch['valid_channel_mask'][:, :1], dtype=torch.bool), batch['valid_channel_mask']], dim=1)
-            if 'valid_length_mask' in batch:
-                batch['valid_length_mask'] = torch.cat([torch.ones_like(batch['valid_length_mask'][:, :1], dtype=torch.bool), batch['valid_length_mask']], dim=1)
+            if self.add_global:
+                patch_emb = torch.cat([self.global_channel.expand(patch_emb.size(0), -1, patch_emb.size(2), -1), patch_emb], dim=1)
+                patch_emb = torch.cat([self.global_token.expand(patch_emb.size(0), patch_emb.size(1), -1, -1), patch_emb], dim=2)
+                if 'valid_channel_mask' in batch:
+                    batch['valid_channel_mask'] = torch.cat([torch.ones_like(batch['valid_channel_mask'][:, :1], dtype=torch.bool), batch['valid_channel_mask']], dim=1)
+                if 'valid_length_mask' in batch:
+                    batch['valid_length_mask'] = torch.cat([torch.ones_like(batch['valid_length_mask'][:, :1], dtype=torch.bool), batch['valid_length_mask']], dim=1)
 
-        contrastive_loss = dict()
+            for layer_idx in range(self.encoder.num_layers):
+                patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
+                # patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
+                patch_emb = self.encoder.layers[layer_idx](patch_emb, self.area_config, inter_window_attn_mask=~batch['valid_length_mask'] if 'valid_length_mask' in batch else None, inter_region_attn_mask=~batch['valid_channel_mask'] if 'valid_channel_mask' in batch else None)
 
-        for layer_idx in range(self.encoder.num_layers):
-            patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
-            # patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
-            patch_emb = self.encoder.layers[layer_idx](patch_emb, self.area_config, inter_window_attn_mask=~batch['valid_length_mask'] if 'valid_length_mask' in batch else None, inter_region_attn_mask=~batch['valid_channel_mask'] if 'valid_channel_mask' in batch else None)
-
-            if layer_idx == self.encoder.num_layers - 3:
-                i_branch = 0
-                has_image = batch.get('has_image', None)
-                if has_image is not None:
-                    branch_embs = patch_emb[has_image] # (B_with_image, K, N, d)
-                else:
-                    branch_embs = patch_emb
-                if (not encoder_only
-                        and 'image_encoder_inputs' in batch
-                        and has_image.any()
-                        and self.alignment_weight > 0):
-                    image_encoder_inputs = {k: v[has_image] for k, v in batch['image_encoder_inputs'].items()}
-                    if self.use_llm_vq:
-                        assert self.add_global, "LLM VQ path requires add_global=True."
-                        global_branch = branch_embs[:, 0, 0, :]  # (B_img, d_model)
-                        k_tokens = self.global_to_k_tokens(global_branch).view(
-                            global_branch.size(0), self.num_language_tokens, self.d_model,
-                        )
-                        _, vq_info = self.llm_vq(k_tokens.unsqueeze(2))  # (B, K, 1, d_model)
-                        quantized = vq_info["quantized"].view(
-                            global_branch.size(0), self.num_language_tokens, -1,
-                        )  # (B_img, K, llama_dim)
-                        pred_flatten = self.llm_contrastive_proj(
-                            quantized.reshape(quantized.size(0), -1)
-                        )
-                        contrastive_loss["llm_vq_aux_loss"] = (
-                            self.llm_vq_aux_weight, vq_info["aux_loss"],
-                        )
-                    else:
-                        if self.add_global:
-                            semantic_emb = self.semantic_readout(branch_embs[:, 0, 0, :])
-                        else:
-                            semantic_emb = self.semantic_readout(branch_embs.view(branch_embs.size(0), branch_embs.size(1), -1))
-                        pred_flatten = self.contrastive_proj(semantic_emb) # (B, n_events, d_model) <- does not work
-
-                    image_hidden_states = self.get_image_hidden_states(**image_encoder_inputs) # (B, n_events, n_branch, d_model)
-                    image_hidden_states_branch = image_hidden_states[:, i_branch] # (B, n_events, d_model)
-                    image_flatten = image_hidden_states_branch.reshape(-1, image_hidden_states_branch.size(-1))
-
-                    # contrastive learning
-                    temperature = 0.07
-                    pred_norm = F.normalize(pred_flatten, dim=-1)
-                    image_norm = F.normalize(image_flatten, dim=-1)
-
-                    # Pairwise similarity: positives are on the diagonal
-                    logits = torch.matmul(pred_norm, image_norm.t()) / temperature
-                    targets = torch.arange(logits.size(0), device=logits.device)
-
-                    # Symmetric InfoNCE
-                    loss_p2i = F.cross_entropy(logits, targets)
-                    loss_i2p = F.cross_entropy(logits.t(), targets)
-                    branch_loss = 0.5 * (loss_p2i + loss_i2p)
-
-                    contrastive_loss[f"contrastive_loss_{i_branch}"] = (self.alignment_weight, branch_loss)
-                    with torch.no_grad():
-                        pred_to_img = logits.argmax(dim=1)
-                        img_to_pred = logits.argmax(dim=0)
-
-                        acc_p2i = (pred_to_img == targets).float()
-                        acc_i2p = (img_to_pred == targets).float()
-                        acc = 0.5 * (acc_p2i + acc_i2p)
-
-                    contrastive_loss[f"contrastive_acc_{i_branch}"] = acc.mean()
-                    contrastive_loss_per_source = defaultdict(list)
-
-                    sources = batch['source']
+                if layer_idx == self.encoder.num_layers - 3:
+                    i_branch = 0
+                    has_image = batch.get('has_image', None)
                     if has_image is not None:
-                        mask_list = has_image.detach().cpu().tolist()
-                        sources = [s for s, m in zip(sources, mask_list) if m]
-                    for i, src in enumerate(sources):
-                        contrastive_loss_per_source[src].append(acc[i])
+                        branch_embs = patch_emb[has_image] # (B_with_image, K, N, d)
+                    else:
+                        branch_embs = patch_emb
+                    if (not encoder_only
+                            and 'image_encoder_inputs' in batch
+                            and has_image.any()
+                            and self.alignment_weight > 0):
+                        if self.use_llm_vq:
+                            assert self.add_global, "LLM VQ path requires add_global=True."
+                            global_branch = branch_embs[:, 0, 0, :]  # (B_img, d_model)
+                            k_tokens = self.global_to_k_tokens(global_branch).view(
+                                global_branch.size(0), self.num_language_tokens, self.d_model,
+                            )
+                            _, vq_info = self.llm_vq(k_tokens.unsqueeze(2))  # (B, K, 1, d_model)
+                            quantized = vq_info["quantized"].view(
+                                global_branch.size(0), self.num_language_tokens, -1,
+                            )  # (B_img, K, llama_dim)
+                            pred_flatten = self.llm_contrastive_proj(
+                                quantized.reshape(quantized.size(0), -1)
+                            )
+                            contrastive_loss["llm_vq_aux_loss"] = (
+                                self.llm_vq_aux_weight, vq_info["aux_loss"],
+                            )
+                        else:
+                            if self.add_global:
+                                semantic_emb = self.semantic_readout(branch_embs[:, 0, 0, :])
+                            else:
+                                semantic_emb = self.semantic_readout(branch_embs.view(branch_embs.size(0), branch_embs.size(1), -1))
+                            pred_flatten = self.contrastive_proj(semantic_emb) # (B, n_events, d_model) <- does not work
 
-                    for src, acc_list in contrastive_loss_per_source.items():
-                        contrastive_loss[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
+                        contrastive_loss.update(
+                            self._image_contrastive(pred_flatten, batch, has_image, i_branch))
 
-        # Extract global token and patch-level representations
-        global_rep = patch_emb[:, 0, 0, :] if self.add_global else patch_emb.mean(dim=(1, 2))
-        patch_tokens = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
+            # Extract global token and patch-level representations
+            global_rep = patch_emb[:, 0, 0, :] if self.add_global else patch_emb.mean(dim=(1, 2))
+            patch_tokens = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
 
         if encoder_only:
             # Skip reconstruction output and equivariance — callers
@@ -831,9 +1013,8 @@ class CSBrainAlign(nn.Module):
             }
 
         if self.project_to_source:
-            source_emb = patch_emb[:, 1:, 1:, :] if self.add_global else patch_emb
             # Reconstruct back to sensor space for masked reconstruction loss
-            out = self.source_projector.inverse(source_emb, ch_coords,
+            out = self.source_projector.inverse(patch_tokens, ch_coords,
                                                 valid_channel_mask=valid_ch)
             out = self.proj_out(out)
         else:

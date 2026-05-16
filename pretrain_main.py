@@ -144,7 +144,7 @@ def main():
         from datasets.cached_dataset import get_webdataset, collate_cached, SessionGroupedLoader
         from torch.utils.data import ConcatDataset
         dataset_names = [
-            # 'tueg/*.tar',
+            'tueg/*.tar',
             # 'siena_scalp/*.tar',
             # 'physionet_2018/*.tar',
             # 'raw_eeg/*.tar',
@@ -164,7 +164,8 @@ def main():
         n_samples_per_epoch = 1109545
         pretrained_dataset = get_webdataset(
             dataset_names,
-            params
+            params,
+            event_window_target_len=params.seq_len * params.in_dim,
         ) #resampled=True
 
         num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
@@ -235,7 +236,7 @@ def main():
         alljoined_ds = get_webdataset(
             [
                 "Alljoined-1.6M/*.tar",
-                "tueg/*.tar",
+                # "tueg/*.tar",
             ],
             params,
             event_window_target_len=target_event_len,

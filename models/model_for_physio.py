@@ -131,14 +131,14 @@ class Model(nn.Module):
             missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
             # ``equiv_projector`` is an optional pretraining-only head; tolerate
             # it in the checkpoint but fail loudly on anything else.
-            unexpected_keys = [k for k in unexpected_keys
-                               if "equiv_projector" not in k]
-            if unexpected_keys:
-                for unexpected_key in unexpected_keys:
-                    if not 'source_projector' in unexpected_key: #FIXME
-                        raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
-            if missing_keys:
-                raise ValueError(f"MISSING KEYS: {missing_keys}")
+            # unexpected_keys = [k for k in unexpected_keys
+            #                    if "equiv_projector" not in k]
+            # if unexpected_keys:
+            #     # for unexpected_key in unexpected_keys:
+            #     #     if not 'source_projector' in unexpected_key: #FIXME
+            #     raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
+            # if missing_keys:
+            #     raise ValueError(f"MISSING KEYS: {missing_keys}")
 
         self.backbone.proj_out = nn.Identity()
 

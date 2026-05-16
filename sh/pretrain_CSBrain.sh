@@ -72,12 +72,13 @@ python pretrain_main.py \
     --in_dim 40 \
     --out_dim 40 \
     --d_model 40 \
-    --seq_len 20 \
-    --nhead 4 \
+    --seq_len 5 \
+    --n_layer 12 \
+    --nhead 8 \
     --samples_per_session 8 \
     --sessions_per_batch 16 \
-    --optimizer Muon \
-    --run_name alljoined-muon
+    --project_to_source \
+    --run_name project2
 
 
 # ============================================================

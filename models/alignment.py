@@ -479,7 +479,8 @@ class CSBrainAlign(nn.Module):
                  mamba_band_periods=None, n_mamba_layers=2,
                  mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
                  use_llm_vq=False, num_language_tokens=8,
-                 max_llm_codebook_size=4096, llm_vq_aux_weight=0.1):
+                 max_llm_codebook_size=4096, llm_vq_aux_weight=0.1,
+                 spectral_mode='static', stft_n_fft=64, stft_hop=1):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
@@ -527,7 +528,10 @@ class CSBrainAlign(nn.Module):
                 expand=mamba_expand, causal=causal,
             )
         elif patch_embed_type == 'cnn':
-            self.patch_embedding = PatchEmbedding(in_dim, out_dim, d_model, seq_len, causal=causal)
+            self.patch_embedding = PatchEmbedding(
+                in_dim, out_dim, d_model, seq_len, causal=causal,
+                spectral_mode=spectral_mode, stft_n_fft=stft_n_fft, stft_hop=stft_hop,
+            )
         else:
             raise ValueError(f"Unknown patch_embed_type: {patch_embed_type}")
 
@@ -1259,10 +1263,14 @@ class MambaPatchEmbedding(nn.Module):
 
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, in_dim, out_dim, d_model, seq_len, causal=False):
+    def __init__(self, in_dim, out_dim, d_model, seq_len, causal=False,
+                 spectral_mode='static', stft_n_fft=64, stft_hop=1):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
+        if spectral_mode not in ('static', 'instantaneous'):
+            raise ValueError(f"Unknown spectral_mode: {spectral_mode}")
+        self.spectral_mode = spectral_mode
         if causal:
             # Channel dim (kernel=19, pad=9) stays symmetric.
             # Time dim (kernel=7): no built-in padding; left-pad manually.
@@ -1291,10 +1299,53 @@ class PatchEmbedding(nn.Module):
             nn.GroupNorm(5, d_model),
             nn.GELU(),
         )
-        self.spectral_proj = nn.Sequential(
-            nn.Linear(d_model // 2 + 1, d_model),
-            nn.Dropout(0.1),
-        )
+
+        if self.spectral_mode == 'static':
+            self.spectral_proj = nn.Sequential(
+                nn.Linear(d_model // 2 + 1, d_model),
+                nn.Dropout(0.1),
+            )
+        else:
+            # Instantaneous spectrum: STFT is run on the full per-channel signal
+            # (patch_num * patch_size samples) so internal patch boundaries are
+            # handled seamlessly, then the time axis is split back into
+            # (patch_num, frames_per_patch). A Conv2d head turns each per-patch
+            # spectrogram into a d_model vector.
+            if in_dim % stft_hop != 0:
+                raise ValueError(
+                    f"stft_hop ({stft_hop}) must divide patch_size ({in_dim}) so the "
+                    f"STFT time axis can be reshaped cleanly into per-patch frames."
+                )
+            self.stft_n_fft = stft_n_fft
+            self.stft_hop = stft_hop
+            self.register_buffer(
+                'stft_window', torch.hann_window(stft_n_fft), persistent=False,
+            )
+            F_bins = stft_n_fft // 2 + 1
+            T_frames = in_dim // stft_hop  # frames per patch (= patch_size when hop=1)
+            c1, c2 = 16, 32
+
+            def _conv_out(L, k, s, p):
+                return (L + 2 * p - k) // s + 1
+
+            f1 = _conv_out(F_bins, 7, 4, 3)
+            t1 = _conv_out(T_frames, 7, 8, 3)
+            f2 = _conv_out(f1, 3, 2, 1)
+            t2 = _conv_out(t1, 3, 4, 1)
+            flatten_dim = c2 * f2 * t2
+
+            self.spectral_conv = nn.Sequential(
+                nn.Conv2d(1, c1, kernel_size=(7, 7), stride=(4, 8), padding=(3, 3)),
+                nn.GroupNorm(min(8, c1), c1),
+                nn.GELU(),
+                nn.Conv2d(c1, c2, kernel_size=(3, 3), stride=(2, 4), padding=(1, 1)),
+                nn.GroupNorm(min(8, c2), c2),
+                nn.GELU(),
+            )
+            self.spectral_proj = nn.Sequential(
+                nn.Linear(flatten_dim, d_model),
+                nn.Dropout(0.1),
+            )
 
     def forward(self, x, mask=None):
         bz, ch_num, patch_num, patch_size = x.shape
@@ -1303,6 +1354,10 @@ class PatchEmbedding(nn.Module):
         else:
             mask_x = x.clone()
             mask_x[mask == 1] = self.mask_encoding
+
+        # Keep the masked 4D signal around for the spectral path; the per-branch
+        # reshape below may rebind ``mask_x`` for the proj_in path.
+        mask_x_4d = mask_x  # (bz, ch, patch_num, patch_size)
 
         if self.causal:
             # Process each time step independently so GroupNorm doesn't mix across time
@@ -1315,10 +1370,38 @@ class PatchEmbedding(nn.Module):
             patch_emb = self.proj_in(mask_x)
             patch_emb = patch_emb.permute(0, 2, 1, 3).contiguous().view(bz, ch_num, patch_num, self.d_model)
 
-        mask_x = mask_x.contiguous().view(bz * ch_num * patch_num, patch_size)
-        spectral = torch.fft.rfft(mask_x, dim=-1, norm='forward')
-        spectral = torch.abs(spectral).contiguous().view(bz, ch_num, patch_num, mask_x.shape[1] // 2 + 1)
-        spectral_emb = self.spectral_proj(spectral)
+        if self.spectral_mode == 'static':
+            sig = mask_x_4d.contiguous().view(bz * ch_num * patch_num, patch_size)
+            spectral = torch.fft.rfft(sig, dim=-1, norm='forward')
+            spectral = torch.abs(spectral).contiguous().view(bz, ch_num, patch_num, sig.shape[1] // 2 + 1)
+            spectral_emb = self.spectral_proj(spectral)
+        else:
+            # Run STFT on the full per-channel timeseries so internal patch
+            # boundaries don't introduce spurious zero-padding, then split the
+            # time axis back into (patch_num, frames_per_patch).
+            L = patch_num * patch_size
+            full_sig = mask_x_4d.contiguous().view(bz * ch_num, L)
+            spec = torch.stft(
+                full_sig,
+                n_fft=self.stft_n_fft,
+                hop_length=self.stft_hop,
+                win_length=self.stft_n_fft,
+                window=self.stft_window,
+                center=True,
+                return_complex=True,
+                normalized=True,
+            )
+            # center=True with hop=h gives 1 + L // h frames; drop the trailing
+            # frame so the time axis is exactly L // h = patch_num * (patch_size // h).
+            frames_per_patch = patch_size // self.stft_hop
+            total_frames = patch_num * frames_per_patch
+            spec = spec.abs()[..., :total_frames]                       # (B*C, F, total_frames)
+            F_bins = spec.shape[-2]
+            spec = spec.view(bz, ch_num, F_bins, patch_num, frames_per_patch)
+            spec = spec.permute(0, 1, 3, 2, 4).contiguous()             # (bz, ch, patch_num, F, frames_per_patch)
+            spec = spec.view(bz * ch_num * patch_num, 1, F_bins, frames_per_patch)
+            feats = self.spectral_conv(spec).flatten(start_dim=1)
+            spectral_emb = self.spectral_proj(feats).view(bz, ch_num, patch_num, self.d_model)
         patch_emb = patch_emb + spectral_emb
 
         pe_input = patch_emb.permute(0, 3, 1, 2)  # (B, d_model, ch, time)

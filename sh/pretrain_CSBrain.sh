@@ -77,7 +77,7 @@ python pretrain_main.py \
     --nhead 8 \
     --samples_per_session 8 \
     --sessions_per_batch 16 \
-    --project_to_source \
+    --spectral_mode instantaneous \
     --run_name project2
 
 

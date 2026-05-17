@@ -28,6 +28,7 @@ ARCH_PARAM_FIELDS = (
     'patch_embed_type', 'mamba_band_periods', 'n_mamba_layers',
     'mamba_d_state', 'mamba_d_conv', 'mamba_expand',
     'use_llm_vq', 'num_language_tokens', 'max_llm_codebook_size',
+    'spectral_mode', 'stft_n_fft', 'stft_hop',
 )
 
 

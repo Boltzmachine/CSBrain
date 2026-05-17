@@ -78,6 +78,12 @@ def main():
     parser.add_argument('--max_llm_codebook_size', type=int, default=4096, help='max codebook size (top-K most frequent LLM tokens kept)')
     parser.add_argument('--llm_vq_aux_weight', type=float, default=0.1, help='weight for the VQ commitment / entropy auxiliary loss')
 
+    # --- Spectral branch inside the CNN patch embedder ---
+    parser.add_argument('--spectral_mode', type=str, default='static', choices=['static', 'instantaneous'],
+                        help='static: single FFT magnitude vector per patch (default). instantaneous: STFT-based spectrogram per patch processed by a Conv2d head.')
+    parser.add_argument('--stft_n_fft', type=int, default=64, help='STFT n_fft for spectral_mode=instantaneous')
+    parser.add_argument('--stft_hop', type=int, default=1, help='STFT hop_length for spectral_mode=instantaneous (hop=1 keeps the time axis equal to patch_size)')
+
     # --- SSM/Mamba multi-frequency patch embedding ---
     parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'], help='patch embedder: CNN (default) or multi-frequency Mamba SSM')
     parser.add_argument('--mamba_band_periods', type=str, default=None, help='list of band sample periods, e.g. "[200,600,1200]"; default [in_dim, 3*in_dim, 6*in_dim]')

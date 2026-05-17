@@ -63,6 +63,9 @@ def get_model(params, brain_regions, sorted_indices):
             num_language_tokens=getattr(params, 'num_language_tokens', 8),
             max_llm_codebook_size=getattr(params, 'max_llm_codebook_size', 4096),
             llm_vq_aux_weight=getattr(params, 'llm_vq_aux_weight', 0.1),
+            spectral_mode=getattr(params, 'spectral_mode', 'static'),
+            stft_n_fft=getattr(params, 'stft_n_fft', 64),
+            stft_hop=getattr(params, 'stft_hop', 1),
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
@@ -94,6 +97,9 @@ def get_model(params, brain_regions, sorted_indices):
             num_language_tokens=getattr(params, 'num_language_tokens', 8),
             max_llm_codebook_size=getattr(params, 'max_llm_codebook_size', 4096),
             llm_vq_aux_weight=getattr(params, 'llm_vq_aux_weight', 0.1),
+            spectral_mode=getattr(params, 'spectral_mode', 'static'),
+            stft_n_fft=getattr(params, 'stft_n_fft', 64),
+            stft_hop=getattr(params, 'stft_hop', 1),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
         # ``max_horizon == 0`` short-circuits the world-model components:

@@ -480,7 +480,11 @@ class CSBrainAlign(nn.Module):
                  mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
                  use_llm_vq=False, num_language_tokens=8,
                  max_llm_codebook_size=4096, llm_vq_aux_weight=0.1,
-                 spectral_mode='static', stft_n_fft=64, stft_hop=1):
+                 spectral_mode='static', stft_n_fft=64, stft_hop=1,
+                 use_moe=False, num_experts=4, moe_top_k=2,
+                 moe_gate_input_dim=32,
+                 moe_balance_weight=0.01, moe_band_prior_weight=0.1,
+                 in_dim_for_gate=None):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
@@ -493,6 +497,19 @@ class CSBrainAlign(nn.Module):
         self.use_llm_vq = use_llm_vq
         self.num_language_tokens = num_language_tokens
         self.llm_vq_aux_weight = llm_vq_aux_weight
+
+        # --- MoE config ---
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.moe_top_k = moe_top_k
+        self.moe_gate_input_dim = moe_gate_input_dim
+        self.moe_balance_weight = moe_balance_weight
+        self.moe_band_prior_weight = moe_band_prior_weight
+        if use_moe and patch_embed_type != 'cnn':
+            raise ValueError(
+                "use_moe=True currently requires patch_embed_type='cnn' so the "
+                "per-patch FFT magnitude is available as a gate input."
+            )
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
         if self.project_to_source:
@@ -547,9 +564,35 @@ class CSBrainAlign(nn.Module):
         self.pretrained_image_encoder = Dinov2Model.from_pretrained("facebook/dinov2-base").eval()
         encoder_layer = CSBrain_TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, area_config=self.area_config, sorted_indices=self.sorted_indices, batch_first=True,
-            activation=F.gelu, causal=causal
+            activation=F.gelu, causal=causal,
+            use_moe=use_moe, num_experts=num_experts, moe_top_k=moe_top_k,
+            moe_gate_input_dim=moe_gate_input_dim,
         )
         self.encoder = CSBrain_TransformerEncoder(encoder_layer, num_layers=n_layer, enable_nested_tensor=False)
+
+        # --- MoE gate input: project per-patch FFT magnitude to a small
+        # descriptor consumed by every encoder layer's MoE gate. Building it
+        # once here keeps each gate cheap and lets us anchor it on a fixed
+        # F_bins = in_dim // 2 + 1 (the static rFFT magnitude length).
+        if self.use_moe:
+            f_bins = (in_dim_for_gate or in_dim) // 2 + 1
+            self.moe_n_freq_bins = f_bins
+            self.moe_gate_proj = nn.Sequential(
+                nn.LayerNorm(f_bins),
+                nn.Linear(f_bins, moe_gate_input_dim),
+            )
+            # Pre-compute contiguous frequency-bin ranges per expert so the
+            # band-prior loss is parameter-free.
+            edges = torch.linspace(0, f_bins, num_experts + 1).round().long()
+            band_assign = torch.zeros(num_experts, f_bins)
+            for k in range(num_experts):
+                lo, hi = int(edges[k]), max(int(edges[k + 1]), int(edges[k]) + 1)
+                band_assign[k, lo:hi] = 1.0
+            self.register_buffer('moe_band_assign', band_assign, persistent=False)
+            # Learned defaults applied at global-token positions (where there
+            # is no underlying patch to FFT).
+            self.moe_global_gate_input = nn.Parameter(torch.zeros(moe_gate_input_dim))
+            self.moe_global_band_target = nn.Parameter(torch.ones(num_experts) / num_experts)
 
         # Source path: temporal-only attention over concatenated sources.
         if self.project_to_source:
@@ -953,6 +996,24 @@ class CSBrainAlign(nn.Module):
             coord_emb = self.coord_enhancement(coord_pe)
             patch_emb = patch_emb + coord_emb.unsqueeze(2)
 
+            # --- Build MoE gate inputs and band-prior targets from the raw
+            # per-patch FFT magnitude that PatchEmbedding stashed during its
+            # forward. Both tensors must be aligned with `patch_emb` after
+            # the global-channel/token concatenation below.
+            gate_features = None
+            band_targets = None
+            if self.use_moe:
+                mag = getattr(self.patch_embedding, 'last_spectral_magnitude', None)
+                assert mag is not None, (
+                    "MoE expects PatchEmbedding to expose `last_spectral_magnitude`. "
+                    "Did you change the patch embed type away from 'cnn'?"
+                )
+                gate_features = self.moe_gate_proj(mag)  # (B, C, N, gate_input_dim)
+                energy = mag.pow(2)
+                band_targets = torch.einsum(
+                    'bcnf,ef->bcne', energy, self.moe_band_assign,
+                )  # (B, C, N, E)
+
             if self.add_global:
                 patch_emb = torch.cat([self.global_channel.expand(patch_emb.size(0), -1, patch_emb.size(2), -1), patch_emb], dim=1)
                 patch_emb = torch.cat([self.global_token.expand(patch_emb.size(0), patch_emb.size(1), -1, -1), patch_emb], dim=2)
@@ -961,10 +1022,36 @@ class CSBrainAlign(nn.Module):
                 if 'valid_length_mask' in batch:
                     batch['valid_length_mask'] = torch.cat([torch.ones_like(batch['valid_length_mask'][:, :1], dtype=torch.bool), batch['valid_length_mask']], dim=1)
 
+                if self.use_moe:
+                    B_, C_, N_, _ = patch_emb.shape  # (B, C+1, N+1, d)
+                    g_gate = self.moe_global_gate_input.view(1, 1, 1, -1).expand(B_, C_, N_, -1)
+                    g_band = self.moe_global_band_target.view(1, 1, 1, -1).expand(B_, C_, N_, -1)
+                    # Insert original gate/targets at [1:, 1:]; global channel row
+                    # and global time column take the learned default.
+                    gate_features_padded = g_gate.clone()
+                    gate_features_padded[:, 1:, 1:, :] = gate_features
+                    band_targets_padded = g_band.clone()
+                    band_targets_padded[:, 1:, 1:, :] = band_targets
+                    gate_features = gate_features_padded
+                    band_targets = band_targets_padded
+
+            moe_balance_running = patch_emb.new_zeros(())
+            moe_band_prior_running = patch_emb.new_zeros(())
             for layer_idx in range(self.encoder.num_layers):
                 patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
                 # patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
-                patch_emb = self.encoder.layers[layer_idx](patch_emb, self.area_config, inter_window_attn_mask=~batch['valid_length_mask'] if 'valid_length_mask' in batch else None, inter_region_attn_mask=~batch['valid_channel_mask'] if 'valid_channel_mask' in batch else None)
+                patch_emb = self.encoder.layers[layer_idx](
+                    patch_emb, self.area_config,
+                    inter_window_attn_mask=~batch['valid_length_mask'] if 'valid_length_mask' in batch else None,
+                    inter_region_attn_mask=~batch['valid_channel_mask'] if 'valid_channel_mask' in batch else None,
+                    gate_features=gate_features,
+                    band_targets=band_targets,
+                )
+                if self.use_moe:
+                    aux = self.encoder.layers[layer_idx].last_aux_loss
+                    moe_balance_running = moe_balance_running + aux['balance']
+                    if 'band_prior' in aux:
+                        moe_band_prior_running = moe_band_prior_running + aux['band_prior']
 
                 if layer_idx == self.encoder.num_layers - 3:
                     i_branch = 0
@@ -1079,6 +1166,17 @@ class CSBrainAlign(nn.Module):
                     equiv_losses["info_max_loss"] = (
                         self.info_max_weight, info_loss)
 
+        moe_losses = {}
+        if self.use_moe and not self.project_to_source:
+            n_layers = self.encoder.num_layers
+            moe_losses["moe_balance_loss"] = (
+                self.moe_balance_weight, moe_balance_running / n_layers,
+            )
+            if self.moe_band_prior_weight > 0:
+                moe_losses["moe_band_prior_loss"] = (
+                    self.moe_band_prior_weight, moe_band_prior_running / n_layers,
+                )
+
         return out, {
             "rep": rep,
             "global_rep": global_rep,
@@ -1086,6 +1184,7 @@ class CSBrainAlign(nn.Module):
             # "zero_lag_sync_loss": (0.1, zero_lag_sync_loss),
             **contrastive_loss,
             **equiv_losses,
+            **moe_losses,
         }
     
     def training_step(self, *args, **kwargs):
@@ -1370,11 +1469,17 @@ class PatchEmbedding(nn.Module):
             patch_emb = self.proj_in(mask_x)
             patch_emb = patch_emb.permute(0, 2, 1, 3).contiguous().view(bz, ch_num, patch_num, self.d_model)
 
+        # Always compute the per-patch FFT magnitude; we expose it as a
+        # side output so an upstream MoE can route on raw spectral content.
+        sig_static = mask_x_4d.contiguous().view(bz * ch_num * patch_num, patch_size)
+        spectral_static = torch.fft.rfft(sig_static, dim=-1, norm='forward')
+        spectral_static = torch.abs(spectral_static).contiguous().view(
+            bz, ch_num, patch_num, sig_static.shape[1] // 2 + 1,
+        )
+        self.last_spectral_magnitude = spectral_static
+
         if self.spectral_mode == 'static':
-            sig = mask_x_4d.contiguous().view(bz * ch_num * patch_num, patch_size)
-            spectral = torch.fft.rfft(sig, dim=-1, norm='forward')
-            spectral = torch.abs(spectral).contiguous().view(bz, ch_num, patch_num, sig.shape[1] // 2 + 1)
-            spectral_emb = self.spectral_proj(spectral)
+            spectral_emb = self.spectral_proj(spectral_static)
         else:
             # Run STFT on the full per-channel timeseries so internal patch
             # boundaries don't introduce spurious zero-padding, then split the

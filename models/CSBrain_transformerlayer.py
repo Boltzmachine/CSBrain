@@ -1,4 +1,5 @@
 import copy
+import math
 from typing import Optional, Any, Union, Callable
 
 import torch
@@ -9,11 +10,114 @@ from torch.nn import functional as F
 import numpy as np
 
 
+class MoEFeedForward(nn.Module):
+    """Top-k MoE FFN sized to preserve the dense FFN weight budget.
+
+    Per-expert hidden = ``dim_feedforward // num_experts`` so the combined
+    weight count of ``w1`` (E, d, h_e) + ``w2`` (E, h_e, d) equals the dense
+    ``2 * d * dim_feedforward``. Bias and gate parameters add a small
+    residual (≤ (E-1)*d_model + E*g) that is negligible at the scales here.
+    The gate is conditioned on an external ``gate_input`` — typically a
+    per-patch spectral descriptor — so experts can specialize by frequency
+    rather than by token identity.
+    """
+
+    def __init__(self, d_model: int, dim_feedforward: int, num_experts: int,
+                 top_k: int = 2, gate_input_dim: Optional[int] = None,
+                 dropout: float = 0.1,
+                 activation: Callable[[Tensor], Tensor] = F.gelu,
+                 bias: bool = True):
+        super().__init__()
+        assert dim_feedforward % num_experts == 0, (
+            f"dim_feedforward ({dim_feedforward}) must be divisible by "
+            f"num_experts ({num_experts}) so per-expert hidden size matches "
+            f"the dense FFN parameter budget."
+        )
+        self.d_model = d_model
+        self.num_experts = num_experts
+        self.top_k = min(top_k, num_experts)
+        self.expert_hidden = dim_feedforward // num_experts
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout)
+
+        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, self.expert_hidden))
+        self.w2 = nn.Parameter(torch.empty(num_experts, self.expert_hidden, d_model))
+        nn.init.kaiming_uniform_(self.w1, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.w2, a=math.sqrt(5))
+        if bias:
+            self.b1 = nn.Parameter(torch.zeros(num_experts, self.expert_hidden))
+            self.b2 = nn.Parameter(torch.zeros(num_experts, d_model))
+        else:
+            self.register_parameter('b1', None)
+            self.register_parameter('b2', None)
+
+        self.gate_input_dim = gate_input_dim if gate_input_dim is not None else d_model
+        self.gate = nn.Linear(self.gate_input_dim, num_experts)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def forward(self, x: Tensor,
+                gate_input: Optional[Tensor] = None,
+                band_targets: Optional[Tensor] = None):
+        """x: (..., d_model). Returns (out, aux) with same leading shape.
+
+        ``gate_input`` (..., gate_input_dim) drives expert selection; if
+        ``None``, gate falls back to the token embedding. ``band_targets``
+        (..., num_experts) is an optional soft prior over experts (e.g.,
+        per-band energy) used to compute a KL alignment loss.
+        """
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, self.d_model)
+        N = x_flat.size(0)
+
+        if gate_input is None:
+            gate_in = x_flat
+        else:
+            gate_in = gate_input.reshape(-1, self.gate_input_dim)
+        gate_logits = self.gate(gate_in)
+        gate_probs_full = torch.softmax(gate_logits, dim=-1)
+
+        topk_vals, topk_idx = gate_probs_full.topk(self.top_k, dim=-1)
+        topk_norm = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-9)
+        gate_weights = torch.zeros_like(gate_probs_full).scatter(
+            dim=-1, index=topk_idx, src=topk_norm,
+        )
+
+        h_all = torch.einsum('nd,edh->neh', x_flat, self.w1)
+        if self.b1 is not None:
+            h_all = h_all + self.b1.unsqueeze(0)
+        h_all = self.activation(h_all)
+        h_all = self.dropout(h_all)
+        out_all = torch.einsum('neh,ehd->ned', h_all, self.w2)
+        if self.b2 is not None:
+            out_all = out_all + self.b2.unsqueeze(0)
+        out = (out_all * gate_weights.unsqueeze(-1)).sum(dim=1)
+        out = out.reshape(orig_shape)
+
+        top1 = topk_idx[:, 0]
+        f = torch.zeros(self.num_experts, device=x_flat.device, dtype=gate_probs_full.dtype)
+        f.scatter_add_(0, top1, torch.ones(N, device=x_flat.device, dtype=gate_probs_full.dtype))
+        f = f / max(N, 1)
+        P = gate_probs_full.mean(dim=0)
+        balance_loss = self.num_experts * (f * P).sum()
+
+        aux = {'balance': balance_loss}
+        if band_targets is not None:
+            tgt = band_targets.reshape(-1, self.num_experts)
+            tgt = tgt / (tgt.sum(dim=-1, keepdim=True) + 1e-9)
+            log_pred = torch.log(gate_probs_full + 1e-9)
+            log_tgt = torch.log(tgt + 1e-9)
+            aux['band_prior'] = (tgt * (log_tgt - log_pred)).sum(dim=-1).mean()
+        return out, aux
+
+
 class CSBrain_TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: Union[str, Callable[[torch.Tensor], torch.Tensor]] = F.relu,
                  layer_norm_eps: float = 1e-5, batch_first: bool = False, bias: bool = True,
-                 area_config: dict = {}, sorted_indices: list = [], causal: bool = False):
+                 area_config: dict = {}, sorted_indices: list = [], causal: bool = False,
+                 use_moe: bool = False, num_experts: int = 4, moe_top_k: int = 2,
+                 moe_gate_input_dim: Optional[int] = None):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
@@ -28,9 +132,29 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
 
         self.global_fc = nn.Linear(d_model, d_model, bias=bias)
 
-        self.linear1 = nn.Linear(d_model, dim_feedforward, bias=bias)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model, bias=bias)
+        self.use_moe = use_moe
+        if use_moe:
+            # Resolve activation now so MoE uses the same nonlinearity as the
+            # dense FFN it replaces.
+            if isinstance(activation, str):
+                act_fn = getattr(F, activation, F.relu)
+            else:
+                act_fn = activation
+            self.moe = MoEFeedForward(
+                d_model=d_model, dim_feedforward=dim_feedforward,
+                num_experts=num_experts, top_k=moe_top_k,
+                gate_input_dim=moe_gate_input_dim,
+                dropout=dropout, activation=act_fn, bias=bias,
+            )
+            self.dropout = nn.Dropout(dropout)  # kept for state-dict symmetry; unused in MoE path
+        else:
+            self.linear1 = nn.Linear(d_model, dim_feedforward, bias=bias)
+            self.dropout = nn.Dropout(dropout)
+            self.linear2 = nn.Linear(dim_feedforward, d_model, bias=bias)
+
+        # Populated by the most recent forward when ``use_moe`` is True; read
+        # by the caller (e.g. CSBrainAlign) to assemble auxiliary losses.
+        self.last_aux_loss: dict = {}
 
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
         self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
@@ -65,6 +189,8 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
         inter_window_attn_mask: Optional[torch.Tensor] = None,
         inter_region_attn_mask: Optional[torch.Tensor] = None,
+        gate_features: Optional[torch.Tensor] = None,
+        band_targets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = src
         x = x + self._inter_window_attention(self.norm1(x), src_mask, inter_window_attn_mask)
@@ -74,7 +200,7 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
         else:
             x = x + self._inter_region_attention_static(self.norm2(x), src_mask, inter_region_attn_mask)
 
-        x = x + self._ff_block(self.norm3(x))
+        x = x + self._ff_block(self.norm3(x), gate_features=gate_features, band_targets=band_targets)
         return x
 
     def _inter_region_attention_static(self, x: torch.Tensor,
@@ -177,13 +303,18 @@ class CSBrain_TransformerEncoderLayer(nn.Module):
 
         return self.dropout2(x)
 
-    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
+    def _ff_block(self, x: torch.Tensor,
+                  gate_features: Optional[torch.Tensor] = None,
+                  band_targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, C, T, F = x.shape
-        x_reshaped = x.permute(0, 2, 1, 3).reshape(B * T, C, F)
 
-        x_ff = self.linear2(self.dropout(self.activation(self.linear1(x_reshaped))))
-
-        x_ff = x_ff.reshape(B, T, C, F).permute(0, 2, 1, 3)
+        if self.use_moe:
+            x_ff, aux = self.moe(x, gate_input=gate_features, band_targets=band_targets)
+            self.last_aux_loss = aux
+        else:
+            x_reshaped = x.permute(0, 2, 1, 3).reshape(B * T, C, F)
+            x_ff = self.linear2(self.dropout(self.activation(self.linear1(x_reshaped))))
+            x_ff = x_ff.reshape(B, T, C, F).permute(0, 2, 1, 3)
 
         return self.dropout3(x_ff)
 

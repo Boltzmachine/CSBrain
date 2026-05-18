@@ -46,5 +46,4 @@ python pretrain_main.py \
     --predictor_n_layers 4 \
     --model_dir outputs/ \
     --spectral_mode instantaneous \
-    --seed 44 \
-    --run_name worldmodel-mix-cinebrain-v8-seed44
+    --run_name worldmodel-mix-cinebrain-v8-moe

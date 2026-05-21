@@ -66,6 +66,13 @@ def get_model(params, brain_regions, sorted_indices):
             spectral_mode=getattr(params, 'spectral_mode', 'static'),
             stft_n_fft=getattr(params, 'stft_n_fft', 64),
             stft_hop=getattr(params, 'stft_hop', 1),
+            use_moe=getattr(params, 'use_moe', False),
+            num_experts=getattr(params, 'num_experts', 4),
+            moe_top_k=getattr(params, 'moe_top_k', 2),
+            moe_gate_input_dim=getattr(params, 'moe_gate_input_dim', 32),
+            moe_balance_weight=getattr(params, 'moe_balance_weight', 0.01),
+            moe_band_prior_weight=getattr(params, 'moe_band_prior_weight', 0.1),
+            moe_z_loss_weight=getattr(params, 'moe_z_loss_weight', 1e-3),
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
@@ -100,6 +107,13 @@ def get_model(params, brain_regions, sorted_indices):
             spectral_mode=getattr(params, 'spectral_mode', 'static'),
             stft_n_fft=getattr(params, 'stft_n_fft', 64),
             stft_hop=getattr(params, 'stft_hop', 1),
+            use_moe=getattr(params, 'use_moe', False),
+            num_experts=getattr(params, 'num_experts', 4),
+            moe_top_k=getattr(params, 'moe_top_k', 2),
+            moe_gate_input_dim=getattr(params, 'moe_gate_input_dim', 32),
+            moe_balance_weight=getattr(params, 'moe_balance_weight', 0.01),
+            moe_band_prior_weight=getattr(params, 'moe_band_prior_weight', 0.1),
+            moe_z_loss_weight=getattr(params, 'moe_z_loss_weight', 1e-3),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
         # ``max_horizon == 0`` short-circuits the world-model components:

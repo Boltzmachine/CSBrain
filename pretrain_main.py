@@ -47,6 +47,10 @@ def main():
     parser.add_argument('--nhead', type=int, default=8, help='nhead')
     parser.add_argument('--need_mask', type=bool, default=True, help='need_mask')
     parser.add_argument('--mask_ratio', type=float, default=0.5, help='mask_ratio')
+    parser.add_argument('--freq_mask_prob', type=float, default=0.0,
+                        help='probability of replacing patch-mask reconstruction with masked-frequency-band reconstruction on a given batch (0 = always patch-mask)')
+    parser.add_argument('--freq_recon_n_bands', type=int, default=5,
+                        help='number of equal-width frequency bands to split the rFFT axis into for masked-frequency-band reconstruction')
     parser.add_argument('--dataset_dir', type=str, default='path/to/dataset', help='dataset_dir')
     parser.add_argument('--model_dir', type=str, default='outputs', help='model_dir') # eg. 'CSBrain/pth'
     parser.add_argument('--TemEmbed_kernel_sizes', type=str, default="[(1,), (3,), (5,)]")
@@ -83,6 +87,16 @@ def main():
                         help='static: single FFT magnitude vector per patch (default). instantaneous: STFT-based spectrogram per patch processed by a Conv2d head.')
     parser.add_argument('--stft_n_fft', type=int, default=64, help='STFT n_fft for spectral_mode=instantaneous')
     parser.add_argument('--stft_hop', type=int, default=1, help='STFT hop_length for spectral_mode=instantaneous (hop=1 keeps the time axis equal to patch_size)')
+
+    # --- Frequency-band MoE FFN (replaces dense FFN inside encoder layers) ---
+    parser.add_argument('--use_moe', action='store_true', default=False,
+                        help='replace the dense FFN in each encoder layer with a top-k MoE FFN whose gate is conditioned on the per-patch FFT magnitude; per-expert hidden = dim_feedforward // num_experts keeps the dense weight budget')
+    parser.add_argument('--num_experts', type=int, default=4, help='number of MoE experts (must divide dim_feedforward)')
+    parser.add_argument('--moe_top_k', type=int, default=2, help='top-k experts activated per token')
+    parser.add_argument('--moe_gate_input_dim', type=int, default=32, help='dim of the spectral descriptor fed to the MoE gate')
+    parser.add_argument('--moe_balance_weight', type=float, default=0.01, help='weight of the Switch-style load-balancing loss')
+    parser.add_argument('--moe_band_prior_weight', type=float, default=0.1, help='weight of the KL(band-energy || gate) prior; set to 0 to disable the band-anchor warmup')
+    parser.add_argument('--moe_z_loss_weight', type=float, default=1e-3, help='weight of the router z-loss (Zoph et al. ST-MoE) that keeps gate logits bounded; required to prevent late-training NaN')
 
     # --- SSM/Mamba multi-frequency patch embedding ---
     parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'], help='patch embedder: CNN (default) or multi-frequency Mamba SSM')

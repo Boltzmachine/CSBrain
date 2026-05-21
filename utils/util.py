@@ -13,6 +13,38 @@ def generate_mask(bz, ch_num, patch_num, mask_ratio, device):
     mask = mask.bernoulli_(mask_ratio)
     return mask
 
+
+def apply_freq_band_mask(x, n_bands):
+    """rFFT the per-channel signal, zero one random contiguous band per sample,
+    iFFT back. Returns ``(masked_x, band_mask)``:
+
+    * ``masked_x``: (B, C, N, d) band-removed input.
+    * ``band_mask``: (B, n_freq) float — ``1`` on the rFFT bins that were
+      zeroed, ``0`` elsewhere — for restricting the recon loss to those bins.
+
+    x: (B, C, N, d) — per-patch timeseries; the band split is over the full
+    per-channel length ``N*d``.
+    """
+    B, C, N, d = x.shape
+    T = N * d
+    ts = x.reshape(B, C, T)
+
+    spec = torch.fft.rfft(ts, dim=-1)  # (B, C, n_freq)
+    n_freq = spec.size(-1)
+
+    edges = torch.linspace(0, n_freq, n_bands + 1, device=x.device).long()
+    band_idx = torch.randint(0, n_bands, (B,), device=x.device)
+    start = edges[band_idx]            # (B,)
+    end = edges[band_idx + 1]          # (B,)
+    bin_idx = torch.arange(n_freq, device=x.device).unsqueeze(0)  # (1, n_freq)
+    band_mask = (
+        (bin_idx >= start.unsqueeze(1)) & (bin_idx < end.unsqueeze(1))
+    ).to(spec.real.dtype)  # (B, n_freq)
+
+    masked_spec = spec * (1.0 - band_mask).unsqueeze(1)
+    masked_ts = torch.fft.irfft(masked_spec, n=T, dim=-1)
+    return masked_ts.reshape(B, C, N, d), band_mask
+
 def to_tensor(array):
     return torch.from_numpy(array).float()
 

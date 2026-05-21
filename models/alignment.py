@@ -484,6 +484,7 @@ class CSBrainAlign(nn.Module):
                  use_moe=False, num_experts=4, moe_top_k=2,
                  moe_gate_input_dim=32,
                  moe_balance_weight=0.01, moe_band_prior_weight=0.1,
+                 moe_z_loss_weight=1e-3,
                  in_dim_for_gate=None):
         super().__init__()
         self.d_model = d_model
@@ -505,6 +506,7 @@ class CSBrainAlign(nn.Module):
         self.moe_gate_input_dim = moe_gate_input_dim
         self.moe_balance_weight = moe_balance_weight
         self.moe_band_prior_weight = moe_band_prior_weight
+        self.moe_z_loss_weight = moe_z_loss_weight
         if use_moe and patch_embed_type != 'cnn':
             raise ValueError(
                 "use_moe=True currently requires patch_embed_type='cnn' so the "
@@ -589,10 +591,17 @@ class CSBrainAlign(nn.Module):
                 lo, hi = int(edges[k]), max(int(edges[k + 1]), int(edges[k]) + 1)
                 band_assign[k, lo:hi] = 1.0
             self.register_buffer('moe_band_assign', band_assign, persistent=False)
-            # Learned defaults applied at global-token positions (where there
-            # is no underlying patch to FFT).
+            # Learned default for the gate input at global-token positions
+            # (there is no underlying patch FFT there). The band-prior target
+            # at those positions is pinned to uniform: leaving it learnable
+            # lets it drift off the simplex and break the KL once it goes
+            # negative, which manifests as NaN loss after several epochs.
             self.moe_global_gate_input = nn.Parameter(torch.zeros(moe_gate_input_dim))
-            self.moe_global_band_target = nn.Parameter(torch.ones(num_experts) / num_experts)
+            self.register_buffer(
+                'moe_global_band_target',
+                torch.full((num_experts,), 1.0 / num_experts),
+                persistent=False,
+            )
 
         # Source path: temporal-only attention over concatenated sources.
         if self.project_to_source:
@@ -1037,6 +1046,7 @@ class CSBrainAlign(nn.Module):
 
             moe_balance_running = patch_emb.new_zeros(())
             moe_band_prior_running = patch_emb.new_zeros(())
+            moe_z_loss_running = patch_emb.new_zeros(())
             for layer_idx in range(self.encoder.num_layers):
                 patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
                 # patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
@@ -1050,6 +1060,7 @@ class CSBrainAlign(nn.Module):
                 if self.use_moe:
                     aux = self.encoder.layers[layer_idx].last_aux_loss
                     moe_balance_running = moe_balance_running + aux['balance']
+                    moe_z_loss_running = moe_z_loss_running + aux['z_loss']
                     if 'band_prior' in aux:
                         moe_band_prior_running = moe_band_prior_running + aux['band_prior']
 
@@ -1172,6 +1183,10 @@ class CSBrainAlign(nn.Module):
             moe_losses["moe_balance_loss"] = (
                 self.moe_balance_weight, moe_balance_running / n_layers,
             )
+            if self.moe_z_loss_weight > 0:
+                moe_losses["moe_z_loss"] = (
+                    self.moe_z_loss_weight, moe_z_loss_running / n_layers,
+                )
             if self.moe_band_prior_weight > 0:
                 moe_losses["moe_band_prior_loss"] = (
                     self.moe_band_prior_weight, moe_band_prior_running / n_layers,

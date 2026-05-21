@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn import MSELoss
 from tqdm import tqdm
-from utils.util import generate_mask, save_pretrain_checkpoint, build_muon_optimizer
+from utils.util import generate_mask, save_pretrain_checkpoint, build_muon_optimizer, apply_freq_band_mask
 import os
 import wandb
 import time
@@ -154,9 +154,28 @@ class Trainer(object):
                             logs["causal_loss"] = causal_loss.data.cpu().numpy()
                     elif self.params.need_mask:
                         bz, ch_num, patch_num, patch_size = x.shape
-                        mask = generate_mask(
-                            bz, ch_num, patch_num, mask_ratio=self.params.mask_ratio, device=self.device,
+                        freq_mask_prob = getattr(self.params, 'freq_mask_prob', 0.0)
+                        use_freq_mask = (
+                            freq_mask_prob > 0
+                            and torch.rand(1).item() < freq_mask_prob
                         )
+
+                        if use_freq_mask:
+                            # Masked-frequency-band reconstruction: rFFT, zero one
+                            # contiguous band per sample, iFFT back; model
+                            # reconstructs the full timeseries and the loss is
+                            # computed in the frequency domain on the masked bins.
+                            masked_x, band_mask = apply_freq_band_mask(
+                                x, n_bands=self.params.freq_recon_n_bands,
+                            )
+                            batch['timeseries'] = masked_x
+                            mask = None
+                        else:
+                            mask = generate_mask(
+                                bz, ch_num, patch_num,
+                                mask_ratio=self.params.mask_ratio,
+                                device=self.device,
+                            )
                         out = self.model.training_step(batch, mask=mask)
 
                         loss_dict = {}
@@ -177,6 +196,16 @@ class Trainer(object):
                         if info.get('dino_mode', False):
                             # DINO + iBOT replace the masked reconstruction loss
                             loss = sum(loss_dict.values())
+                        elif use_freq_mask:
+                            B_, C_, N_, d_ = x.shape
+                            T_ = N_ * d_
+                            spec_y = torch.fft.rfft(y.reshape(B_, C_, T_), dim=-1)
+                            spec_x = torch.fft.rfft(x.reshape(B_, C_, T_), dim=-1)
+                            mag_diff_sq = (spec_y.abs() - spec_x.abs()).pow(2)
+                            bm = band_mask.unsqueeze(1).expand_as(mag_diff_sq)
+                            freq_loss = (mag_diff_sq * bm).sum() / bm.sum().clamp(min=1)
+                            loss = freq_loss + sum(loss_dict.values())
+                            logs["freq_mask_loss"] = freq_loss.data.cpu().numpy()
                         else:
                             masked_x = x[mask == 1]
                             masked_y = y[mask == 1]

@@ -75,10 +75,12 @@ class MoEFeedForward(nn.Module):
         else:
             gate_in = gate_input.reshape(-1, self.gate_input_dim)
         gate_logits = self.gate(gate_in)
-        gate_probs_full = torch.softmax(gate_logits, dim=-1)
+        # log_softmax for numerically stable KL and z-loss.
+        log_probs = F.log_softmax(gate_logits, dim=-1)
+        gate_probs_full = log_probs.exp()
 
         topk_vals, topk_idx = gate_probs_full.topk(self.top_k, dim=-1)
-        topk_norm = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-9)
+        topk_norm = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         gate_weights = torch.zeros_like(gate_probs_full).scatter(
             dim=-1, index=topk_idx, src=topk_norm,
         )
@@ -101,13 +103,30 @@ class MoEFeedForward(nn.Module):
         P = gate_probs_full.mean(dim=0)
         balance_loss = self.num_experts * (f * P).sum()
 
-        aux = {'balance': balance_loss}
+        # Router z-loss (Zoph et al. ST-MoE). Penalises unbounded growth of
+        # gate logits — the standard fix for MoE training going NaN late.
+        # log Z = logsumexp(logits) per token; loss = mean((log Z)^2).
+        log_Z = torch.logsumexp(gate_logits, dim=-1)
+        z_loss = log_Z.pow(2).mean()
+
+        aux = {'balance': balance_loss, 'z_loss': z_loss}
         if band_targets is not None:
             tgt = band_targets.reshape(-1, self.num_experts)
-            tgt = tgt / (tgt.sum(dim=-1, keepdim=True) + 1e-9)
-            log_pred = torch.log(gate_probs_full + 1e-9)
-            log_tgt = torch.log(tgt + 1e-9)
-            aux['band_prior'] = (tgt * (log_tgt - log_pred)).sum(dim=-1).mean()
+            tgt_sum = tgt.sum(dim=-1, keepdim=True)
+            # Masked patches (zero signal) have zero spectral energy in every
+            # band → tgt_sum == 0. Fall back to uniform there so the prior
+            # stays a valid distribution and the gate isn't pushed anywhere.
+            uniform = torch.full_like(tgt, 1.0 / self.num_experts)
+            tgt = torch.where(
+                tgt_sum > 1e-6,
+                tgt / tgt_sum.clamp_min(1e-6),
+                uniform,
+            )
+            # F.kl_div(input=log_probs, target=probs, log_target=False) uses
+            # xlogy semantics, so tgt = 0 components contribute 0 cleanly.
+            aux['band_prior'] = F.kl_div(
+                log_probs, tgt, reduction='batchmean', log_target=False,
+            )
         return out, aux
 
 

@@ -11,11 +11,45 @@ import torch
 import webdataset as wds
 import json
 from glob import glob
-from transformers import AutoImageProcessor
+# Vision processor for the live ``images`` branch below. Loaded lazily and
+# cached per model id so the same cached_dataset module can serve different
+# encoders across runs without reload churn.
+_VISION_PROCESSOR_CACHE: dict = {}
+# Set by the caller (e.g. pretrain_main) so collate_cached knows which
+# processor to use. Defaults match the model-side default.
+_ACTIVE_VISION_ENCODER = None
 
 
-# model_name = "facebook/dinov2-base"
-# image_processor = AutoImageProcessor.from_pretrained(model_name)
+def set_active_vision_encoder(model_id: str) -> None:
+    """Pin the HF model id used by the live ``images`` collate path."""
+    global _ACTIVE_VISION_ENCODER
+    _ACTIVE_VISION_ENCODER = model_id
+
+
+def _encoder_kind(model_id: str) -> str:
+    return 'vjepa2' if 'vjepa' in model_id.lower() else 'image'
+
+
+def pixel_values_filename(model_id: str) -> str:
+    """Basename for the cached pixel_values H5 paired with ``model_id``.
+
+    DINOv2 (and any other AutoImageProcessor target) shares the original
+    ``pixel_values.h5``; V-JEPA 2 lives next to it as ``pixel_values_vjepa2.h5``
+    so both caches can coexist and the right one is picked at read time.
+    Mirror this in generator scripts to keep producer/consumer in sync.
+    """
+    return 'pixel_values_vjepa2.h5' if _encoder_kind(model_id) == 'vjepa2' else 'pixel_values.h5'
+
+
+def _get_vision_processor(model_id: str):
+    if model_id not in _VISION_PROCESSOR_CACHE:
+        if _encoder_kind(model_id) == 'vjepa2':
+            from transformers import AutoVideoProcessor
+            _VISION_PROCESSOR_CACHE[model_id] = AutoVideoProcessor.from_pretrained(model_id)
+        else:
+            from transformers import AutoImageProcessor
+            _VISION_PROCESSOR_CACHE[model_id] = AutoImageProcessor.from_pretrained(model_id)
+    return _VISION_PROCESSOR_CACHE[model_id]
 
 # @profile
 def collate_cached(batch):
@@ -38,16 +72,37 @@ def collate_cached(batch):
 
     image_pixel_values = None
     if 'images' in batch[0]:
-        all_images = []
-        for x in batch:
-            all_images.extend(x['images'])
-        image_encoder_inputs = image_processor(images=all_images, return_tensors="pt")
-        for key in image_encoder_inputs:
-            if key == 'pixel_values':
-                image_pixel_values = image_encoder_inputs[key].view(len(batch), -1, *image_encoder_inputs[key].shape[1:])
-            else:
-                raise ValueError(f"Unexpected key '{key}' in image_encoder_inputs")
+        proc = _get_vision_processor(_ACTIVE_VISION_ENCODER)
+        if _encoder_kind(_ACTIVE_VISION_ENCODER) == 'vjepa2':
+            # Each x['images'] is a list of raw frames (np.uint8 H,W,C). Wrap
+            # each as a single-frame video so VJEPA2VideoProcessor returns
+            # pixel_values_videos of shape (sum_T, 1, 3, H, W).
+            videos = []
+            for x in batch:
+                for img in x['images']:
+                    videos.append([img])
+            processed = proc(videos=videos, return_tensors='pt')
+            pvv = processed['pixel_values_videos']  # (N_total, 1, 3, H, W)
+            image_pixel_values = pvv.squeeze(1).view(
+                len(batch), -1, *pvv.shape[2:])
+        else:
+            all_images = []
+            for x in batch:
+                all_images.extend(x['images'])
+            processed = proc(images=all_images, return_tensors='pt')
+            image_pixel_values = processed['pixel_values'].view(
+                len(batch), -1, *processed['pixel_values'].shape[1:])
 
+    # Size the zero fallback from a real cached entry when present so we
+    # match whatever encoder/resolution the cache was built for (V-JEPA 2 =
+    # 256, DINOv2 = 224, etc.). Falls back to the active encoder's default
+    # resolution only when every item is missing.
+    _real = next((item['pixel_values'] for item in batch if 'pixel_values' in item), None)
+    if _real is not None:
+        _fallback_shape = tuple(_real.shape)
+    else:
+        _fallback_hw = 256 if _encoder_kind(_ACTIVE_VISION_ENCODER) == 'vjepa2' else 224
+        _fallback_shape = (3, _fallback_hw, _fallback_hw)
     all_pixel_values = []
     has_image = []
     for item in batch:
@@ -55,7 +110,7 @@ def collate_cached(batch):
             all_pixel_values.append(item['pixel_values'])
             has_image.append(True)
         else:
-            all_pixel_values.append(torch.zeros((3, 224, 224), dtype=torch.float32))
+            all_pixel_values.append(torch.zeros(_fallback_shape, dtype=torch.float32))
             has_image.append(False)
     image_pixel_values = torch.stack(all_pixel_values, dim=0)
     has_image = torch.tensor(has_image, dtype=torch.bool)
@@ -157,8 +212,13 @@ class _process_webdataset_sample:
 
     def __call__(self, sample):
         if self.image_file is None:
-            self.image_file = h5py.File("data/Alljoined-1.6M/pixel_values.h5", 'r')
-            self.things_image_file = h5py.File("data/THINGS-EEG2/pixel_values.h5", 'r')
+            assert _ACTIVE_VISION_ENCODER is not None, (
+                "call set_active_vision_encoder(params.vision_encoder) before "
+                "consuming the dataset so the right pixel_values_*.h5 is loaded"
+            )
+            _pv_name = pixel_values_filename(_ACTIVE_VISION_ENCODER)
+            self.image_file = h5py.File(f"data/Alljoined-1.6M/{_pv_name}", 'r')
+            self.things_image_file = h5py.File(f"data/THINGS-EEG2/{_pv_name}", 'r')
             text_embed_path = "data/Alljoined-1.6M/text_embeddings.h5"
             if os.path.exists(text_embed_path):
                 self.text_embed_file = h5py.File(text_embed_path, 'r')

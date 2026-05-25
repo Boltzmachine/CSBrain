@@ -46,5 +46,7 @@ python pretrain_main.py \
     --predictor_n_layers 4 \
     --model_dir outputs/ \
     --spectral_mode instantaneous \
-    --use_moe \
-    --run_name worldmodel-mix-cinebrain-v9
+    --freq_mask_prob 1.0 \
+    --band_mask_ratio 0.5 \
+    --freq_recon_n_bands 10 \
+    --run_name worldmodel-mix-cinebrain-debug

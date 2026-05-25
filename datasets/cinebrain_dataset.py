@@ -93,26 +93,39 @@ _BIOSEMI64_NAMES, _BIOSEMI64_COORDS = _biosemi64_coords_spherical()
 # ---------------------------------------------------------------------------
 
 _DECORD_BRIDGE_SET = False
-_DINOV2_PROCESSOR = None
+_VISION_PROCESSOR_CACHE: dict = {}
 
 
-def _get_dinov2_processor():
-    # Cached so repeated frame loads don't reparse the processor config.
-    global _DINOV2_PROCESSOR
-    if _DINOV2_PROCESSOR is None:
-        from transformers import AutoImageProcessor
-        _DINOV2_PROCESSOR = AutoImageProcessor.from_pretrained(
-            'facebook/dinov2-base')
-    return _DINOV2_PROCESSOR
+def _encoder_kind(vision_encoder: str) -> str:
+    """Cheap heuristic: model id contains 'vjepa' => video encoder, else image."""
+    return 'vjepa2' if 'vjepa' in vision_encoder.lower() else 'image'
 
 
-def _load_frame(clip_path: str, t_seconds: float) -> torch.Tensor:
-    """Return a DINOv2-ready pixel_values tensor (3, H, W).
+def _frame_size_for(vision_encoder: str) -> int:
+    """Default crop size matched to the processor (V-JEPA 2 = 256, DINOv2 = 224)."""
+    return 256 if _encoder_kind(vision_encoder) == 'vjepa2' else 224
 
-    We defer resize + ImageNet normalisation to
-    ``AutoImageProcessor.from_pretrained('facebook/dinov2-base')`` so the
-    tensor matches exactly what the encoder expects, including any future
-    config changes (rescale factor, interpolation, crop size).
+
+def _get_vision_processor(vision_encoder: str):
+    """Return (and cache) the right HF processor for ``vision_encoder``."""
+    if vision_encoder not in _VISION_PROCESSOR_CACHE:
+        if _encoder_kind(vision_encoder) == 'vjepa2':
+            from transformers import AutoVideoProcessor
+            proc = AutoVideoProcessor.from_pretrained(vision_encoder)
+        else:
+            from transformers import AutoImageProcessor
+            proc = AutoImageProcessor.from_pretrained(vision_encoder)
+        _VISION_PROCESSOR_CACHE[vision_encoder] = proc
+    return _VISION_PROCESSOR_CACHE[vision_encoder]
+
+
+def _load_frame(clip_path: str, t_seconds: float,
+                vision_encoder: str = 'facebook/dinov2-base') -> torch.Tensor:
+    """Return a vision-encoder-ready pixel_values tensor (3, H, W).
+
+    Dispatches on ``vision_encoder``: V-JEPA 2 ids go through
+    ``AutoVideoProcessor`` (256x256, V-JEPA 2 mean/std); other ids go through
+    ``AutoImageProcessor`` (e.g. 224x224 ImageNet for DINOv2-base).
     """
     global _DECORD_BRIDGE_SET
     import decord
@@ -127,8 +140,13 @@ def _load_frame(clip_path: str, t_seconds: float) -> torch.Tensor:
     idx = int(round(t_seconds * fps))
     idx = max(0, min(len(vr) - 1, idx))
     frame = vr[idx].asnumpy()  # (H, W, C), uint8
-    processed = _get_dinov2_processor()(images=frame, return_tensors='pt')
-    return processed['pixel_values'][0]  # (3, H, W)
+    proc = _get_vision_processor(vision_encoder)
+    if _encoder_kind(vision_encoder) == 'vjepa2':
+        # Wrap as a single-frame video: list of videos, each a list of frames.
+        processed = proc(videos=[[frame]], return_tensors='pt')
+        return processed['pixel_values_videos'][0, 0]
+    processed = proc(images=frame, return_tensors='pt')
+    return processed['pixel_values'][0]
 
 
 # ---------------------------------------------------------------------------
@@ -161,11 +179,12 @@ class CineBrainDataset(Dataset):
         eeg_subdir: str = 'eeg_02',
         clips_subdir: str = 'clips',
         n_eeg_channels: int = 64,
-        frame_size: int = 224,
+        frame_size: Optional[int] = None,
         erp_latency_s: float = 0.0,
         clip_id_fn: Optional[Callable[[str, int], int]] = None,
         load_frames: bool = True,
         cache_dir: Optional[str] = None,
+        vision_encoder: str = 'facebook/dinov2-base',
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -179,7 +198,9 @@ class CineBrainDataset(Dataset):
         self.eeg_subdir = eeg_subdir
         self.clips_subdir = clips_subdir
         self.n_eeg_channels = n_eeg_channels
-        self.frame_size = frame_size
+        self.vision_encoder = vision_encoder
+        # Default crop size depends on the encoder (V-JEPA 2 = 256, DINOv2 = 224).
+        self.frame_size = frame_size if frame_size is not None else _frame_size_for(vision_encoder)
         self.erp_latency_s = erp_latency_s
         self.clip_id_fn = clip_id_fn
         self.load_frames = load_frames
@@ -309,7 +330,7 @@ class CineBrainDataset(Dataset):
                     i * self.stride_samples + self.window_samples / 2
                 ) / self.fs_out + self.erp_latency_s
                 try:
-                    pixel_values[i] = _load_frame(clip_path, window_center_s)
+                    pixel_values[i] = _load_frame(clip_path, window_center_s, self.vision_encoder)
                     has_image[i] = True
                 except (OSError, RuntimeError) as _e:
                     # Tolerate decode/IO errors — alignment loss skips

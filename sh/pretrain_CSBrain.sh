@@ -63,22 +63,46 @@
 # ============================================================
 # Adversarial session-agnostic pretraining
 # ============================================================
+# python pretrain_main.py \
+#     --model Align \
+#     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
+#     --model_dir outputs/ \
+#     --dataset_dir mix \
+#     --n_layer 24 \
+#     --in_dim 40 \
+#     --out_dim 40 \
+#     --d_model 40 \
+#     --seq_len 5 \
+#     --n_layer 12 \
+#     --nhead 8 \
+#     --samples_per_session 8 \
+#     --sessions_per_batch 16 \
+#     --spectral_mode instantaneous \
+#     --run_name full_freq_mask
+
+# ============================================================
+# Band-contrastive pretraining (replaces masked reconstruction)
+# Bands by period: HIGH 10-100ms (10-100 Hz), MID 100ms-1s (1-10 Hz),
+# LOW >1s (<1 Hz). Each band gets its own PatchEmbedding; transformer
+# and downstream layers are shared. InfoNCE pulls (band_i, band_j)
+# patches at the same (channel, time-patch) position of the same sample
+# together; other samples at that position are negatives.
+# ============================================================
 python pretrain_main.py \
     --model Align \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --model_dir outputs/ \
     --dataset_dir mix \
-    --n_layer 24 \
     --in_dim 40 \
     --out_dim 40 \
     --d_model 40 \
-    --seq_len 5 \
+    --seq_len 10 \
     --n_layer 12 \
     --nhead 8 \
     --samples_per_session 8 \
     --sessions_per_batch 16 \
     --spectral_mode instantaneous \
-    --run_name no_freq_mask
+    --run_name Align-time
 
 
 # ============================================================

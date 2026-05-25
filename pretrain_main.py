@@ -51,13 +51,17 @@ def main():
                         help='probability of replacing patch-mask reconstruction with masked-frequency-band reconstruction on a given batch (0 = always patch-mask)')
     parser.add_argument('--freq_recon_n_bands', type=int, default=5,
                         help='number of equal-width frequency bands to split the rFFT axis into for masked-frequency-band reconstruction')
+    parser.add_argument('--band_mask_ratio', type=float, default=None,
+                        help='fraction of bands to mask per sample for masked-frequency-band reconstruction; k=max(1, round(freq_recon_n_bands * band_mask_ratio)). None (default) keeps the legacy behavior of masking exactly 1 band per sample.')
     parser.add_argument('--dataset_dir', type=str, default='path/to/dataset', help='dataset_dir')
     parser.add_argument('--model_dir', type=str, default='outputs', help='model_dir') # eg. 'CSBrain/pth'
     parser.add_argument('--TemEmbed_kernel_sizes', type=str, default="[(1,), (3,), (5,)]")
     parser.add_argument('--use_SmallerToken', type=bool, default=False, help='SmallerToken->dataset.py')
     parser.add_argument('--model', type=str, default='CSBrain', help='CSBrain')
     parser.add_argument('--vision_encoder', type=str, default='facebook/dinov2-base',
-                        help='HF model id of the frozen vision encoder used by the Spectral model for alignment (e.g. facebook/dinov2-base, facebook/dino-vitb8). Must match the preprocessing used to cache image_encoder_inputs.')
+                        help='HF model id of the frozen vision encoder used for image alignment (e.g. facebook/dinov2-base or facebook/vjepa2-vitl-fpc64-256). Must match the preprocessing used to cache image_encoder_inputs; V-JEPA 2 expects pixel_values_videos at 256x256.')
+    parser.add_argument('--image_pool_heads', type=int, default=4,
+                        help='Heads for the learned-query attention pool over V-JEPA 2 patch tokens (Align model).')
     parser.add_argument('--use_saliency', action='store_true', default=False,
                         help='Enable the saliency-alignment branch on the Spectral model (KL between band-mixed saliency prediction and DINO attention rollout).')
     parser.add_argument('--saliency_rollout_skip_layers', type=int, default=2,
@@ -152,6 +156,18 @@ def main():
     parser.add_argument('--mix_alljoined_weight', type=float, default=1.0, help='sampling weight for Alljoined-1.6M in the mix+cinebrain dataset')
     parser.add_argument('--mix_cinebrain_weight', type=float, default=1.0, help='sampling weight for CineBrain in the mix+cinebrain dataset')
 
+    # --- Band-contrastive pretraining ---
+    parser.add_argument('--contrastive_band', action='store_true', default=False,
+                        help='enable band-contrastive pretraining (replaces masked reconstruction)')
+    parser.add_argument('--fs', type=int, default=200, help='sampling rate (Hz) for band-contrastive bandpass split')
+    parser.add_argument('--band_cutoffs', type=str, default='1,10',
+                        help='comma-separated Hz cut frequencies; K-1 values define K bands. '
+                             'Default "1,10" -> [<1 Hz, 1-10 Hz, >=10 Hz].')
+    parser.add_argument('--contrastive_temp', type=float, default=0.1,
+                        help='InfoNCE temperature for band-contrastive loss')
+    parser.add_argument('--contrastive_proj_dim', type=int, default=64,
+                        help='projection head output dim for band-contrastive loss')
+
     params = parser.parse_args()
     print(params)
     setup_seed(params.seed)
@@ -161,7 +177,11 @@ def main():
         params.batch_size = 4
 
     if params.dataset_dir == 'mix':
-        from datasets.cached_dataset import get_webdataset, collate_cached, SessionGroupedLoader
+        from datasets.cached_dataset import (
+            get_webdataset, collate_cached, SessionGroupedLoader,
+            set_active_vision_encoder,
+        )
+        set_active_vision_encoder(params.vision_encoder)
         from torch.utils.data import ConcatDataset
         dataset_names = [
             'tueg/*.tar',
@@ -178,7 +198,7 @@ def main():
             # 'ds006480/*.tar', 
             # 'ds006525/*.tar', 
             # 'ds006547/*.tar',
-            "Alljoined-1.6M/*.tar",
+            # "Alljoined-1.6M/*.tar",
             # "things_eeg2/*.tar",
         ]
         n_samples_per_epoch = 1109545
@@ -243,10 +263,15 @@ def main():
     elif params.dataset_dir == 'mix+cinebrain':
         from datasets.cached_dataset import (
             get_webdataset, collate_cached, collate_cached_with_future,
+            set_active_vision_encoder,
         )
         from datasets.cinebrain_dataset import (
             CineBrainDataset, CineBrainIterableWrapper, WeightedSampleMix,
         )
+        # Pin the live ``images`` collate path to the same encoder the
+        # model uses; cached pixel_values for the no-``images`` path must
+        # already match this encoder.
+        set_active_vision_encoder(params.vision_encoder)
 
         # Crop the Alljoined event window to seq_len * in_dim so each
         # Alljoined sample lines up shape-for-shape with a CineBrain
@@ -277,6 +302,7 @@ def main():
             stride_s=params.cinebrain_stride_s,
             erp_latency_s=params.cinebrain_erp_latency_s,
             load_frames=bool(params.cinebrain_load_frames),
+            vision_encoder=params.vision_encoder,
         )
         print('CineBrain clips:', len(cinebrain_inner))
         cinebrain_iter = CineBrainIterableWrapper(cinebrain_inner)
@@ -319,6 +345,7 @@ def main():
             stride_s=params.cinebrain_stride_s,
             erp_latency_s=params.cinebrain_erp_latency_s,
             load_frames=bool(params.cinebrain_load_frames),
+            vision_encoder=params.vision_encoder,
         )
         print('CineBrain clips:', len(pretrained_dataset))
         num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0

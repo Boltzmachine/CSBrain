@@ -14,13 +14,16 @@ def generate_mask(bz, ch_num, patch_num, mask_ratio, device):
     return mask
 
 
-def apply_freq_band_mask(x, n_bands):
-    """rFFT the per-channel signal, zero one random contiguous band per sample,
-    iFFT back. Returns ``(masked_x, band_mask)``:
+def apply_freq_band_mask(x, n_bands, mask_ratio=None):
+    """rFFT the per-channel signal, zero ``k`` randomly chosen bands per
+    sample, iFFT back. Returns ``(masked_x, band_mask)``:
 
     * ``masked_x``: (B, C, N, d) band-removed input.
     * ``band_mask``: (B, n_freq) float — ``1`` on the rFFT bins that were
       zeroed, ``0`` elsewhere — for restricting the recon loss to those bins.
+
+    ``k = max(1, round(n_bands * mask_ratio))`` when ``mask_ratio`` is given;
+    when ``mask_ratio is None`` (default), ``k=1`` (a single random band).
 
     x: (B, C, N, d) — per-patch timeseries; the band split is over the full
     per-channel length ``N*d``.
@@ -33,17 +36,121 @@ def apply_freq_band_mask(x, n_bands):
     n_freq = spec.size(-1)
 
     edges = torch.linspace(0, n_freq, n_bands + 1, device=x.device).long()
-    band_idx = torch.randint(0, n_bands, (B,), device=x.device)
-    start = edges[band_idx]            # (B,)
-    end = edges[band_idx + 1]          # (B,)
+
+    if mask_ratio is None:
+        k = 1
+    else:
+        k = max(1, min(n_bands, int(round(n_bands * float(mask_ratio)))))
+
+    # Sample k distinct band indices per row uniformly without replacement.
+    picks = torch.rand(B, n_bands, device=x.device).topk(
+        k, dim=-1, largest=False).indices  # (B, k)
+    band_select = torch.zeros(
+        B, n_bands, device=x.device, dtype=spec.real.dtype)
+    band_select.scatter_(1, picks, 1.0)
+
     bin_idx = torch.arange(n_freq, device=x.device).unsqueeze(0)  # (1, n_freq)
-    band_mask = (
-        (bin_idx >= start.unsqueeze(1)) & (bin_idx < end.unsqueeze(1))
-    ).to(spec.real.dtype)  # (B, n_freq)
+    edge_lo = edges[:-1].unsqueeze(1)  # (n_bands, 1)
+    edge_hi = edges[1:].unsqueeze(1)   # (n_bands, 1)
+    band_of_bin = (
+        (bin_idx >= edge_lo) & (bin_idx < edge_hi)
+    ).to(spec.real.dtype)  # (n_bands, n_freq)
+    band_mask = band_select @ band_of_bin  # (B, n_freq)
 
     masked_spec = spec * (1.0 - band_mask).unsqueeze(1)
     masked_ts = torch.fft.irfft(masked_spec, n=T, dim=-1)
     return masked_ts.reshape(B, C, N, d), band_mask
+
+
+def bandpass_decompose(x, fs, cutoffs):
+    """Split ``x`` into ``len(cutoffs) + 1`` frequency-band time-domain views.
+
+    The split is done over the full per-channel signal ``N*d`` so band
+    boundaries are crisp regardless of patch boundaries: rFFT, zero bins
+    outside each band, irFFT.
+
+    Args:
+        x: (B, C, N, d) per-patch timeseries.
+        fs: sampling rate in Hz.
+        cutoffs: monotonically increasing iterable of K-1 cut frequencies in
+            Hz, e.g. ``(1.0, 10.0)`` → 3 bands ``[0, 1) Hz``, ``[1, 10) Hz``,
+            ``[10, +inf) Hz``.
+
+    Returns:
+        List of K tensors, each of shape (B, C, N, d).
+    """
+    B, C, N, d = x.shape
+    T = N * d
+    ts = x.reshape(B, C, T)
+    spec = torch.fft.rfft(ts, dim=-1)  # (B, C, T//2+1)
+    freqs = torch.fft.rfftfreq(T, d=1.0 / float(fs)).to(x.device)  # (T//2+1,)
+
+    edges = [0.0] + [float(c) for c in cutoffs] + [float('inf')]
+    views = []
+    for k in range(len(edges) - 1):
+        lo, hi = edges[k], edges[k + 1]
+        bin_mask = ((freqs >= lo) & (freqs < hi)).to(spec.real.dtype)  # (n_freq,)
+        spec_k = spec * bin_mask.view(1, 1, -1)
+        ts_k = torch.fft.irfft(spec_k, n=T, dim=-1)
+        views.append(ts_k.reshape(B, C, N, d))
+    return views
+
+
+def symmetric_band_infonce(z_per_band, temp, valid_channel_mask=None):
+    """Per-position symmetric InfoNCE across K band views.
+
+    For each (channel, patch) position, every sample's K band embeddings
+    must agree (positives), while embeddings of other samples at the same
+    position are negatives.
+
+    Args:
+        z_per_band: list of K tensors of shape (B, C, N, d_proj).
+        temp: InfoNCE temperature.
+        valid_channel_mask: optional (B, C) bool — False for padded
+            channels. Padded (sample, channel) positions are excluded as
+            both anchors and negatives.
+
+    Returns:
+        Scalar loss (mean over K*(K-1) ordered band pairs and over valid
+        anchor positions).
+    """
+    K = len(z_per_band)
+    if K < 2:
+        return z_per_band[0].new_zeros(())
+    B, C, N, d = z_per_band[0].shape
+    P = C * N
+
+    z = torch.stack(z_per_band, dim=0)               # (K, B, C, N, d)
+    z = torch.nn.functional.normalize(z, dim=-1)
+    z = z.permute(0, 2, 3, 1, 4).contiguous()        # (K, C, N, B, d)
+    z = z.view(K, P, B, d)
+
+    if valid_channel_mask is not None:
+        ch_valid = valid_channel_mask.t().contiguous()       # (C, B)
+        pos_valid = ch_valid.unsqueeze(1).expand(C, N, B)    # (C, N, B)
+        pos_valid = pos_valid.reshape(P, B)                  # (P, B)
+    else:
+        pos_valid = torch.ones(P, B, dtype=torch.bool, device=z.device)
+
+    NEG_INF = torch.finfo(z.dtype).min / 2
+    targets = torch.arange(B, device=z.device).unsqueeze(0).expand(P, B)  # (P, B)
+
+    loss = z.new_zeros(())
+    pair_count = 0
+    for k1 in range(K):
+        for k2 in range(K):
+            if k1 == k2:
+                continue
+            sim = torch.bmm(z[k1], z[k2].transpose(1, 2)) / temp     # (P, B, B)
+            sim = sim.masked_fill(~pos_valid.unsqueeze(1), NEG_INF)  # mask cols
+            log_probs = torch.nn.functional.log_softmax(sim, dim=-1)
+            ce = -log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)  # (P, B)
+            ce = ce * pos_valid.float()
+            denom = pos_valid.float().sum().clamp(min=1)
+            loss = loss + ce.sum() / denom
+            pair_count += 1
+    return loss / max(pair_count, 1)
+
 
 def to_tensor(array):
     return torch.from_numpy(array).float()
@@ -61,6 +168,10 @@ ARCH_PARAM_FIELDS = (
     'mamba_d_state', 'mamba_d_conv', 'mamba_expand',
     'use_llm_vq', 'num_language_tokens', 'max_llm_codebook_size',
     'spectral_mode', 'stft_n_fft', 'stft_hop',
+    # Vision encoder determines image_feature_dim (768 for DINOv2-base,
+    # 1024 for V-JEPA 2 ViT-L), which is baked into contrastive_proj and
+    # llm_contrastive_proj weight shapes; mismatch -> checkpoint load fails.
+    'vision_encoder', 'image_pool_heads',
 )
 
 

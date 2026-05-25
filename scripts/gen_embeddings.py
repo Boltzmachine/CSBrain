@@ -5,9 +5,34 @@ from typing import Iterable, List
 import torch
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
-from transformers import AutoImageProcessor, Dinov2Model
+from transformers import AutoImageProcessor, AutoVideoProcessor, Dinov2Model
 import h5py
 import numpy as np
+
+import sys
+from pathlib import Path as _PathHelper
+_REPO_ROOT = _PathHelper(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+	sys.path.insert(0, str(_REPO_ROOT))
+from datasets.cached_dataset import pixel_values_filename, _encoder_kind
+
+
+def _load_vision_processor(model_name: str):
+	if _encoder_kind(model_name) == 'vjepa2':
+		return AutoVideoProcessor.from_pretrained(model_name)
+	return AutoImageProcessor.from_pretrained(model_name)
+
+
+def _processed_pixel_values(processor, model_name: str, image) -> np.ndarray:
+	"""Return (3, H, W) numpy array for one PIL image, encoder-appropriate."""
+	if _encoder_kind(model_name) == 'vjepa2':
+		# VJEPA2VideoProcessor expects a list of videos; single-frame video.
+		frame = np.array(image)
+		out = processor(videos=[[frame]], return_tensors='pt')
+		# pixel_values_videos: (1, T=1, 3, H, W)
+		return out['pixel_values_videos'][0, 0].cpu().numpy()
+	out = processor(images=image, return_tensors='pt')
+	return out['pixel_values'][0].cpu().numpy()
 
 
 IMAGE_EXTENSIONS = {
@@ -196,21 +221,21 @@ def main2():
 		print(f"No images found under: {args.input_dir}")
 		return
 
-	processor = AutoImageProcessor.from_pretrained(args.model_name)
-	output_h5 = args.output_dir / "pixel_values.h5"
+	processor = _load_vision_processor(args.model_name)
+	# Output basename pairs with the encoder kind so cached_dataset can pick
+	# the right file at read time via pixel_values_filename(model_id).
+	output_h5 = args.output_dir / pixel_values_filename(args.model_name)
 	storage_dtype = np.float32
 
-	written = 0
-	all_image_arr = None #np.zeros((len(image_paths), 3, processor.size[], processor.size["width"]), dtype=storage_dtype)
+	all_image_arr = None
 	written = set()
 
 	with h5py.File(output_h5, "w") as h5f:
-		for image_path in tqdm(
-			image_paths
-		):
+		for image_path in tqdm(image_paths):
 			image = Image.open(image_path).convert("RGB")
-			inputs = processor(images=image, return_tensors="pt")
-			pixel_values = inputs["pixel_values"][0].cpu().numpy().astype(storage_dtype, copy=False)
+			pixel_values = _processed_pixel_values(
+				processor, args.model_name, image
+			).astype(storage_dtype, copy=False)
 			image_index = int(image_path.stem)
 			if all_image_arr is None:
 				all_image_arr = np.zeros((len(image_paths), *pixel_values.shape), dtype=storage_dtype)
@@ -219,12 +244,12 @@ def main2():
 				written.add(image_index)
 			else:
 				raise ValueError(f"Duplicate image index detected: {image_index} from path: {image_path}")
-			
+
 		h5f.create_dataset("pixel_values", data=all_image_arr)
 	assert len(written) == len(image_paths), f"Expected to write {len(image_paths)} unique images, but got {len(written)} unique indices."
 
 
-	print(f"Saved {written} processed images to: {output_h5}")
+	print(f"Saved {len(written)} processed images to: {output_h5}")
 
 if __name__ == "__main__":
 	main2()

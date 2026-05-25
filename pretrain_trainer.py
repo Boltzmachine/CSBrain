@@ -3,7 +3,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn import MSELoss
 from tqdm import tqdm
-from utils.util import generate_mask, save_pretrain_checkpoint, build_muon_optimizer, apply_freq_band_mask
+from utils.util import (
+    generate_mask, save_pretrain_checkpoint, build_muon_optimizer,
+    apply_freq_band_mask, bandpass_decompose, symmetric_band_infonce,
+)
 import os
 import wandb
 import time
@@ -123,7 +126,43 @@ class Trainer(object):
                         batch['timeseries'] = x
                     else:
                         batch = {'timeseries': x.to(self.device) / 100}
-                    if getattr(self.params, 'causal', False):
+                    if getattr(self.params, 'contrastive_band', False):
+                        # Band-contrastive pretraining: split x into K freq bands,
+                        # run K encoder-only forwards (each with its own
+                        # specialised patch embedding, shared transformer),
+                        # then symmetric per-position InfoNCE across bands.
+                        cutoffs = [
+                            float(c) for c in str(self.params.band_cutoffs).split(',')
+                            if c.strip()
+                        ]
+                        fs = int(getattr(self.params, 'fs', 200))
+                        band_views = bandpass_decompose(x, fs=fs, cutoffs=cutoffs)
+                        K = len(band_views)
+                        m = self.model.module if hasattr(self.model, 'module') else self.model
+
+                        z_per_band = []
+                        info_last = {}
+                        for k_b in range(K):
+                            batch_k = {**batch, 'timeseries': band_views[k_b]}
+                            _, info_k = self.model(
+                                batch_k, mask=None,
+                                encoder_only=True, band_idx=k_b,
+                            )
+                            patch_tokens_k = info_k['patch_tokens']  # (B, C, N, d)
+                            z_per_band.append(m.contrastive_band_proj(patch_tokens_k))
+                            info_last = info_k
+
+                        valid_ch = batch.get('valid_channel_mask', None)
+                        c_loss = symmetric_band_infonce(
+                            z_per_band,
+                            temp=float(getattr(self.params, 'contrastive_temp', 0.1)),
+                            valid_channel_mask=valid_ch,
+                        )
+                        loss = c_loss
+                        logs = {"contrastive_band_loss": c_loss.data.cpu().numpy()}
+                        # No `out` tuple in this path → skip adversarial branch.
+                        out = None
+                    elif getattr(self.params, 'causal', False):
                         # Causal next-patch prediction: no masking needed
                         out = self.model.training_step(batch, mask=None)
 
@@ -143,7 +182,7 @@ class Trainer(object):
                                         value.detach().cpu().numpy()
                                         if torch.is_tensor(value) else value)
 
-                        if info.get('dino_mode', False):
+                        if self.params.dino_mode:
                             # DINO replaces the primary causal loss
                             loss = sum(loss_dict.values())
                         else:
@@ -167,6 +206,8 @@ class Trainer(object):
                             # computed in the frequency domain on the masked bins.
                             masked_x, band_mask = apply_freq_band_mask(
                                 x, n_bands=self.params.freq_recon_n_bands,
+                                mask_ratio=getattr(
+                                    self.params, 'band_mask_ratio', None),
                             )
                             batch['timeseries'] = masked_x
                             mask = None
@@ -193,14 +234,14 @@ class Trainer(object):
                                     logs[key] = (
                                         value.detach().cpu().numpy()
                                         if torch.is_tensor(value) else value)
-                        if info.get('dino_mode', False):
+                        if self.params.dino_mode:
                             # DINO + iBOT replace the masked reconstruction loss
                             loss = sum(loss_dict.values())
                         elif use_freq_mask:
                             B_, C_, N_, d_ = x.shape
                             T_ = N_ * d_
-                            spec_y = torch.fft.rfft(y.reshape(B_, C_, T_), dim=-1)
-                            spec_x = torch.fft.rfft(x.reshape(B_, C_, T_), dim=-1)
+                            spec_y = torch.fft.rfft(y.reshape(B_, C_, T_), dim=-1, norm="ortho")
+                            spec_x = torch.fft.rfft(x.reshape(B_, C_, T_), dim=-1, norm="ortho")
                             mag_diff_sq = (spec_y.abs() - spec_x.abs()).pow(2)
                             bm = band_mask.unsqueeze(1).expand_as(mag_diff_sq)
                             freq_loss = (mag_diff_sq * bm).sum() / bm.sum().clamp(min=1)

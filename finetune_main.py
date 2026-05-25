@@ -53,6 +53,10 @@ def main():
                         help='multi_lr')  
     parser.add_argument('--frozen', type=bool,
                         default=False, help='frozen')
+    parser.add_argument('--linear_probe', action='store_true', default=False,
+                        help='linear probing: freeze the backbone and replace the '
+                             'classifier head with a single linear layer '
+                             '(currently wired for PhysioNet-MI)')
     parser.add_argument('--use_pretrained_weights', action='store_true', help='Use pretrained weights')
     parser.add_argument('--foundation_dir', type=str,default='pth/CSBrain.pth',help='foundation_dir')
     parser.add_argument('--model', type=str, default='CSBrain', help='CBraMod CSBrain CSBrain_new CSBrain_I CSBrain_II')
@@ -94,9 +98,14 @@ def main():
     parser.add_argument('--mamba_d_conv', type=int, default=4, help='Mamba depthwise conv width')
     parser.add_argument('--mamba_expand', type=int, default=2, help='Mamba expansion factor')
 
-    # --- DINOv3/v2 EEG-to-image classifier ---
+    # --- Vision encoder for image-alignment branches ---
+    # Used by --model DINOv3EEG (image classifier) AND by --model Align/WorldModel
+    # (the CSBrainAlign image_alignment head). MUST match the encoder used at
+    # pretraining; the checkpoint loader will surface a shape mismatch otherwise.
     parser.add_argument('--vision_encoder', type=str, default='facebook/dinov2-base',
-                        help='HuggingFace model id for the DINO image encoder (used by --model DINOv3EEG)')
+                        help='HF model id of the frozen vision encoder (e.g. facebook/dinov2-base, facebook/vjepa2-vitl-fpc64-256). Used by DINOv3EEG and by Align/WorldModel backbones; must match the pretraining encoder.')
+    parser.add_argument('--image_pool_heads', type=int, default=4,
+                        help='Heads for the V-JEPA 2 attention-pool head (Align/WorldModel backbones only); ignored for image-encoder backbones with a CLS token.')
     parser.add_argument('--image_mode', type=str, default='raw',
                         choices=['raw', 'spectrogram'],
                         help="EEG->image transform: 'raw' (C,T) 2D layout (paper default) "
@@ -108,6 +117,14 @@ def main():
     parser.add_argument('--lora_rank', type=int, default=8, help='LoRA rank')
     parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA alpha')
     parser.add_argument('--freeze_backbone', action='store_true', help='freeze the DINO encoder (linear probing)')
+
+    # --- gradient analysis ---
+    parser.add_argument('--grad_analysis', action='store_true',
+                        help='record per-parameter grad norms and weight drift '
+                             'across training and dump CSVs + plots')
+    parser.add_argument('--grad_analysis_dir', type=str, default=None,
+                        help='where to write grad analysis artifacts '
+                             '(default: <model_dir>/grad_analysis)')
 
     params = parser.parse_args()
     if os.environ.get("DEBUG", "0") == "1":

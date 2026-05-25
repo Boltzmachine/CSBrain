@@ -15,7 +15,7 @@ from collections import defaultdict
 
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import Dinov2Model
+from transformers import AutoModel
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +485,11 @@ class CSBrainAlign(nn.Module):
                  moe_gate_input_dim=32,
                  moe_balance_weight=0.01, moe_band_prior_weight=0.1,
                  moe_z_loss_weight=1e-3,
-                 in_dim_for_gate=None):
+                 in_dim_for_gate=None,
+                 contrastive_band=False, contrastive_n_bands=3,
+                 contrastive_proj_dim=64,
+                 vision_encoder='facebook/dinov2-base',
+                 image_pool_heads=4):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
@@ -554,6 +558,29 @@ class CSBrainAlign(nn.Module):
         else:
             raise ValueError(f"Unknown patch_embed_type: {patch_embed_type}")
 
+        # --- Band-contrastive pretraining: one specialised PatchEmbedding per
+        # frequency band, plus a small projection head for the InfoNCE objective.
+        # Later layers (coord PE, transformer, etc.) are shared.
+        self.contrastive_band = contrastive_band
+        if contrastive_band:
+            if patch_embed_type != 'cnn':
+                raise ValueError(
+                    "contrastive_band currently requires patch_embed_type='cnn'."
+                )
+            self.band_patch_embeddings = nn.ModuleList([
+                PatchEmbedding(
+                    in_dim, out_dim, d_model, seq_len, causal=causal,
+                    spectral_mode=spectral_mode,
+                    stft_n_fft=stft_n_fft, stft_hop=stft_hop,
+                )
+                for _ in range(contrastive_n_bands)
+            ])
+            self.contrastive_band_proj = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, contrastive_proj_dim),
+            )
+
         self.TemEmbed_kernel_sizes = TemEmbed_kernel_sizes
         kernel_sizes = self.TemEmbed_kernel_sizes
         self.TemEmbedEEGLayer = TemEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim, kernel_sizes=kernel_sizes, stride=1, causal=causal)
@@ -563,7 +590,25 @@ class CSBrainAlign(nn.Module):
         self.BrainEmbedEEGLayer = BrainEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim)
         self.sorted_indices = sorted_indices
 
-        self.pretrained_image_encoder = Dinov2Model.from_pretrained("facebook/dinov2-base").eval()
+        # Frozen pretrained vision encoder. Behavior dispatches on
+        # config.model_type: V-JEPA 2 has no CLS and takes pixel_values_videos,
+        # while DINOv2-style ViTs emit a CLS token from pixel_values. Only
+        # the attention-pool head (V-JEPA 2 path) is trained.
+        self.vision_encoder_name = vision_encoder
+        self.pretrained_image_encoder = AutoModel.from_pretrained(vision_encoder).eval()
+        for p in self.pretrained_image_encoder.parameters():
+            p.requires_grad = False
+        self.image_feature_dim = int(self.pretrained_image_encoder.config.hidden_size)
+        self.encoder_kind = str(self.pretrained_image_encoder.config.model_type).lower()
+        if self.encoder_kind == 'vjepa2':
+            # Learned-query attention pool over V-JEPA 2 patch tokens.
+            self.image_pool_query = nn.Parameter(
+                torch.randn(1, 1, self.image_feature_dim) * 0.02)
+            self.image_pool_attn = nn.MultiheadAttention(
+                embed_dim=self.image_feature_dim, num_heads=image_pool_heads,
+                batch_first=True,
+            )
+            self.image_pool_norm = nn.LayerNorm(self.image_feature_dim)
         encoder_layer = CSBrain_TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, area_config=self.area_config, sorted_indices=self.sorted_indices, batch_first=True,
             activation=F.gelu, causal=causal,
@@ -665,7 +710,7 @@ class CSBrainAlign(nn.Module):
         self.contrastive_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, 768),
+            nn.Linear(d_model, self.image_feature_dim),
         )
 
         if self.use_llm_vq:
@@ -728,7 +773,7 @@ class CSBrainAlign(nn.Module):
         self.llm_contrastive_proj = nn.Sequential(
             nn.Linear(self.num_language_tokens * llama_dim, d_model),
             nn.GELU(),
-            nn.Linear(d_model, 768),
+            nn.Linear(d_model, self.image_feature_dim),
         )
 
     def compute_zero_lag_sync_loss(self, source_emb):
@@ -784,16 +829,50 @@ class CSBrainAlign(nn.Module):
 
         return branch_embeds
     
+    @torch.no_grad()
+    def _vjepa2_patch_tokens(self, pixel_values):
+        """Run frozen V-JEPA 2 on a single still frame per sample.
+
+        ``pixel_values``: (B, 3, H, W). V-JEPA 2 expects a video tensor
+        ``pixel_values_videos`` of shape (B, T, C, H, W) with T divisible
+        by tubelet_size (default 2). We replicate the frame T=2 times so
+        the temporal patch count is 1.
+        Returns the last hidden state — (B, N_patches, image_feature_dim).
+        """
+        pv = pixel_values.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()
+        outputs = self.pretrained_image_encoder(pixel_values_videos=pv)
+        return outputs.last_hidden_state  # (B, N, d_img)
+
     @torch.inference_mode()
-    def get_image_hidden_states(self, **image_encoder_inputs):
+    def _dinov2_cls_token(self, image_encoder_inputs):
+        """Run frozen DINOv2-style ViT and return the CLS token at layer 12.
+
+        Mirrors the pre-VJEPA behavior: ``hidden_states[12][:, 0]``.
+        """
         outputs = self.pretrained_image_encoder(**image_encoder_inputs, output_hidden_states=True)
-        hidden_states = outputs.hidden_states
-        selected_hidden_states = []
-        # for layer_idx in [1, 6, 12]:
-        for layer_idx in [12]:
-            selected_hidden_states.append(hidden_states[layer_idx][:, 0])
-        selected_hidden_states = torch.stack(selected_hidden_states, dim=1) # (B, n_branch, d_model)
-        return selected_hidden_states
+        return outputs.hidden_states[12][:, 0]  # (B, d_img)
+
+    def get_image_hidden_states(self, **image_encoder_inputs):
+        """Return (B, n_branch=1, image_feature_dim) for either encoder.
+
+        Dispatches on ``self.encoder_kind``: V-JEPA 2 (no CLS) -> attention
+        pool over patch tokens with a learnable query; DINOv2-style ViTs ->
+        CLS token at layer 12 (the original pre-VJEPA path).
+        """
+        if self.encoder_kind == 'vjepa2':
+            pixel_values = image_encoder_inputs.get('pixel_values')
+            assert pixel_values is not None, (
+                "V-JEPA 2 image encoder expects `pixel_values` in image_encoder_inputs"
+            )
+            patch_tokens = self._vjepa2_patch_tokens(pixel_values)  # (B, N, d_img)
+            B = patch_tokens.size(0)
+            q = self.image_pool_query.expand(B, -1, -1)
+            pooled, _ = self.image_pool_attn(q, patch_tokens, patch_tokens, need_weights=False)
+            pooled = self.image_pool_norm(pooled.squeeze(1))  # (B, d_img)
+            return pooled.unsqueeze(1)  # (B, 1, d_img)
+        # DINOv2-style fallback (also covers any future ViT with a CLS token).
+        cls = self._dinov2_cls_token(image_encoder_inputs)  # (B, d_img)
+        return cls.unsqueeze(1)
 
 
     # ------------------------------------------------------------------
@@ -919,7 +998,7 @@ class CSBrainAlign(nn.Module):
             out[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
         return out
 
-    def forward(self, batch, mask=None, encoder_only=False):
+    def forward(self, batch, mask=None, encoder_only=False, band_idx=None):
         """Encode ``batch`` and (unless ``encoder_only``) compute losses.
 
         When ``encoder_only=True`` the patch-embed → transformer body
@@ -930,6 +1009,10 @@ class CSBrainAlign(nn.Module):
         world-model future-window encode — all of which need only the
         latent tokens, and several of which sit inside a ``no_grad``
         block where loss computation would be wasted.
+
+        ``band_idx`` selects a band-specialised patch embedding from
+        ``self.band_patch_embeddings`` (requires ``contrastive_band=True``).
+        When None the default ``self.patch_embedding`` is used.
         """
         x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
         ch_coords = batch['ch_coords']
@@ -962,7 +1045,11 @@ class CSBrainAlign(nn.Module):
         # Remember base N before patch embedding so we can map the
         # interleaved multi-band tokens back to per-patch reconstructions.
         base_N = x.size(2)
-        patch_emb = self.patch_embedding(x, mask)
+        if band_idx is not None:
+            pe = self.band_patch_embeddings[band_idx]
+        else:
+            pe = self.patch_embedding
+        patch_emb = pe(x, mask)
 
         # Fix #3: tell the temporal transformer which time positions were
         # masked in sensor space. Aggregate the per-(channel, patch) mask
@@ -977,7 +1064,7 @@ class CSBrainAlign(nn.Module):
                 )
 
         if self.patch_embed_type == 'mamba' and 'valid_length_mask' in batch:
-            batch['valid_length_mask'] = self.patch_embedding.adapt_valid_length_mask(
+            batch['valid_length_mask'] = pe.adapt_valid_length_mask(
                 batch['valid_length_mask'])
 
         contrastive_loss = dict()
@@ -1012,7 +1099,7 @@ class CSBrainAlign(nn.Module):
             gate_features = None
             band_targets = None
             if self.use_moe:
-                mag = getattr(self.patch_embedding, 'last_spectral_magnitude', None)
+                mag = getattr(pe, 'last_spectral_magnitude', None)
                 assert mag is not None, (
                     "MoE expects PatchEmbedding to expose `last_spectral_magnitude`. "
                     "Did you change the patch embed type away from 'cnn'?"

@@ -142,15 +142,26 @@ class Model(nn.Module):
 
         self.backbone.proj_out = nn.Identity()
 
-        self.classifier = nn.Sequential(
-            nn.LazyLinear(4 * 200),
-            nn.ELU(),
-            nn.Dropout(param.dropout),
-            nn.Linear(4 * 200, 200),
-            nn.ELU(),
-            nn.Dropout(param.dropout),
-            nn.Linear(200, param.num_of_classes)
-        )
+        if getattr(param, 'linear_probe', False):
+            self.classifier = nn.LazyLinear(param.num_of_classes)
+        else:
+            self.classifier = nn.Sequential(
+                nn.LazyLinear(4 * 200),
+                nn.ELU(),
+                nn.Dropout(param.dropout),
+                nn.Linear(4 * 200, 200),
+                nn.ELU(),
+                nn.Dropout(param.dropout),
+                nn.Linear(200, param.num_of_classes)
+            )
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self.param, 'linear_probe', False):
+            # Keep backbone in eval mode so dropout / norm stats don't drift
+            # while the linear head trains on frozen features.
+            self.backbone.eval()
+        return self
 
     def forward(self, batch):
         x = batch.pop('x')

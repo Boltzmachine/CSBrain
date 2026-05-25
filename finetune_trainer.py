@@ -5,6 +5,7 @@ from tqdm import tqdm
 import torch
 from finetune_evaluator import Evaluator
 from utils.util import build_muon_optimizer
+from utils.grad_analysis import GradientAnalyzer
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss, MSELoss
 from timeit import default_timer as timer
 import numpy as np
@@ -48,13 +49,14 @@ class Trainer(object):
 
         self.best_model_states = None
 
+        freeze_backbone = params.frozen or getattr(params, 'linear_probe', False)
         backbone_params = []
         other_params = []
         for name, param in self.model.named_parameters():
             if "backbone" in name:
                 backbone_params.append(param)
 
-                if params.frozen:
+                if freeze_backbone:
                     param.requires_grad = False
                 else:
                     param.requires_grad = True
@@ -95,6 +97,14 @@ class Trainer(object):
         )
         print(self.model)
 
+        self.grad_analyzer = None
+        if getattr(self.params, 'grad_analysis', False):
+            out_dir = getattr(self.params, 'grad_analysis_dir', None) \
+                or os.path.join(self.params.model_dir, 'grad_analysis')
+            self.grad_analyzer = GradientAnalyzer(self.model, out_dir)
+            print(f"[GradAnalyzer] tracking {len(self.grad_analyzer.init_snapshot)} "
+                  f"trainable tensors -> {out_dir}")
+
     def train_for_multiclass(self):
         f1_best = 0
         kappa_best = 0
@@ -118,11 +128,18 @@ class Trainer(object):
                 loss.backward()
                 wandb.log({"train/loss": loss.item()})
                 losses.append(loss.data.cpu().numpy())
+                if self.grad_analyzer is not None:
+                    # record raw (pre-clip) gradient magnitudes so the
+                    # numbers reflect what the optimiser actually saw.
+                    self.grad_analyzer.after_backward()
                 if self.params.clip_value > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
                     # torch.nn.utils.clip_grad_value_(self.model.parameters(), self.params.clip_value)
                 self.optimizer.step()
                 self.optimizer_scheduler.step()
+
+            if self.grad_analyzer is not None:
+                self.grad_analyzer.end_of_epoch(epoch + 1)
 
             optim_state = self.optimizer.state_dict()
 
@@ -178,6 +195,9 @@ class Trainer(object):
             model_path = self.params.model_dir + "/epoch{}_acc_{:.5f}_kappa_{:.5f}_f1_{:.5f}.pth".format(best_f1_epoch, acc, kappa, f1)
             torch.save(self.model.state_dict(), model_path)
             print("model save in " + model_path)
+            if self.grad_analyzer is not None:
+                paths = self.grad_analyzer.finalize()
+                print(f"[GradAnalyzer] wrote: {paths}")
             return {
                 'val_kappa': kappa_best, 'val_acc': acc_best, 'val_f1': f1_best,
                 'test_kappa': kappa, 'test_acc': acc, 'test_f1': f1,

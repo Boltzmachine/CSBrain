@@ -1,3 +1,11 @@
+def _count_bands(band_cutoffs):
+    """K = (#cut frequencies) + 1. Accepts a CSV string or iterable."""
+    if isinstance(band_cutoffs, str):
+        cuts = [c for c in band_cutoffs.split(',') if c.strip()]
+        return len(cuts) + 1
+    return len(list(band_cutoffs)) + 1
+
+
 def get_model(params, brain_regions, sorted_indices):
     if params.model == 'CSBrain':
         from .CSBrain import CSBrain
@@ -73,6 +81,11 @@ def get_model(params, brain_regions, sorted_indices):
             moe_balance_weight=getattr(params, 'moe_balance_weight', 0.01),
             moe_band_prior_weight=getattr(params, 'moe_band_prior_weight', 0.1),
             moe_z_loss_weight=getattr(params, 'moe_z_loss_weight', 1e-3),
+            contrastive_band=getattr(params, 'contrastive_band', False),
+            contrastive_n_bands=_count_bands(getattr(params, 'band_cutoffs', '1,10')),
+            contrastive_proj_dim=getattr(params, 'contrastive_proj_dim', 64),
+            vision_encoder=getattr(params, 'vision_encoder', 'facebook/dinov2-base'),
+            image_pool_heads=getattr(params, 'image_pool_heads', 4),
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
@@ -114,6 +127,8 @@ def get_model(params, brain_regions, sorted_indices):
             moe_balance_weight=getattr(params, 'moe_balance_weight', 0.01),
             moe_band_prior_weight=getattr(params, 'moe_band_prior_weight', 0.1),
             moe_z_loss_weight=getattr(params, 'moe_z_loss_weight', 1e-3),
+            vision_encoder=getattr(params, 'vision_encoder', 'facebook/dinov2-base'),
+            image_pool_heads=getattr(params, 'image_pool_heads', 4),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
         # ``max_horizon == 0`` short-circuits the world-model components:

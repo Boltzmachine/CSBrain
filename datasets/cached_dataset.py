@@ -168,15 +168,27 @@ def collate_cached_with_future(batch):
     cb_indices = [i for i, b in enumerate(batch) if 'timeseries_future' in b]
     if not cb_indices:
         return out
-    ts_future_stack = torch.stack(
-        [batch[i]['timeseries_future'] for i in cb_indices], dim=0)
+    # Future-stack channel count may be < the batch's max channel count when
+    # a future-providing dataset (e.g. EgoBrain @ 32ch) mixes with a source
+    # that has more channels (e.g. Alljoined-1.6M @ 64ch). Zero-pad the
+    # channel axis to max_chs; the encoder ignores padded channels via
+    # valid_channel_mask (already set by collate_cached above).
     max_chs = out['timeseries'].size(1)
-    assert ts_future_stack.size(2) == max_chs, (
-        f"future-window channels ({ts_future_stack.size(2)}) must match "
-        f"the batch's max channel count ({max_chs}); add channel padding "
-        f"to collate_cached_with_future if a future-providing dataset has "
-        f"fewer channels than another mixed source"
-    )
+    futures = [batch[i]['timeseries_future'] for i in cb_indices]
+    padded = []
+    for ts_f in futures:
+        chs = ts_f.size(1)
+        if chs < max_chs:
+            pad_shape = list(ts_f.shape)
+            pad_shape[1] = max_chs - chs
+            ts_f = torch.cat([ts_f, torch.zeros(*pad_shape, dtype=ts_f.dtype)], dim=1)
+        elif chs > max_chs:
+            raise RuntimeError(
+                f"future-window has more channels ({chs}) than the batch's "
+                f"max channel count ({max_chs}); collate_cached should have "
+                f"padded the primary timeseries to at least {chs}")
+        padded.append(ts_f)
+    ts_future_stack = torch.stack(padded, dim=0)
     out['cinebrain_idx'] = torch.tensor(cb_indices, dtype=torch.long)
     out['timeseries_future'] = ts_future_stack
     out['pixel_values_future'] = torch.stack(

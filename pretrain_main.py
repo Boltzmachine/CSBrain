@@ -79,6 +79,10 @@ def main():
     parser.add_argument('--equivariance_weight', type=float, default=0.0, help='weight for hemispheric equivariance loss (0 = disabled)')
     parser.add_argument('--info_max_weight', type=float, default=0.0, help='weight for VICReg-style info-max regulariser on inv/eq subspaces (0 = disabled)')
     parser.add_argument('--alignment_weight', type=float, default=1.0, help='weight for EEG-image contrastive alignment loss (0 = disabled)')
+    parser.add_argument('--use_volume_conduction', action='store_true', default=False,
+                        help='replace the sinusoidal spherical-coord channel positional encoding with a volume-conduction-aware encoding (arXiv 2601.06134): learnable exp(-d/tau) distance kernel over per-sample 3D electrode positions, row-normalised, smoothed positions projected to d_model and added per channel')
+    parser.add_argument('--vc_tau_init', type=float, default=0.08,
+                        help='initial volume-conduction decay length tau in metres (alpha is initialised so softplus(alpha) == vc_tau_init); ~8 cm matches typical inter-electrode spacing')
 
     # --- LLM-embedding VQ tokenization for contrastive path ---
     parser.add_argument('--use_llm_vq', action='store_true', default=False, help='tokenize the global token into K language tokens via a frozen LLM-embedding codebook before contrastive alignment')
@@ -155,6 +159,18 @@ def main():
     parser.add_argument('--target_momentum', type=float, default=0.998, help='EMA momentum for WorldModel target encoder (0 disables EMA — targets come from the online encoder)')
     parser.add_argument('--mix_alljoined_weight', type=float, default=1.0, help='sampling weight for Alljoined-1.6M in the mix+cinebrain dataset')
     parser.add_argument('--mix_cinebrain_weight', type=float, default=1.0, help='sampling weight for CineBrain in the mix+cinebrain dataset')
+
+    # --- EgoBrain (motion-rich egocentric EEG + GoPro video) ---
+    parser.add_argument('--egobrain_subjects', type=str, default='P0001', help='comma-separated EgoBrain subject ids (e.g. P0001,P0002) or "all"')
+    parser.add_argument('--egobrain_root', type=str, default='data/EgoBrain', help='root directory for the EgoBrain dataset (after datasets.egobrain_preprocess)')
+    parser.add_argument('--egobrain_n_windows', type=int, default=3, help='number of windows to emit per EgoBrain clip')
+    parser.add_argument('--egobrain_window_s', type=float, default=2.0, help='EEG window length in seconds (window_samples must be divisible by in_dim)')
+    parser.add_argument('--egobrain_stride_s', type=float, default=1.0, help='stride between consecutive EgoBrain windows in seconds')
+    parser.add_argument('--egobrain_clip_s', type=float, default=4.0, help='preprocessed clip length in seconds (must match egobrain_preprocess --clip_s)')
+    parser.add_argument('--egobrain_erp_latency_s', type=float, default=0.0, help='time shift added to the frame-lookup timestamp')
+    parser.add_argument('--egobrain_load_frames', type=int, default=1, help='whether to decode raw video frames (0 disables the alignment term)')
+    parser.add_argument('--egobrain_max_channels', type=int, default=32, help='cap on the EgoBrain channel count after 10-20 montage filtering')
+    parser.add_argument('--mix_egobrain_weight', type=float, default=1.0, help='sampling weight for EgoBrain in the mix+egobrain dataset')
 
     # --- Band-contrastive pretraining ---
     parser.add_argument('--contrastive_band', action='store_true', default=False,
@@ -329,6 +345,205 @@ def main():
             batch_size=params.batch_size,
             num_workers=num_workers,
             collate_fn=collate_fn,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    elif params.dataset_dir == 'mix+cinebrain+egobrain':
+        from datasets.cached_dataset import (
+            get_webdataset, collate_cached, collate_cached_with_future,
+            set_active_vision_encoder,
+        )
+        from datasets.cinebrain_dataset import (
+            CineBrainDataset, CineBrainIterableWrapper, WeightedSampleMix,
+        )
+        from datasets.egobrain_dataset import (
+            EgoBrainDataset, EgoBrainIterableWrapper,
+        )
+        set_active_vision_encoder(params.vision_encoder)
+
+        target_event_len = params.seq_len * params.in_dim
+        alljoined_ds = get_webdataset(
+            ["Alljoined-1.6M/*.tar"],
+            params,
+            event_window_target_len=target_event_len,
+        )
+
+        # Both video-providing sources need max_horizon+1 windows when the
+        # latent predictor is on; one window otherwise. CineBrain (64ch)
+        # and EgoBrain (32ch) future stacks share a single batch via
+        # collate_cached_with_future, which pads EgoBrain's channels up
+        # to the batch max (64) before stacking.
+        n_windows_fut = max(1, params.max_horizon + 1)
+
+        cb_subjects = [s.strip() for s in params.cinebrain_subjects.split(',')
+                       if s.strip()]
+        cinebrain_inner = CineBrainDataset(
+            data_dir=params.cinebrain_root,
+            subjects=cb_subjects,
+            in_dim=params.in_dim,
+            n_windows=n_windows_fut,
+            window_s=params.cinebrain_window_s,
+            stride_s=params.cinebrain_stride_s,
+            erp_latency_s=params.cinebrain_erp_latency_s,
+            load_frames=bool(params.cinebrain_load_frames),
+            vision_encoder=params.vision_encoder,
+        )
+        print('CineBrain clips:', len(cinebrain_inner))
+        cinebrain_iter = CineBrainIterableWrapper(cinebrain_inner)
+
+        if params.egobrain_subjects.lower() == 'all':
+            import re as _re
+            ego_subjects = sorted(
+                d for d in os.listdir(params.egobrain_root)
+                if _re.match(r'^P\d{4}$', d)
+                and os.path.isdir(os.path.join(params.egobrain_root, d)))
+        else:
+            ego_subjects = [s.strip() for s in params.egobrain_subjects.split(',')
+                            if s.strip()]
+        egobrain_inner = EgoBrainDataset(
+            data_dir=params.egobrain_root,
+            subjects=ego_subjects,
+            in_dim=params.in_dim,
+            n_windows=n_windows_fut,
+            window_s=params.egobrain_window_s,
+            stride_s=params.egobrain_stride_s,
+            clip_s=params.egobrain_clip_s,
+            erp_latency_s=params.egobrain_erp_latency_s,
+            load_frames=bool(params.egobrain_load_frames),
+            vision_encoder=params.vision_encoder,
+            max_channels=params.egobrain_max_channels,
+        )
+        print('EgoBrain clips:', len(egobrain_inner))
+        egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
+
+        n_samples_per_epoch = 1109545
+        pretrained_dataset = WeightedSampleMix(
+            sources=[alljoined_ds, cinebrain_iter, egobrain_iter],
+            weights=[params.mix_alljoined_weight,
+                     params.mix_cinebrain_weight,
+                     params.mix_egobrain_weight],
+            samples_per_epoch=n_samples_per_epoch,
+        )
+
+        num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
+        collate_fn = (
+            collate_cached_with_future if params.max_horizon > 0
+            else collate_cached
+        )
+        data_loader = DataLoader(
+            pretrained_dataset,
+            batch_size=params.batch_size,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    elif params.dataset_dir == 'mix+egobrain':
+        from datasets.cached_dataset import (
+            get_webdataset, collate_cached, collate_cached_with_future,
+            set_active_vision_encoder,
+        )
+        from datasets.cinebrain_dataset import WeightedSampleMix
+        from datasets.egobrain_dataset import (
+            EgoBrainDataset, EgoBrainIterableWrapper,
+        )
+        set_active_vision_encoder(params.vision_encoder)
+
+        target_event_len = params.seq_len * params.in_dim
+        alljoined_ds = get_webdataset(
+            ["Alljoined-1.6M/*.tar"],
+            params,
+            event_window_target_len=target_event_len,
+        )
+
+        n_windows_ego = max(1, params.max_horizon + 1)
+        if params.egobrain_subjects.lower() == 'all':
+            import re as _re
+            ego_subjects = sorted(
+                d for d in os.listdir(params.egobrain_root)
+                if _re.match(r'^P\d{4}$', d)
+                and os.path.isdir(os.path.join(params.egobrain_root, d)))
+        else:
+            ego_subjects = [s.strip() for s in params.egobrain_subjects.split(',')
+                            if s.strip()]
+        egobrain_inner = EgoBrainDataset(
+            data_dir=params.egobrain_root,
+            subjects=ego_subjects,
+            in_dim=params.in_dim,
+            n_windows=n_windows_ego,
+            window_s=params.egobrain_window_s,
+            stride_s=params.egobrain_stride_s,
+            clip_s=params.egobrain_clip_s,
+            erp_latency_s=params.egobrain_erp_latency_s,
+            load_frames=bool(params.egobrain_load_frames),
+            vision_encoder=params.vision_encoder,
+            max_channels=params.egobrain_max_channels,
+        )
+        print('EgoBrain clips:', len(egobrain_inner))
+        egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
+
+        n_samples_per_epoch = 1109545
+        pretrained_dataset = WeightedSampleMix(
+            sources=[alljoined_ds, egobrain_iter],
+            weights=[params.mix_alljoined_weight,
+                     params.mix_egobrain_weight],
+            samples_per_epoch=n_samples_per_epoch,
+        )
+
+        num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
+        collate_fn = (
+            collate_cached_with_future if params.max_horizon > 0
+            else collate_cached
+        )
+        data_loader = DataLoader(
+            pretrained_dataset,
+            batch_size=params.batch_size,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    elif params.dataset_dir == 'egobrain':
+        from datasets.egobrain_dataset import EgoBrainDataset, collate_egobrain
+        if params.egobrain_subjects.lower() == 'all':
+            import re as _re
+            ego_subjects = sorted(
+                d for d in os.listdir(params.egobrain_root)
+                if _re.match(r'^P\d{4}$', d)
+                and os.path.isdir(os.path.join(params.egobrain_root, d)))
+        else:
+            ego_subjects = [s.strip() for s in params.egobrain_subjects.split(',')
+                            if s.strip()]
+        pretrained_dataset = EgoBrainDataset(
+            data_dir=params.egobrain_root,
+            subjects=ego_subjects,
+            in_dim=params.in_dim,
+            n_windows=params.egobrain_n_windows,
+            window_s=params.egobrain_window_s,
+            stride_s=params.egobrain_stride_s,
+            clip_s=params.egobrain_clip_s,
+            erp_latency_s=params.egobrain_erp_latency_s,
+            load_frames=bool(params.egobrain_load_frames),
+            vision_encoder=params.vision_encoder,
+            max_channels=params.egobrain_max_channels,
+        )
+        print('EgoBrain clips:', len(pretrained_dataset))
+        num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
+        n_samples_per_epoch = 1109545
+        sampler = torch.utils.data.RandomSampler(
+            pretrained_dataset,
+            replacement=True,
+            num_samples=n_samples_per_epoch,
+        )
+        data_loader = DataLoader(
+            pretrained_dataset,
+            batch_size=params.batch_size,
+            num_workers=num_workers,
+            sampler=sampler,
+            collate_fn=collate_egobrain,
             pin_memory=True,
             drop_last=True,
         )

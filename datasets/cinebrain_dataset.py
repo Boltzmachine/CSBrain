@@ -95,6 +95,16 @@ _BIOSEMI64_NAMES, _BIOSEMI64_COORDS = _biosemi64_coords_spherical()
 _DECORD_BRIDGE_SET = False
 _VISION_PROCESSOR_CACHE: dict = {}
 
+# Per-process LRU cache of decord.VideoReader instances, keyed by file path.
+# Opening a multi-GB GoPro MP4 takes ~2 s on the first access (header parse +
+# index build); reusing the open reader drops random-access frame load to
+# ~0.5 s per frame. The cache is per-DataLoader-worker because each worker
+# is a separate process (fork); cache size is bounded so we don't keep more
+# than a handful of large file handles open.
+from collections import OrderedDict as _OrderedDict
+_VIDEO_READER_CACHE: '_OrderedDict[str, object]' = _OrderedDict()
+_VIDEO_READER_CACHE_MAX = 4
+
 
 def _encoder_kind(vision_encoder: str) -> str:
     """Cheap heuristic: model id contains 'vjepa' => video encoder, else image."""
@@ -119,6 +129,29 @@ def _get_vision_processor(vision_encoder: str):
     return _VISION_PROCESSOR_CACHE[vision_encoder]
 
 
+def _get_video_reader(clip_path: str):
+    """Return a (potentially cached) decord.VideoReader for ``clip_path``.
+
+    On cache miss, opens a new reader and evicts the least-recently-used
+    entry once the cache reaches ``_VIDEO_READER_CACHE_MAX``. On cache hit,
+    promotes the entry to most-recently-used so a hot file stays warm.
+    """
+    global _DECORD_BRIDGE_SET
+    import decord
+    if not _DECORD_BRIDGE_SET:
+        decord.bridge.set_bridge('native')
+        _DECORD_BRIDGE_SET = True
+    cached = _VIDEO_READER_CACHE.get(clip_path)
+    if cached is not None:
+        _VIDEO_READER_CACHE.move_to_end(clip_path)
+        return cached
+    vr = decord.VideoReader(clip_path)
+    _VIDEO_READER_CACHE[clip_path] = vr
+    if len(_VIDEO_READER_CACHE) > _VIDEO_READER_CACHE_MAX:
+        _VIDEO_READER_CACHE.popitem(last=False)
+    return vr
+
+
 def _load_frame(clip_path: str, t_seconds: float,
                 vision_encoder: str = 'facebook/dinov2-base') -> torch.Tensor:
     """Return a vision-encoder-ready pixel_values tensor (3, H, W).
@@ -127,12 +160,7 @@ def _load_frame(clip_path: str, t_seconds: float,
     ``AutoVideoProcessor`` (256x256, V-JEPA 2 mean/std); other ids go through
     ``AutoImageProcessor`` (e.g. 224x224 ImageNet for DINOv2-base).
     """
-    global _DECORD_BRIDGE_SET
-    import decord
-    if not _DECORD_BRIDGE_SET:
-        decord.bridge.set_bridge('native')
-        _DECORD_BRIDGE_SET = True
-    vr = decord.VideoReader(clip_path)
+    vr = _get_video_reader(clip_path)
     fps = vr.get_avg_fps()
     # CineBrain clips are 24 fps per the paper; if decord can't recover
     # the fps header we'd rather crash than silently mis-index frames.
@@ -147,6 +175,39 @@ def _load_frame(clip_path: str, t_seconds: float,
         return processed['pixel_values_videos'][0, 0]
     processed = proc(images=frame, return_tensors='pt')
     return processed['pixel_values'][0]
+
+
+def _load_frames_batch(clip_path: str,
+                       t_seconds_list: Sequence[float],
+                       vision_encoder: str = 'facebook/dinov2-base'
+                       ) -> torch.Tensor:
+    """Batched variant of :func:`_load_frame` for multi-window clips.
+
+    Decodes all requested frames with a single ``vr.get_batch`` (sequential
+    GOP read, much cheaper than per-call ``vr[idx]`` seeks when frames are
+    close in time) and runs the HF processor on the batch in one shot.
+    Returns ``(K, 3, H, W)`` aligned to ``t_seconds_list`` order.
+    """
+    vr = _get_video_reader(clip_path)
+    fps = vr.get_avg_fps()
+    assert fps and fps > 0, f"decord could not read fps from {clip_path}"
+    n = len(vr)
+    indices = [max(0, min(n - 1, int(round(t * fps)))) for t in t_seconds_list]
+    # ``get_batch`` requires monotonically-non-decreasing indices on most
+    # decord builds; sort + unscatter to preserve caller order.
+    order = sorted(range(len(indices)), key=lambda i: indices[i])
+    sorted_idx = [indices[i] for i in order]
+    frames_native = vr.get_batch(sorted_idx).asnumpy()  # (K, H, W, C) uint8
+    # Undo the sort: out[order[k]] = frames_native[k]
+    unsorted = [None] * len(indices)
+    for k, src in enumerate(order):
+        unsorted[src] = frames_native[k]
+    proc = _get_vision_processor(vision_encoder)
+    if _encoder_kind(vision_encoder) == 'vjepa2':
+        processed = proc(videos=[[f] for f in unsorted], return_tensors='pt')
+        return processed['pixel_values_videos'][:, 0]
+    processed = proc(images=list(unsorted), return_tensors='pt')
+    return processed['pixel_values']
 
 
 # ---------------------------------------------------------------------------
@@ -325,20 +386,25 @@ class CineBrainDataset(Dataset):
         has_image = torch.zeros(self.n_windows, dtype=torch.bool)
         if self.load_frames:
             clip_path = self._resolve_clip_path(sub, c)
-            for i in range(self.n_windows):
-                window_center_s = (
-                    i * self.stride_samples + self.window_samples / 2
-                ) / self.fs_out + self.erp_latency_s
-                try:
-                    pixel_values[i] = _load_frame(clip_path, window_center_s, self.vision_encoder)
-                    has_image[i] = True
-                except (OSError, RuntimeError) as _e:
-                    # Tolerate decode/IO errors — alignment loss skips
-                    # this sample via has_image. Other exceptions bubble
-                    # up so we don't silently mask real bugs (that's how
-                    # the earlier TypeError went unnoticed).
-                    print(f'[cinebrain] frame load failed for {clip_path} '
-                          f'@ {window_center_s:.2f}s: {_e}')
+            t_videos = [
+                (i * self.stride_samples + self.window_samples / 2)
+                / self.fs_out + self.erp_latency_s
+                for i in range(self.n_windows)
+            ]
+            try:
+                # Batched decode + HF preprocess. CineBrain clips are short
+                # (~4 s, 24 fps) so the windows live in one or two GOPs;
+                # batch + sort gives near-sequential read.
+                frames = _load_frames_batch(
+                    clip_path, t_videos, self.vision_encoder)
+                pixel_values = frames
+                has_image[:] = True
+            except (OSError, RuntimeError) as _e:
+                # Tolerate decode/IO errors — alignment loss skips this
+                # sample via has_image. Other exceptions bubble up so we
+                # don't silently mask real bugs.
+                print(f'[cinebrain] batch frame load failed for {clip_path} '
+                      f'@ {t_videos}: {_e}')
 
         return {
             'timeseries': timeseries,                      # (W, C, N, d)

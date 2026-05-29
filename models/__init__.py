@@ -86,6 +86,8 @@ def get_model(params, brain_regions, sorted_indices):
             contrastive_proj_dim=getattr(params, 'contrastive_proj_dim', 64),
             vision_encoder=getattr(params, 'vision_encoder', 'facebook/dinov2-base'),
             image_pool_heads=getattr(params, 'image_pool_heads', 4),
+            use_volume_conduction=getattr(params, 'use_volume_conduction', False),
+            vc_tau_init=getattr(params, 'vc_tau_init', 0.08),
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
@@ -129,6 +131,8 @@ def get_model(params, brain_regions, sorted_indices):
             moe_z_loss_weight=getattr(params, 'moe_z_loss_weight', 1e-3),
             vision_encoder=getattr(params, 'vision_encoder', 'facebook/dinov2-base'),
             image_pool_heads=getattr(params, 'image_pool_heads', 4),
+            use_volume_conduction=getattr(params, 'use_volume_conduction', False),
+            vc_tau_init=getattr(params, 'vc_tau_init', 0.08),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
         # ``max_horizon == 0`` short-circuits the world-model components:

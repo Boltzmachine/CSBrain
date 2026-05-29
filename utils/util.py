@@ -172,6 +172,7 @@ ARCH_PARAM_FIELDS = (
     # 1024 for V-JEPA 2 ViT-L), which is baked into contrastive_proj and
     # llm_contrastive_proj weight shapes; mismatch -> checkpoint load fails.
     'vision_encoder', 'image_pool_heads',
+    'use_volume_conduction', 'vc_tau_init'
 )
 
 

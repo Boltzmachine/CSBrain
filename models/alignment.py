@@ -310,6 +310,105 @@ class SourceProjector(nn.Module):
         }
 
 
+class VolumeConductionEncoding(nn.Module):
+    """Volume-conduction-aware channel positional encoding (arXiv 2601.06134).
+
+    Given per-sample 3D electrode positions, builds a learnable, row-
+    normalised exponential distance-decay kernel and uses it to smooth
+    each electrode's position into a convex combination of its physical
+    neighbours. The smoothed Cartesian position is projected to the
+    transformer width and added to the patch embedding as a channel-
+    level positional encoding.
+
+    Inputs to ``forward``
+    ---------------------
+    ch_coords : (B, C, 3)
+        Either Cartesian (x, y, z) in metres or spherical (r, theta, phi)
+        as produced by :func:`datasets.cached_dataset._to_spherical`.
+        Controlled by ``coord_kind``. NaN rows are tolerated and treated
+        as invalid channels (their contribution to the kernel is zeroed
+        and their output is set to zero).
+    valid_channel_mask : (B, C) bool, optional
+        ``False`` for padded / dropped channels.
+
+    Returns
+    -------
+    (B, C, d_model) channel-level embedding.
+    """
+
+    def __init__(self, d_model: int, coord_kind: str = 'spherical',
+                 tau_init: float = 0.08, eps: float = 1e-6):
+        super().__init__()
+        if coord_kind not in ('spherical', 'cartesian'):
+            raise ValueError(
+                f"coord_kind must be 'spherical' or 'cartesian', got {coord_kind}"
+            )
+        self.coord_kind = coord_kind
+        self.eps = eps
+
+        # tau = softplus(alpha) + eps. Initialise alpha so tau ~= tau_init.
+        # softplus(a) = tau -> a = log(exp(tau) - 1).
+        tau_init = max(tau_init, 10.0 * eps)
+        alpha_init = math.log(math.expm1(tau_init))
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+        self.proj = nn.Linear(3, d_model)
+
+    @staticmethod
+    def _spherical_to_cartesian(coords: torch.Tensor) -> torch.Tensor:
+        """(B, C, 3) spherical (r, theta=atan2(y,x), phi=acos(z/r)) -> Cartesian."""
+        r = coords[..., 0]
+        theta = coords[..., 1]
+        phi = coords[..., 2]
+        sin_phi = torch.sin(phi)
+        x = r * sin_phi * torch.cos(theta)
+        y = r * sin_phi * torch.sin(theta)
+        z = r * torch.cos(phi)
+        return torch.stack([x, y, z], dim=-1)
+
+    def forward(self, ch_coords: torch.Tensor,
+                valid_channel_mask: torch.Tensor = None) -> torch.Tensor:
+        if self.coord_kind == 'spherical':
+            cart = self._spherical_to_cartesian(ch_coords)
+        else:
+            cart = ch_coords
+
+        # Treat NaN/inf rows as invalid; combine with any user-supplied mask.
+        finite_mask = torch.isfinite(cart).all(dim=-1)            # (B, C)
+        if valid_channel_mask is not None:
+            valid = finite_mask & valid_channel_mask.bool()
+        else:
+            valid = finite_mask
+        safe_cart = torch.where(
+            finite_mask.unsqueeze(-1), cart, torch.zeros_like(cart),
+        )
+
+        # Pairwise Euclidean distances over the channel axis.
+        diff = safe_cart.unsqueeze(2) - safe_cart.unsqueeze(1)    # (B, C, C, 3)
+        dist = torch.linalg.vector_norm(diff, dim=-1)             # (B, C, C)
+
+        tau = F.softplus(self.alpha) + self.eps
+        kernel = torch.exp(-dist / tau)                           # (B, C, C)
+
+        # Zero out columns belonging to invalid channels so they cannot
+        # contribute mass to any row's smoothed position.
+        col_mask = valid.unsqueeze(1).to(kernel.dtype)            # (B, 1, C)
+        kernel = kernel * col_mask
+
+        # Row-normalise. Rows with no valid neighbours fall back to a
+        # safe identity (smoothed = own coord) so output stays finite;
+        # those rows are zeroed below via ``valid`` anyway when they are
+        # themselves invalid.
+        row_sum = kernel.sum(dim=-1, keepdim=True)                # (B, C, 1)
+        kernel_norm = kernel / row_sum.clamp_min(self.eps)
+
+        smoothed = torch.bmm(kernel_norm, safe_cart)              # (B, C, 3)
+
+        emb = self.proj(smoothed)                                 # (B, C, d_model)
+        emb = emb * valid.unsqueeze(-1).to(emb.dtype)
+        return emb
+
+
 class TemporalConcatEncoder(nn.Module):
     """Temporal-only transformer over concatenated source features.
 
@@ -489,7 +588,8 @@ class CSBrainAlign(nn.Module):
                  contrastive_band=False, contrastive_n_bands=3,
                  contrastive_proj_dim=64,
                  vision_encoder='facebook/dinov2-base',
-                 image_pool_heads=4):
+                 image_pool_heads=4,
+                 use_volume_conduction=False, vc_tau_init=0.08):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
@@ -680,6 +780,14 @@ class CSBrainAlign(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+
+        # Volume-conduction channel positional encoding (arXiv 2601.06134).
+        # Replaces the sinusoidal coord_enhancement output when enabled.
+        self.use_volume_conduction = use_volume_conduction
+        if use_volume_conduction:
+            self.volume_conduction = VolumeConductionEncoding(
+                d_model=d_model, coord_kind='spherical', tau_init=vc_tau_init,
+            )
 
         self.features_by_layer = []
         self.input_features = []
@@ -1088,8 +1196,14 @@ class CSBrainAlign(nn.Module):
                 contrastive_loss.update(
                     self._image_contrastive(pred_flatten, batch, has_image))
         else:
-            coord_pe, finite_coord_mask = self._spherical_positional_encoding(ch_coords)
-            coord_emb = self.coord_enhancement(coord_pe)
+            if self.use_volume_conduction:
+                coord_emb = self.volume_conduction(
+                    ch_coords,
+                    valid_channel_mask=batch.get('valid_channel_mask', None),
+                )
+            else:
+                coord_pe, finite_coord_mask = self._spherical_positional_encoding(ch_coords)
+                coord_emb = self.coord_enhancement(coord_pe)
             patch_emb = patch_emb + coord_emb.unsqueeze(2)
 
             # --- Build MoE gate inputs and band-prior targets from the raw

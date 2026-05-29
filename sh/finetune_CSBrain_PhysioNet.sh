@@ -41,7 +41,7 @@ echo "Job started at $(date)" | tee -a "$LOG_FILE"
 #     --weight_decay  0.01 \
 #     --lr 0.00005 
 
-FOUNDATION_DIR="outputs/Align-time/epoch5_loss0.0349089652299881.pth"
+FOUNDATION_DIR="outputs/worldmodel-mix-cineegobrain/epoch10_loss0.7540026903152466.pth"
 CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
 EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
 WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}"

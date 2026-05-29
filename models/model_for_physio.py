@@ -131,14 +131,14 @@ class Model(nn.Module):
             missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
             # ``equiv_projector`` is an optional pretraining-only head; tolerate
             # it in the checkpoint but fail loudly on anything else.
-            # unexpected_keys = [k for k in unexpected_keys
-            #                    if "equiv_projector" not in k]
-            # if unexpected_keys:
-            #     # for unexpected_key in unexpected_keys:
-            #     #     if not 'source_projector' in unexpected_key: #FIXME
-            #     raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
-            # if missing_keys:
-            #     raise ValueError(f"MISSING KEYS: {missing_keys}")
+            unexpected_keys = [k for k in unexpected_keys
+                               if "equiv_projector" not in k]
+            if unexpected_keys:
+                # for unexpected_key in unexpected_keys:
+                #     if not 'source_projector' in unexpected_key: #FIXME
+                raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
+            if missing_keys:
+                raise ValueError(f"MISSING KEYS: {missing_keys}")
 
         self.backbone.proj_out = nn.Identity()
 
@@ -170,12 +170,63 @@ class Model(nn.Module):
 
         if getattr(self.param, 'use_initial_segment_only', False):
             seg_len = self.param.seq_len
-            x = x[:, :, :seg_len, :].contiguous()
-            batch['timeseries'] = x
-            feats = self.backbone(batch)
-            if not isinstance(feats, tuple):
-                raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
-            feats = feats[1]["rep"]
+            # n_starts = seq_len - seg_len + 1
+            n_starts = 1
+
+            if n_starts <= 1:
+                # The input already matches seg_len; nothing to crop or ensemble.
+                x = x[:, :, :seg_len, :].contiguous()
+                batch['timeseries'] = x
+                feats = self.backbone(batch)
+                if not isinstance(feats, tuple):
+                    raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
+                feats = feats[1]["rep"]
+            elif self.training:
+                # Per-sample sub-patch jitter on the raw time axis: each
+                # example is shifted by 0..n_starts-1 *samples* before being
+                # re-patchified. Sample-level (not patch-level) shifts keep
+                # the patch grid and the encoder's positional slots stable --
+                # each patch still holds the same content it would at shift=0
+                # up to a few-sample boundary slide.
+                flat_len = seq_len * patch_size
+                seg_samples = seg_len * patch_size
+                x_flat = x.view(bz, ch_num, flat_len)
+                shift = torch.randint(0, n_starts, (bz,), device=x.device)
+                sample_offsets = torch.arange(seg_samples, device=x.device)
+                gather_idx = (shift.unsqueeze(1) + sample_offsets.unsqueeze(0)) \
+                    .view(bz, 1, seg_samples) \
+                    .expand(bz, ch_num, seg_samples)
+                x_flat = torch.gather(x_flat, dim=2, index=gather_idx)
+                x = x_flat.view(bz, ch_num, seg_len, patch_size).contiguous()
+                batch['timeseries'] = x
+                feats = self.backbone(batch)
+                if not isinstance(feats, tuple):
+                    raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
+                feats = feats[1]["rep"]
+            else:
+                # Eval-time sliding-window ensemble over the same sample-level
+                # shifts used in training. Process one shift per forward pass
+                # so eval memory stays at the input batch size regardless of
+                # n_starts -- stacking all shifts into the batch dim OOMs once
+                # n_starts gets large.
+                flat_len = seq_len * patch_size
+                seg_samples = seg_len * patch_size
+                x_flat = x.view(bz, ch_num, flat_len)
+                logits_sum = None
+                for s in range(n_starts):
+                    x_s = x_flat[:, :, s:s + seg_samples] \
+                        .reshape(bz, ch_num, seg_len, patch_size).contiguous()
+                    seg_batch = {'timeseries': x_s}
+                    for k, v in batch.items():
+                        seg_batch[k] = v
+                    feats_s = self.backbone(seg_batch)
+                    if not isinstance(feats_s, tuple):
+                        raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
+                    feats_s = feats_s[1]["rep"]
+                    out_s = feats_s.contiguous().view(bz, -1)
+                    logits_s = self.classifier(out_s)
+                    logits_sum = logits_s if logits_sum is None else logits_sum + logits_s
+                return logits_sum / n_starts
         elif getattr(self.param, 'segment_forward', False) and seq_len > self.param.seq_len:
             # Pretrained encoder expects seq_len=self.param.seq_len; the finetune
             # input is longer, so split along time and encode each segment

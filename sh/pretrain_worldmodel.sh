@@ -32,7 +32,7 @@
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
-    --dataset_dir mix+cinebrain+egobrain \
+    --dataset_dir mix+egobrain \
     --mix_alljoined_weight 1.0 \
     --mix_cinebrain_weight 1.0 \
     --mix_egobrain_weight 1.0 \
@@ -68,4 +68,4 @@ python pretrain_main.py \
     --predictor_n_layers 4 \
     --model_dir outputs/ \
     --spectral_mode instantaneous \
-    --run_name worldmodel-mix-cineegobrain
+    --run_name worldmodel-mix-egobrain

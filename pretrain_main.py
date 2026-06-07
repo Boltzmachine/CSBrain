@@ -106,6 +106,20 @@ def main():
     parser.add_argument('--moe_band_prior_weight', type=float, default=0.1, help='weight of the KL(band-energy || gate) prior; set to 0 to disable the band-anchor warmup')
     parser.add_argument('--moe_z_loss_weight', type=float, default=1e-3, help='weight of the router z-loss (Zoph et al. ST-MoE) that keeps gate logits bounded; required to prevent late-training NaN')
 
+    # --- Learnable spectral-band filterbank + cross-band + multi-level alignment ---
+    parser.add_argument('--use_spectral_bands', action='store_true', default=False,
+                        help='decompose raw EEG with a learnable SincNet-style filterbank into K ordered bands, add band-type embeddings, run them through the shared CSBrain backbone with cross-band attention, and align each band to multiple visual levels via a learned soft assignment (mutually exclusive with --use_moe)')
+    parser.add_argument('--num_spectral_bands', type=int, default=4, help='number of learnable frequency bands K')
+    parser.add_argument('--filterbank_kernel_size', type=int, default=101, help='SincNet bandpass FIR length (odd)')
+    parser.add_argument('--filterbank_min_bw_hz', type=float, default=1.0, help='minimum per-band bandwidth in Hz (each band learns its own low/high cutoff independently and may overlap freely)')
+    parser.add_argument('--use_cross_band_attn', action='store_true', default=True, help='enable cross-band attention (cross-frequency coupling) between encoder layers')
+    parser.add_argument('--no_cross_band_attn', dest='use_cross_band_attn', action='store_false', help='disable cross-band attention (ablation)')
+    parser.add_argument('--cross_band_every', type=int, default=1, help='apply cross-band attention every N encoder layers')
+    parser.add_argument('--use_band_type_embedding', action='store_true', default=True, help='add a learned per-band type embedding')
+    parser.add_argument('--no_band_type_embedding', dest='use_band_type_embedding', action='store_false', help='disable band-type embedding (ablation)')
+    parser.add_argument('--num_visual_levels', type=int, default=3, help='number of image-encoder hidden levels (shallow/mid/deep) to align bands against')
+    parser.add_argument('--band_decorr_weight', type=float, default=0.01, help='weight of the band-decorrelation regularizer on per-band aligned embeddings')
+
     # --- SSM/Mamba multi-frequency patch embedding ---
     parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'], help='patch embedder: CNN (default) or multi-frequency Mamba SSM')
     parser.add_argument('--mamba_band_periods', type=str, default=None, help='list of band sample periods, e.g. "[200,600,1200]"; default [in_dim, 3*in_dim, 6*in_dim]')
@@ -172,6 +186,21 @@ def main():
     parser.add_argument('--egobrain_max_channels', type=int, default=32, help='cap on the EgoBrain channel count after 10-20 montage filtering')
     parser.add_argument('--mix_egobrain_weight', type=float, default=1.0, help='sampling weight for EgoBrain in the mix+egobrain dataset')
 
+    # --- Euclidean Alignment (per-subject whitening, arXiv:2601.17883 Eq 9-10) ---
+    parser.add_argument('--use_euclidean_alignment', action='store_true', default=False,
+                        help='apply per-subject Euclidean Alignment whitening before patching. '
+                             'Requires precomputed sidecar files written by `python -m datasets.compute_ea {egobrain,cinebrain,alljoined,physio}`. '
+                             'Subjects without a matrix in the sidecar pass through unchanged.')
+    parser.add_argument('--ea_egobrain_path', type=str,
+                        default='data/EgoBrain/cache_eeg_200hz/ea_subject.pt',
+                        help='path to the EgoBrain EA sidecar (.pt)')
+    parser.add_argument('--ea_cinebrain_path', type=str,
+                        default='data/CineBrain/cache_eeg_200hz/ea_subject.pt',
+                        help='path to the CineBrain EA sidecar (.pt)')
+    parser.add_argument('--ea_alljoined_path', type=str,
+                        default='data/cache/Alljoined-1.6M/ea_subject.pt',
+                        help='path to the Alljoined-1.6M EA sidecar (.pt)')
+
     # --- Band-contrastive pretraining ---
     parser.add_argument('--contrastive_band', action='store_true', default=False,
                         help='enable band-contrastive pretraining (replaces masked reconstruction)')
@@ -191,6 +220,21 @@ def main():
 
     if os.environ.get('DEBUG', '0') == '1':
         params.batch_size = 4
+
+    # --- Euclidean Alignment sidecars (per-subject whitening matrices) ---
+    # When --use_euclidean_alignment is on, load whichever sidecars the
+    # active dataset branch will consume. Loaders that don't get a matrix
+    # for a given subject silently pass that subject's data through
+    # unchanged, so a missing sidecar degrades gracefully (with a warning).
+    ea_egobrain = ea_cinebrain = ea_alljoined = None
+    if params.use_euclidean_alignment:
+        from datasets.euclidean_alignment import load_ea_matrices
+        if 'egobrain' in params.dataset_dir:
+            ea_egobrain = load_ea_matrices(params.ea_egobrain_path)
+        if 'cinebrain' in params.dataset_dir:
+            ea_cinebrain = load_ea_matrices(params.ea_cinebrain_path)
+        if 'mix' in params.dataset_dir:               # mix mode always pulls Alljoined
+            ea_alljoined = load_ea_matrices(params.ea_alljoined_path)
 
     if params.dataset_dir == 'mix':
         from datasets.cached_dataset import (
@@ -301,6 +345,7 @@ def main():
             ],
             params,
             event_window_target_len=target_event_len,
+            ea_matrices=ea_alljoined,
         )
 
         # When the latent predictor is on we need at least max_horizon+1
@@ -319,6 +364,7 @@ def main():
             erp_latency_s=params.cinebrain_erp_latency_s,
             load_frames=bool(params.cinebrain_load_frames),
             vision_encoder=params.vision_encoder,
+            ea_matrices=ea_cinebrain,
         )
         print('CineBrain clips:', len(cinebrain_inner))
         cinebrain_iter = CineBrainIterableWrapper(cinebrain_inner)
@@ -367,6 +413,7 @@ def main():
             ["Alljoined-1.6M/*.tar"],
             params,
             event_window_target_len=target_event_len,
+            ea_matrices=ea_alljoined,
         )
 
         # Both video-providing sources need max_horizon+1 windows when the
@@ -388,6 +435,7 @@ def main():
             erp_latency_s=params.cinebrain_erp_latency_s,
             load_frames=bool(params.cinebrain_load_frames),
             vision_encoder=params.vision_encoder,
+            ea_matrices=ea_cinebrain,
         )
         print('CineBrain clips:', len(cinebrain_inner))
         cinebrain_iter = CineBrainIterableWrapper(cinebrain_inner)
@@ -413,6 +461,7 @@ def main():
             load_frames=bool(params.egobrain_load_frames),
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
+            ea_matrices=ea_egobrain,
         )
         print('EgoBrain clips:', len(egobrain_inner))
         egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
@@ -456,6 +505,7 @@ def main():
             ["Alljoined-1.6M/*.tar"],
             params,
             event_window_target_len=target_event_len,
+            ea_matrices=ea_alljoined,
         )
 
         n_windows_ego = max(1, params.max_horizon + 1)
@@ -480,6 +530,7 @@ def main():
             load_frames=bool(params.egobrain_load_frames),
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
+            ea_matrices=ea_egobrain,
         )
         print('EgoBrain clips:', len(egobrain_inner))
         egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
@@ -529,6 +580,7 @@ def main():
             load_frames=bool(params.egobrain_load_frames),
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
+            ea_matrices=ea_egobrain,
         )
         print('EgoBrain clips:', len(pretrained_dataset))
         num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
@@ -561,6 +613,7 @@ def main():
             erp_latency_s=params.cinebrain_erp_latency_s,
             load_frames=bool(params.cinebrain_load_frames),
             vision_encoder=params.vision_encoder,
+            ea_matrices=ea_cinebrain,
         )
         print('CineBrain clips:', len(pretrained_dataset))
         num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0

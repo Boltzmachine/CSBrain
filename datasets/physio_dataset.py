@@ -14,11 +14,16 @@ class CustomDataset(Dataset):
             data_dir,
             mode='train',
             flip_aug=False,
+            ea_matrices=None,
     ):
         super(CustomDataset, self).__init__()
         self.db = lmdb.open(data_dir, readonly=True, lock=False, readahead=True, meminit=False)
         with self.db.begin(write=False) as txn:
             self.keys = pickle.loads(txn.get('__keys__'.encode()))[mode]
+        # Optional per-subject Euclidean Alignment matrices (dict keyed by
+        # 'SXXX' subject id, parsed from the LMDB key prefix). When set,
+        # whitening is applied in __getitem__ before the /100 rescale.
+        self.ea_matrices = ea_matrices
 
         # Hemisphere-flip augmentation (training only).
         # Swaps homologous electrode pairs and relabels left↔right fist.
@@ -48,6 +53,17 @@ class CustomDataset(Dataset):
             data = data[self.flip_perm]
             label = self._label_flip.get(label, label)
 
+        # --- Euclidean Alignment (optional) ---
+        # Sample shape is (C, n_windows, T). EA whitens along the channel
+        # axis; we reshape to (C, n_windows*T), apply, then reshape back.
+        if self.ea_matrices is not None:
+            sub_id = key.split('R', 1)[0]                  # 'S001R04-1' -> 'S001'
+            R = self.ea_matrices.get(sub_id)
+            if R is not None:
+                from datasets.euclidean_alignment import apply_ea
+                C, W, T = data.shape
+                data = apply_ea(data.reshape(C, W * T), R).reshape(C, W, T)
+
         ch_coords = _to_spherical(pair["ch_coords"])
         ch_names = pair["ch_names"]
         return {
@@ -73,12 +89,25 @@ class LoadDataset(object):
         self.params = params
         self.datasets_dir = params.datasets_dir
         self.flip_aug = getattr(params, 'hemisphere_flip_aug', False)
+        # Lazy-load the EA matrices sidecar only when the flag is set, so
+        # default behaviour is unchanged. Sidecar path defaults to
+        # ``<datasets_dir>/ea_subject.pt`` (next to the LMDB) but can be
+        # overridden via params.ea_path.
+        self.ea_matrices = None
+        if getattr(params, 'use_euclidean_alignment', False):
+            from datasets.euclidean_alignment import load_ea_matrices
+            ea_path = getattr(params, 'ea_path', None) or os.path.join(
+                self.datasets_dir, 'ea_subject.pt')
+            self.ea_matrices = load_ea_matrices(ea_path)
 
     def get_data_loader(self):
         train_set = CustomDataset(self.datasets_dir, mode='train',
-                                  flip_aug=self.flip_aug)
-        val_set = CustomDataset(self.datasets_dir, mode='val')
-        test_set = CustomDataset(self.datasets_dir, mode='test')
+                                  flip_aug=self.flip_aug,
+                                  ea_matrices=self.ea_matrices)
+        val_set = CustomDataset(self.datasets_dir, mode='val',
+                                ea_matrices=self.ea_matrices)
+        test_set = CustomDataset(self.datasets_dir, mode='test',
+                                 ea_matrices=self.ea_matrices)
         print(len(train_set), len(val_set), len(test_set))
         print(len(train_set)+len(val_set)+len(test_set))
         data_loader = {

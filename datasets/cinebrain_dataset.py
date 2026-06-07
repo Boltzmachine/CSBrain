@@ -246,10 +246,14 @@ class CineBrainDataset(Dataset):
         load_frames: bool = True,
         cache_dir: Optional[str] = None,
         vision_encoder: str = 'facebook/dinov2-base',
+        ea_matrices: Optional[dict] = None,
     ):
         super().__init__()
         self.data_dir = data_dir
         self.subjects = list(subjects)
+        # Per-subject EA whitening matrices (see datasets/euclidean_alignment.py).
+        # Applied in _load_preprocessed when present.
+        self.ea_matrices = ea_matrices
         self.in_dim = in_dim
         self.n_windows = n_windows
         self.window_samples = int(round(window_s * fs_out))
@@ -338,15 +342,23 @@ class CineBrainDataset(Dataset):
         resample via MNE. The fallback is 2–3 orders of magnitude slower,
         so training runs should ALWAYS populate the cache first (see
         ``datasets/cinebrain_preprocess.py``).
+
+        When ``self.ea_matrices`` is set, the subject's Euclidean Alignment
+        whitening is applied as a final post-cache step.
         """
         cache = self._cache_path(sub, c)
         if os.path.exists(cache):
-            return np.load(cache)
-        raw = self._load_concat_recording(sub, c)            # (C, 4000)
-        ts = preprocess_segment(raw, self.fs_in, self.fs_out)  # (C, 800)
-        ts = ts * 1e6 if np.abs(ts).max() < 1.0 else ts
-        np.clip(ts, -300, 300, out=ts)
-        return ts.astype(np.float32)
+            ts = np.load(cache)
+        else:
+            raw = self._load_concat_recording(sub, c)            # (C, 4000)
+            ts = preprocess_segment(raw, self.fs_in, self.fs_out)  # (C, 800)
+            ts = ts * 1e6 if np.abs(ts).max() < 1.0 else ts
+            np.clip(ts, -300, 300, out=ts)
+            ts = ts.astype(np.float32)
+        if self.ea_matrices is not None and sub in self.ea_matrices:
+            from datasets.euclidean_alignment import apply_ea
+            ts = apply_ea(ts, self.ea_matrices[sub])
+        return ts
 
     def _resolve_clip_path(self, sub: str, c: int) -> str:
         if self.clip_id_fn is not None:

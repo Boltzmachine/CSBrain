@@ -6,6 +6,23 @@ def _count_bands(band_cutoffs):
     return len(list(band_cutoffs)) + 1
 
 
+def _spectral_band_kwargs(params):
+    """Collect the learnable-filterbank / cross-band / multi-level-alignment
+    options for CSBrainAlign, all defaulting to the feature being OFF."""
+    return dict(
+        use_spectral_bands=getattr(params, 'use_spectral_bands', False),
+        num_spectral_bands=getattr(params, 'num_spectral_bands', 4),
+        fs=getattr(params, 'fs', 200),
+        filterbank_kernel_size=getattr(params, 'filterbank_kernel_size', 101),
+        filterbank_min_bw_hz=getattr(params, 'filterbank_min_bw_hz', 1.0),
+        use_cross_band_attn=getattr(params, 'use_cross_band_attn', True),
+        cross_band_every=getattr(params, 'cross_band_every', 1),
+        use_band_type_embedding=getattr(params, 'use_band_type_embedding', True),
+        num_visual_levels=getattr(params, 'num_visual_levels', 3),
+        band_decorr_weight=getattr(params, 'band_decorr_weight', 0.01),
+    )
+
+
 def get_model(params, brain_regions, sorted_indices):
     if params.model == 'CSBrain':
         from .CSBrain import CSBrain
@@ -88,6 +105,7 @@ def get_model(params, brain_regions, sorted_indices):
             image_pool_heads=getattr(params, 'image_pool_heads', 4),
             use_volume_conduction=getattr(params, 'use_volume_conduction', False),
             vc_tau_init=getattr(params, 'vc_tau_init', 0.08),
+            **_spectral_band_kwargs(params),
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
@@ -133,6 +151,7 @@ def get_model(params, brain_regions, sorted_indices):
             image_pool_heads=getattr(params, 'image_pool_heads', 4),
             use_volume_conduction=getattr(params, 'use_volume_conduction', False),
             vc_tau_init=getattr(params, 'vc_tau_init', 0.08),
+            **_spectral_band_kwargs(params),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
         # ``max_horizon == 0`` short-circuits the world-model components:

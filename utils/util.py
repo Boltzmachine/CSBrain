@@ -172,7 +172,15 @@ ARCH_PARAM_FIELDS = (
     # 1024 for V-JEPA 2 ViT-L), which is baked into contrastive_proj and
     # llm_contrastive_proj weight shapes; mismatch -> checkpoint load fails.
     'vision_encoder', 'image_pool_heads',
-    'use_volume_conduction', 'vc_tau_init'
+    'use_volume_conduction', 'vc_tau_init',
+    # Learnable spectral-band backbone: these change the module set / weight
+    # shapes (filterbank, band-type embedding, cross-band attention, per-band
+    # alignment heads, band->level logits), so finetuning must rebuild the
+    # backbone with the *same* config the checkpoint was trained under.
+    'use_spectral_bands', 'num_spectral_bands', 'fs',
+    'filterbank_kernel_size', 'filterbank_min_bw_hz',
+    'use_cross_band_attn', 'cross_band_every', 'use_band_type_embedding',
+    'num_visual_levels',
 )
 
 

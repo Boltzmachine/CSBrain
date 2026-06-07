@@ -68,4 +68,5 @@ python pretrain_main.py \
     --predictor_n_layers 4 \
     --model_dir outputs/ \
     --spectral_mode instantaneous \
-    --run_name worldmodel-mix-egobrain
+    --use_spectral_bands --num_spectral_bands 10 --num_visual_levels 3 \
+    --run_name wm-mix-egobrain-bands-10

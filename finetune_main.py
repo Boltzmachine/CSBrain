@@ -75,6 +75,13 @@ def main():
     parser.add_argument('--results_csv', type=str, default=None, help='path to CSV file for logging results')
     parser.add_argument('--hemisphere_flip_aug', action='store_true', default=False,
                         help='hemisphere-flip data augmentation with label swap (motor imagery)')
+    parser.add_argument('--use_euclidean_alignment', action='store_true', default=False,
+                        help='apply per-subject Euclidean Alignment whitening before patching. '
+                             'Requires a precomputed sidecar at <datasets_dir>/ea_subject.pt '
+                             'or --ea_path. Currently wired into PhysioNet.')
+    parser.add_argument('--ea_path', type=str, default=None,
+                        help='override the EA sidecar path; defaults to '
+                             '<datasets_dir>/ea_subject.pt')
     parser.add_argument('--segment_forward', action='store_true', default=False,
                         help='split the input time dim into segments of size seq_len, '
                              'encode each with the pretrained encoder, and concat the '
@@ -113,6 +120,21 @@ def main():
     parser.add_argument('--image_size', type=int, default=0, help='override DINO image size; 0 means use the processor default')
     parser.add_argument('--stft_n_fft', type=int, default=64, help='STFT n_fft for EEG->image (spectrogram mode only)')
     parser.add_argument('--stft_hop_length', type=int, default=16, help='STFT hop length for EEG->image (spectrogram mode only)')
+
+    # --- Learnable spectral-band backbone (must match the pretrained checkpoint) ---
+    parser.add_argument('--fs', type=int, default=200, help='sampling rate (Hz) for the learnable filterbank')
+    parser.add_argument('--use_spectral_bands', action='store_true', default=False,
+                        help='use the learnable SincNet-style filterbank + cross-band + multi-level-alignment backbone (must match pretraining)')
+    parser.add_argument('--num_spectral_bands', type=int, default=4, help='number of learnable frequency bands K')
+    parser.add_argument('--filterbank_kernel_size', type=int, default=101, help='SincNet bandpass FIR length (odd)')
+    parser.add_argument('--filterbank_min_bw_hz', type=float, default=1.0, help='minimum per-band bandwidth in Hz (each band learns its own low/high independently)')
+    parser.add_argument('--use_cross_band_attn', action='store_true', default=True, help='enable cross-band attention')
+    parser.add_argument('--no_cross_band_attn', dest='use_cross_band_attn', action='store_false', help='disable cross-band attention (ablation)')
+    parser.add_argument('--cross_band_every', type=int, default=1, help='apply cross-band attention every N encoder layers')
+    parser.add_argument('--use_band_type_embedding', action='store_true', default=True, help='add a learned per-band type embedding')
+    parser.add_argument('--no_band_type_embedding', dest='use_band_type_embedding', action='store_false', help='disable band-type embedding (ablation)')
+    parser.add_argument('--num_visual_levels', type=int, default=3, help='number of image-encoder hidden levels to align bands against')
+    parser.add_argument('--band_decorr_weight', type=float, default=0.01, help='weight of the band-decorrelation regularizer')
     parser.add_argument('--use_lora', action='store_true', help='attach LoRA adapters to DINO attention Q/K/V')
     parser.add_argument('--lora_rank', type=int, default=8, help='LoRA rank')
     parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA alpha')

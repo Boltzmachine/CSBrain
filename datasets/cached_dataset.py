@@ -210,8 +210,34 @@ def _to_spherical(ch_coords):
 
 
 # @profile
+def _extract_sub_id(sample: dict):
+    """Return the 'sub-XX' identifier for a webdataset sample, or None.
+
+    Looks first at the explicit ``session_id.txt`` field (Alljoined's
+    canonical metadata), then falls back to the leading ``sub-NN`` token
+    of ``__key__``. Returns None for samples without either, which lets
+    EA silently no-op on sources (TUEG, THINGS-EEG2) that don't use this
+    naming convention.
+    """
+    import re as _re
+    sess = sample.get('session_id.txt')
+    if isinstance(sess, bytes):
+        sess = sess.decode('utf-8', errors='ignore')
+    if isinstance(sess, str):
+        m = _re.match(r'(sub-\d+)', sess)
+        if m:
+            return m.group(1)
+    key = sample.get('__key__', '')
+    if isinstance(key, str):
+        m = _re.match(r'(sub-\d+)', key)
+        if m:
+            return m.group(1)
+    return None
+
+
 class _process_webdataset_sample:
-    def __init__(self, params, event_window_target_len=None):
+    def __init__(self, params, event_window_target_len=None,
+                 ea_matrices=None):
         self.image_file = None
         self.things_image_file = None
         self.text_embed_file = None
@@ -221,6 +247,12 @@ class _process_webdataset_sample:
         # None we keep the historical fixed 240-sample window so existing
         # configs (e.g. Spectral pretraining) are untouched.
         self.event_window_target_len = event_window_target_len
+        # Optional per-subject Euclidean Alignment whitening matrices
+        # (datasets/euclidean_alignment.py). Keyed by 'sub-XX' for Alljoined
+        # samples; lookups for other sources (TUEG, THINGS-EEG2, ...) silently
+        # no-op so this stays safe to wire even when only Alljoined has
+        # matrices precomputed.
+        self.ea_matrices = ea_matrices
 
     def __call__(self, sample):
         if self.image_file is None:
@@ -299,6 +331,18 @@ class _process_webdataset_sample:
                     timeseries = np.pad(timeseries, ((0, 0), (0, padding)))
 
         np.clip(timeseries, -300, 300, out=timeseries)
+
+        # Euclidean Alignment (Eq 9-10 of arXiv:2601.17883): if the caller
+        # registered an EA matrix dict and this sample's subject id is in
+        # it, whiten the trial in place. Subject id is parsed from the
+        # webdataset record's '__key__' (e.g. 'sub-01_sess-01_block-...')
+        # or the 'session_id.txt' field; samples without a recognisable
+        # subject id are passed through unchanged.
+        if self.ea_matrices is not None:
+            from datasets.euclidean_alignment import apply_ea
+            sub_id = _extract_sub_id(sample)
+            if sub_id is not None and sub_id in self.ea_matrices:
+                timeseries = apply_ea(timeseries, self.ea_matrices[sub_id])
 
         timeseries = timeseries.reshape(timeseries.shape[0], -1, self.params.in_dim).astype(np.float32)
 
@@ -550,6 +594,7 @@ def get_webdataset(
     dataset_names,
     params,
     event_window_target_len=None,
+    ea_matrices=None,
 ):
 
     # tmp = tempfile.mkdtemp()
@@ -565,5 +610,6 @@ def get_webdataset(
         shards.extend(files)
     dataset = wds.WebDataset(shards, resampled=True).decode()
     dataset = dataset.map(_process_webdataset_sample(
-        params, event_window_target_len=event_window_target_len))
+        params, event_window_target_len=event_window_target_len,
+        ea_matrices=ea_matrices))
     return dataset

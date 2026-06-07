@@ -167,6 +167,7 @@ class EgoBrainDataset(Dataset):
         clip_s: float = 4.0,
         max_channels: Optional[int] = None,
         frames_cache_dir: Optional[str] = None,
+        ea_matrices: Optional[dict] = None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -186,6 +187,11 @@ class EgoBrainDataset(Dataset):
         self.frame_size = (frame_size if frame_size is not None
                            else _frame_size_for(vision_encoder))
         self.max_channels = max_channels
+        # Optional per-subject Euclidean Alignment whitening matrices. When
+        # provided, _load_clip applies R̄_s^{-1/2} after the keep_mask
+        # selection and before windowing. Sidecar file lives next to the
+        # EEG cache; see datasets/compute_ea.py + euclidean_alignment.py.
+        self.ea_matrices = ea_matrices
 
         # If a per-subject HDF5 frame cache exists with attrs matching the
         # current configuration, use the fast path in __getitem__ that
@@ -269,7 +275,13 @@ class EgoBrainDataset(Dataset):
         return os.path.join(self.cache_dir, sub, f'{c}.npy')
 
     def _load_clip(self, sub: str, c: int) -> np.ndarray:
-        """(C_kept, fs_out*clip_s) float32 µV — already filtered/notched."""
+        """(C_kept, fs_out*clip_s) float32 µV — already filtered/notched.
+
+        When ``self.ea_matrices`` is set, applies the subject's Euclidean
+        Alignment whitening matrix after channel selection. Falls back to
+        the raw signal if no matrix is registered for this subject (e.g.
+        the EA sidecar was built before this subject was downloaded).
+        """
         arr = np.load(self._clip_path(sub, c))
         keep = self._subject_meta[sub]['keep_mask']
         if keep.shape[0] != arr.shape[0]:
@@ -278,7 +290,11 @@ class EgoBrainDataset(Dataset):
             raise RuntimeError(
                 f"cached clip {self._clip_path(sub, c)} has C={arr.shape[0]} "
                 f"but clips.json lists {keep.shape[0]} channels; rebuild cache")
-        return arr[keep]
+        arr = arr[keep]
+        if self.ea_matrices is not None and sub in self.ea_matrices:
+            from datasets.euclidean_alignment import apply_ea
+            arr = apply_ea(arr, self.ea_matrices[sub])
+        return arr
 
     def _video_chapters(self, sub: str) -> list[dict]:
         """Return the per-subject ordered chapter list (with abs paths +

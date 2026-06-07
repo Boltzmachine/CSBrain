@@ -566,6 +566,132 @@ class AttentionMLPSemanticReadout(nn.Module):
         return self.mlp(aggregated)
 
 
+class LearnableFilterbank(nn.Module):
+    """SincNet-style learnable bandpass filterbank with INDEPENDENT per-band bounds.
+
+    Each band k learns its own lower/upper cutoff directly, so bands are free to
+    overlap (or not) as the data demands — there is no shared ordered edge set
+    and no global overlap hyperparameter. Validity is guaranteed by construction
+    via a bounded reparameterization:
+
+        low_k  = f_min + sigmoid(low_logits_k) * (nyq - f_min - min_bw)
+        high_k = low_k + min_bw + sigmoid(width_logits_k) * (nyq - low_k - min_bw)
+
+    so for every band, independently:  f_min <= low_k  and
+    low_k + min_bw <= high_k <= nyquist.  Bands are *initialized* to tile the
+    spectrum into equal slices (to break the K-fold symmetry — identical bands
+    would otherwise receive identical gradients and never separate), but each
+    band may move and overlap any other freely thereafter.
+
+    For each band a SincNet bandpass FIR kernel is built (difference of two
+    normalized-sinc low-pass filters, Hamming-windowed) and the **same** kernel
+    is convolved over every channel. The model is not told which band is which;
+    downstream layers learn the band semantics.
+    """
+
+    def __init__(self, num_bands, fs, kernel_size=101, min_bw_hz=1.0, f_min_hz=1.0):
+        super().__init__()
+        assert kernel_size % 2 == 1, (
+            "kernel_size must be odd for a symmetric zero-phase FIR filter")
+        self.num_bands = int(num_bands)
+        self.fs = float(fs)
+        self.kernel_size = int(kernel_size)
+        self.min_bw = float(min_bw_hz)
+        self.f_min = float(f_min_hz)
+        self.nyquist = self.fs / 2.0
+        assert self.f_min + self.min_bw < self.nyquist, (
+            f"f_min ({f_min_hz}) + min_bw ({min_bw_hz}) must be < nyquist "
+            f"({self.nyquist}); reduce them or raise fs.")
+
+        # Per-band, independent low/width logits. Initialize to an equal-width
+        # tiling of the spectrum by inverting the sigmoid reparameterization.
+        span = self.nyquist - self.f_min - self.min_bw
+        tile = (self.nyquist - self.f_min) / self.num_bands
+        low_logits = torch.empty(self.num_bands)
+        width_logits = torch.empty(self.num_bands)
+
+        def _logit(p):
+            p = min(max(p, 1e-3), 1.0 - 1e-3)
+            return math.log(p / (1.0 - p))
+
+        for k in range(self.num_bands):
+            lo = self.f_min + k * tile
+            hi = min(lo + tile, self.nyquist)
+            wid = max(hi - lo, self.min_bw)
+            low_logits[k] = _logit((lo - self.f_min) / span)
+            width_logits[k] = _logit(
+                (wid - self.min_bw) / max(self.nyquist - lo - self.min_bw, 1e-6))
+        self.low_logits = nn.Parameter(low_logits)
+        self.width_logits = nn.Parameter(width_logits)
+
+        # Fixed (non-learned) tap indices and Hamming window.
+        half = (self.kernel_size - 1) / 2.0
+        n = torch.arange(self.kernel_size, dtype=torch.float32) - half
+        idx = torch.arange(self.kernel_size, dtype=torch.float32)
+        window = 0.54 - 0.46 * torch.cos(2 * math.pi * idx / (self.kernel_size - 1))
+        self.register_buffer('tap_idx', n, persistent=False)      # (L,)
+        self.register_buffer('window', window, persistent=False)  # (L,)
+
+    def band_bounds(self):
+        """Return (low (K,), high (K,)) independent per-band cutoffs in Hz."""
+        span = self.nyquist - self.f_min - self.min_bw
+        low = self.f_min + torch.sigmoid(self.low_logits) * span
+        width = self.min_bw + torch.sigmoid(self.width_logits) * (self.nyquist - low - self.min_bw)
+        high = low + width
+        return low, high                                    # each (K,)
+
+    def _build_kernels(self, dtype):
+        low, high = self.band_bounds()                       # (K,), (K,)
+        f1 = (low / self.fs).unsqueeze(1)                    # (K,1) cycles/sample
+        f2 = (high / self.fs).unsqueeze(1)
+        n = self.tap_idx.to(low.device).unsqueeze(0)         # (1,L)
+        # Normalized-sinc low-pass (torch.sinc(x) = sin(pi x)/(pi x); value 1 at 0).
+        lp2 = 2 * f2 * torch.sinc(2 * f2 * n)
+        lp1 = 2 * f1 * torch.sinc(2 * f1 * n)
+        bp = (lp2 - lp1) * self.window.to(low.device).unsqueeze(0)  # (K,L)
+        return bp.unsqueeze(1).to(dtype)                     # (K,1,L)
+
+    def forward(self, x):
+        """x: (B, C, N, in_dim) raw patches -> (B, K, C, N, in_dim) band signals."""
+        B, C, N, d = x.shape
+        T = N * d
+        sig = x.reshape(B * C, 1, T)
+        kernels = self._build_kernels(x.dtype)               # (K,1,L)
+        bands = F.conv1d(sig, kernels, padding=self.kernel_size // 2)  # (B*C, K, T)
+        bands = bands.reshape(B, C, self.num_bands, T)
+        bands = bands.permute(0, 2, 1, 3).contiguous()       # (B, K, C, T)
+        return bands.reshape(B, self.num_bands, C, N, d)
+
+
+class CrossBandAttention(nn.Module):
+    """Mix information across the K band axis at each (channel, time) token.
+
+    Models cross-frequency coupling without the full band x scale Cartesian
+    product: a single multi-head attention over the length-K band sequence,
+    shared across all (channel, time) positions. ``out_proj`` is zero-init so
+    the layer is an identity at the start of training (the caller re-zeroes it
+    after the model's global ``apply(_weights_init)`` pass).
+    """
+
+    def __init__(self, d_model, nhead, dropout=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True)
+
+    def forward(self, x, B, K):
+        # x: (B*K, Cp, Np, d) -> attend over the K axis -> (B*K, Cp, Np, d)
+        BK, Cp, Np, d = x.shape
+        h = (x.view(B, K, Cp, Np, d)
+               .permute(0, 2, 3, 1, 4)              # (B, Cp, Np, K, d)
+               .reshape(B * Cp * Np, K, d))
+        h_n = self.norm(h)
+        h = h + self.attn(h_n, h_n, h_n, need_weights=False)[0]
+        return (h.reshape(B, Cp, Np, K, d)
+                 .permute(0, 3, 1, 2, 4)            # (B, K, Cp, Np, d)
+                 .reshape(B * K, Cp, Np, d))
+
+
 class CSBrainAlign(nn.Module):
     def __init__(self, in_dim=200, out_dim=200, d_model=200, dim_feedforward=800, seq_len=30, n_layer=12,
                  nhead=8, TemEmbed_kernel_sizes=[(1,), (3,), (5,)], brain_regions=[], sorted_indices=[],
@@ -589,7 +715,12 @@ class CSBrainAlign(nn.Module):
                  contrastive_proj_dim=64,
                  vision_encoder='facebook/dinov2-base',
                  image_pool_heads=4,
-                 use_volume_conduction=False, vc_tau_init=0.08):
+                 use_volume_conduction=False, vc_tau_init=0.08,
+                 use_spectral_bands=False, num_spectral_bands=4,
+                 fs=200, filterbank_kernel_size=101,
+                 filterbank_min_bw_hz=1.0, use_cross_band_attn=True,
+                 cross_band_every=1, use_band_type_embedding=True,
+                 num_visual_levels=3, band_decorr_weight=0.01):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
@@ -602,6 +733,19 @@ class CSBrainAlign(nn.Module):
         self.use_llm_vq = use_llm_vq
         self.num_language_tokens = num_language_tokens
         self.llm_vq_aux_weight = llm_vq_aux_weight
+
+        # --- Spectral-band config ---
+        # When enabled, a learnable filterbank splits the raw EEG into K bands;
+        # the bands are run (folded into the batch) through the SHARED encoder,
+        # mixed by an optional cross-band attention, fused for reconstruction,
+        # and aligned to multiple visual levels via a learned soft assignment.
+        self.use_spectral_bands = use_spectral_bands
+        self.num_spectral_bands = int(num_spectral_bands)
+        self.use_cross_band_attn = use_cross_band_attn
+        self.cross_band_every = max(int(cross_band_every), 1)
+        self.use_band_type_embedding = use_band_type_embedding
+        self.num_visual_levels = int(num_visual_levels) if use_spectral_bands else 1
+        self.band_decorr_weight = band_decorr_weight
 
         # --- MoE config ---
         self.use_moe = use_moe
@@ -792,9 +936,45 @@ class CSBrainAlign(nn.Module):
         self.features_by_layer = []
         self.input_features = []
 
-        self.num_visual_levels = 10
-        max_freq_bins = seq_len * in_dim // 2 + 1
-        self.freq_mask_logits = nn.Parameter(torch.zeros(self.num_visual_levels, max_freq_bins))
+        # --- Learnable spectral-band stream (optional) ---------------------
+        if self.use_spectral_bands:
+            if self.use_moe:
+                raise ValueError(
+                    "use_spectral_bands is mutually exclusive with use_moe in "
+                    "v1: the MoE frequency band-prior conflicts with an "
+                    "explicit learnable filterbank.")
+            if patch_embed_type != 'cnn':
+                raise ValueError(
+                    "use_spectral_bands currently requires patch_embed_type='cnn'.")
+            if not self.add_global:
+                raise ValueError(
+                    "use_spectral_bands requires add_global=True (per-band "
+                    "global tokens drive the multi-level alignment).")
+            K = self.num_spectral_bands
+            self.filterbank = LearnableFilterbank(
+                num_bands=K, fs=fs, kernel_size=filterbank_kernel_size,
+                min_bw_hz=filterbank_min_bw_hz,
+            )
+            # Per-band additive "type" embedding (zero-init => first step ~ baseline).
+            if self.use_band_type_embedding:
+                self.band_type_embed = nn.Parameter(torch.zeros(K, d_model))
+            # Cross-band attention at a subset of encoder layers.
+            if self.use_cross_band_attn:
+                self.cross_band_attn = nn.ModuleList([
+                    CrossBandAttention(d_model, nhead)
+                    if ((layer_idx + 1) % self.cross_band_every == 0) else None
+                    for layer_idx in range(n_layer)
+                ])
+            # Learned soft band->visual-level assignment, normalized over levels.
+            self.band_level_logits = nn.Parameter(
+                torch.zeros(K, self.num_visual_levels))
+            # Per-band projection into the (shared) image feature space.
+            self.band_align_proj = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, d_model), nn.GELU(),
+                    nn.Linear(d_model, self.image_feature_dim),
+                ) for _ in range(K)
+            ])
 
         hidden_ch_dim = 64
         semantic_arch = 'mlp' # 'mlp', 'attn_mlp', 'cnn'
@@ -837,6 +1017,15 @@ class CSBrainAlign(nn.Module):
             )
 
         self.apply(_weights_init)
+
+        # Zero-init cross-band attention out_proj AFTER the generic init pass so
+        # the band stream starts as an identity mix (controlled, near-baseline).
+        if self.use_spectral_bands and self.use_cross_band_attn:
+            for mod in self.cross_band_attn:
+                if mod is not None:
+                    nn.init.zeros_(mod.attn.out_proj.weight)
+                    if mod.attn.out_proj.bias is not None:
+                        nn.init.zeros_(mod.attn.out_proj.bias)
 
         self.features_by_layer = []
         self.input_features = []
@@ -917,71 +1106,204 @@ class CSBrainAlign(nn.Module):
         pe = pe.reshape(norm_coords.size(0), norm_coords.size(1), -1)
         return pe, finite_mask.squeeze(-1)
 
-    def _spectral_branches(self, patch_emb, image_hidden_states):
-        time_emb = patch_emb.view(patch_emb.size(0), patch_emb.size(1), -1)
-        spectral = torch.fft.rfft(time_emb, dim=-1, norm='forward')
+    @staticmethod
+    def _level_indices(num_blocks, n_levels):
+        """Pick ``n_levels`` shallow->deep block indices into ``hidden_states``.
 
-        masks = torch.sigmoid(self.freq_mask_logits[: image_hidden_states.size(-2), :]) # (num_visual_levels, n_freq_bins)
-        branch_spectral = spectral.unsqueeze(0) * masks.unsqueeze(1).unsqueeze(1) # (n_branch, B, n_ch, n_freq_bins)
-        branch_time = torch.fft.irfft(branch_spectral, norm='forward') # (n_branch, B, n_ch, seq_len)
-
-        branch_embeds = []
-        for i_branch in range(branch_time.size(0)):
-            branch_embed = branch_time[i_branch].view(*patch_emb.size())
-            for layer_idx in range(self.encoder_alignment.num_layers):
-                branch_embed = self.TemEmbedEEGLayer(branch_embed) + branch_embed
-                # branch_embed = self.BrainEmbedEEGLayer(branch_embed, self.area_config) + branch_embed
-                branch_embed = self.encoder_alignment.layers[layer_idx](branch_embed, self.area_config)
-            branch_embeds.append(branch_embed)
-        branch_embeds = torch.stack(branch_embeds, dim=1)
-
-        return branch_embeds
-    
-    @torch.no_grad()
-    def _vjepa2_patch_tokens(self, pixel_values):
-        """Run frozen V-JEPA 2 on a single still frame per sample.
-
-        ``pixel_values``: (B, 3, H, W). V-JEPA 2 expects a video tensor
-        ``pixel_values_videos`` of shape (B, T, C, H, W) with T divisible
-        by tubelet_size (default 2). We replicate the frame T=2 times so
-        the temporal patch count is 1.
-        Returns the last hidden state — (B, N_patches, image_feature_dim).
+        ``hidden_states`` has ``num_blocks + 1`` entries (index 0 = embeddings,
+        1..num_blocks = transformer blocks). n_levels=1 returns the final block
+        (matching the original ``hidden_states[12]`` behavior for DINOv2-base).
         """
-        pv = pixel_values.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()
-        outputs = self.pretrained_image_encoder(pixel_values_videos=pv)
-        return outputs.last_hidden_state  # (B, N, d_img)
+        if n_levels <= 1:
+            return [num_blocks]
+        return [max(1, round((i + 1) * num_blocks / n_levels)) for i in range(n_levels)]
 
     @torch.inference_mode()
-    def _dinov2_cls_token(self, image_encoder_inputs):
-        """Run frozen DINOv2-style ViT and return the CLS token at layer 12.
+    def _dinov2_cls_token(self, image_encoder_inputs, n_levels=1):
+        """Frozen DINOv2-style ViT CLS tokens at ``n_levels`` shallow->deep
+        depths. Returns (B, n_levels, d_img)."""
+        outputs = self.pretrained_image_encoder(
+            **image_encoder_inputs, output_hidden_states=True)
+        hs = outputs.hidden_states
+        idxs = self._level_indices(len(hs) - 1, n_levels)
+        return torch.stack([hs[i][:, 0] for i in idxs], dim=1)  # (B, L, d_img)
 
-        Mirrors the pre-VJEPA behavior: ``hidden_states[12][:, 0]``.
+    @torch.no_grad()
+    def _vjepa2_patch_tokens(self, pixel_values, n_levels=1):
+        """Run frozen V-JEPA 2 and attention-pool patch tokens at ``n_levels``
+        depths with the shared learned query. Returns (B, n_levels, d_img).
+
+        ``pixel_values``: (B, 3, H, W). V-JEPA 2 expects a video tensor; we
+        replicate the frame T=2 times so the temporal patch count is 1.
         """
-        outputs = self.pretrained_image_encoder(**image_encoder_inputs, output_hidden_states=True)
-        return outputs.hidden_states[12][:, 0]  # (B, d_img)
+        pv = pixel_values.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()
+        outputs = self.pretrained_image_encoder(
+            pixel_values_videos=pv, output_hidden_states=(n_levels > 1))
+        B = pv.size(0)
+        q = self.image_pool_query.expand(B, -1, -1)
+        if n_levels <= 1:
+            sources = [outputs.last_hidden_state]
+        else:
+            hs = outputs.hidden_states
+            sources = [hs[i] for i in self._level_indices(len(hs) - 1, n_levels)]
+        pooled = []
+        for tok in sources:
+            p, _ = self.image_pool_attn(q, tok, tok, need_weights=False)
+            pooled.append(self.image_pool_norm(p.squeeze(1)))  # (B, d_img)
+        return torch.stack(pooled, dim=1)  # (B, L, d_img)
 
-    def get_image_hidden_states(self, **image_encoder_inputs):
-        """Return (B, n_branch=1, image_feature_dim) for either encoder.
+    def get_image_hidden_states(self, n_levels=1, **image_encoder_inputs):
+        """Return (B, n_levels, image_feature_dim) for either encoder.
 
         Dispatches on ``self.encoder_kind``: V-JEPA 2 (no CLS) -> attention
-        pool over patch tokens with a learnable query; DINOv2-style ViTs ->
-        CLS token at layer 12 (the original pre-VJEPA path).
+        pool over patch tokens with the learned query; DINOv2-style ViTs ->
+        CLS token at the selected depths. ``n_levels=1`` reproduces the
+        original single-level behavior byte-for-byte.
         """
         if self.encoder_kind == 'vjepa2':
             pixel_values = image_encoder_inputs.get('pixel_values')
             assert pixel_values is not None, (
                 "V-JEPA 2 image encoder expects `pixel_values` in image_encoder_inputs"
             )
-            patch_tokens = self._vjepa2_patch_tokens(pixel_values)  # (B, N, d_img)
-            B = patch_tokens.size(0)
-            q = self.image_pool_query.expand(B, -1, -1)
-            pooled, _ = self.image_pool_attn(q, patch_tokens, patch_tokens, need_weights=False)
-            pooled = self.image_pool_norm(pooled.squeeze(1))  # (B, d_img)
-            return pooled.unsqueeze(1)  # (B, 1, d_img)
+            return self._vjepa2_patch_tokens(pixel_values, n_levels=n_levels)
         # DINOv2-style fallback (also covers any future ViT with a CLS token).
-        cls = self._dinov2_cls_token(image_encoder_inputs)  # (B, d_img)
-        return cls.unsqueeze(1)
+        return self._dinov2_cls_token(image_encoder_inputs, n_levels=n_levels)
 
+    # ------------------------------------------------------------------
+    # Learnable spectral-band stream
+    # ------------------------------------------------------------------
+    def _encode_spectral_bands(self, x, batch, mask, ch_coords):
+        """Decompose -> per-band embed (+band-type) -> shared encoder folded
+        over (B*K) with optional cross-band mixing -> fuse.
+
+        Returns:
+            global_rep:   (B, d)        mean over bands of the per-band globals
+            patch_tokens: (B, C, N, d)  fused (sum over bands) content tokens
+            band_global:  (B, K, d)     per-band global tokens (alignment / rep)
+        """
+        B, C, N, in_dim = x.shape
+        K, d = self.num_spectral_bands, self.d_model
+
+        # 1. Decompose raw EEG into K ordered bands.
+        band_sig = self.filterbank(x)                          # (B, K, C, N, in_dim)
+
+        # 2. Coordinate PE (shared across bands), computed once.
+        if self.use_volume_conduction:
+            coord_emb = self.volume_conduction(
+                ch_coords, valid_channel_mask=batch.get('valid_channel_mask', None))
+        else:
+            coord_pe, _ = self._spherical_positional_encoding(ch_coords)
+            coord_emb = self.coord_enhancement(coord_pe)        # (B, C, d)
+
+        # 3. Per-band patch embedding (shared) + coord PE + band-type embedding.
+        band_embs = []
+        for k in range(K):
+            emb_k = self.patch_embedding(band_sig[:, k], mask)  # (B, C, N, d)
+            emb_k = emb_k + coord_emb.unsqueeze(2)
+            if self.use_band_type_embedding:
+                emb_k = emb_k + self.band_type_embed[k].view(1, 1, 1, -1)
+            band_embs.append(emb_k)
+        patch_emb = torch.stack(band_embs, dim=1)               # (B, K, C, N, d)
+
+        # 4. Prepend global channel row + global time column (per band).
+        gch = self.global_channel.view(1, 1, 1, 1, -1).expand(B, K, 1, N, d)
+        patch_emb = torch.cat([gch, patch_emb], dim=2)          # (B, K, C+1, N, d)
+        Cp = patch_emb.size(2)
+        gtok = self.global_token.view(1, 1, 1, 1, -1).expand(B, K, Cp, 1, d)
+        patch_emb = torch.cat([gtok, patch_emb], dim=3)         # (B, K, C+1, N+1, d)
+        Np = patch_emb.size(3)
+
+        # 5. B-sized masks WITH prepended global rows (do NOT mutate batch — the
+        #    equivariance second pass reuses the originals).
+        def _expand(m, size):
+            m = torch.cat([torch.ones_like(m[:, :1], dtype=torch.bool), m], dim=1)
+            return m.unsqueeze(1).expand(B, K, size).reshape(B * K, size)
+        vcm_bk = _expand(batch['valid_channel_mask'], Cp) if 'valid_channel_mask' in batch else None
+        vlm_bk = _expand(batch['valid_length_mask'], Np) if 'valid_length_mask' in batch else None
+
+        # 6. Fold bands into the batch and run the shared encoder + cross-band mix.
+        h = patch_emb.reshape(B * K, Cp, Np, d)
+        h = self._run_band_encoder(
+            h, B, K,
+            iw_mask=~vlm_bk if vlm_bk is not None else None,
+            ir_mask=~vcm_bk if vcm_bk is not None else None,
+        )                                                       # (B*K, Cp, Np, d)
+
+        # 7. Unfold and split global / content.
+        h = h.view(B, K, Cp, Np, d)
+        band_global = h[:, :, 0, 0, :]                          # (B, K, d)
+        band_content = h[:, :, 1:, 1:, :]                       # (B, K, C, N, d)
+        global_rep = band_global.mean(dim=1)                    # (B, d)
+        patch_tokens = band_content.sum(dim=1)                  # (B, C, N, d)
+        return global_rep, patch_tokens, band_global
+
+    def _run_band_encoder(self, h, B, K, iw_mask, ir_mask):
+        """Run the shared encoder over folded (B*K) tokens, applying cross-band
+        attention at the configured subset of layers."""
+        for layer_idx in range(self.encoder.num_layers):
+            h = self.TemEmbedEEGLayer(h) + h
+            h = self.encoder.layers[layer_idx](
+                h, self.area_config,
+                inter_window_attn_mask=iw_mask,
+                inter_region_attn_mask=ir_mask,
+            )
+            if (self.use_cross_band_attn
+                    and self.cross_band_attn[layer_idx] is not None):
+                h = self.cross_band_attn[layer_idx](h, B, K)
+        return h
+
+    def _band_multilevel_align(self, band_global, batch, has_image):
+        """Align per-band globals to multiple visual levels via a learned soft
+        band->level assignment, with a band-decorrelation regularizer.
+
+        band_global: (B, K, d) full batch; ``has_image`` selects aligned rows.
+        Returns a loss/metric dict following the trainer's key conventions
+        ('loss'->(coef, tensor), 'acc'->tensor, 'diag_'->diagnostic).
+        """
+        img_inputs = {k: v[has_image] for k, v in batch['image_encoder_inputs'].items()}
+        image_hs = self.get_image_hidden_states(
+            n_levels=self.num_visual_levels, **img_inputs)      # (B_img, L, d_img)
+        bg = band_global[has_image]                             # (B_img, K, d)
+        B_img, K, _ = bg.shape
+        L = image_hs.size(1)
+
+        z = torch.stack([self.band_align_proj[k](bg[:, k]) for k in range(K)], dim=1)
+        z = F.normalize(z, dim=-1)                              # (B_img, K, d_img)
+        img = F.normalize(image_hs, dim=-1)                     # (B_img, L, d_img)
+
+        A = F.softmax(self.band_level_logits, dim=1)            # (K, L) over levels
+        temperature = 0.07
+        targets = torch.arange(B_img, device=bg.device)
+        out = {}
+        total = bg.new_zeros(())
+        total_acc = bg.new_zeros(())
+        for l in range(L):
+            eeg_l = F.normalize((A[:, l].view(1, K, 1) * z).sum(dim=1), dim=-1)
+            logits = (eeg_l @ img[:, l].t()) / temperature
+            loss_l = 0.5 * (F.cross_entropy(logits, targets)
+                            + F.cross_entropy(logits.t(), targets))
+            total = total + loss_l
+            with torch.no_grad():
+                acc = 0.5 * ((logits.argmax(1) == targets).float().mean()
+                             + (logits.argmax(0) == targets).float().mean())
+            total_acc = total_acc + acc
+            out[f"band_align_acc_level{l}"] = acc
+        out["band_align_loss"] = (self.alignment_weight, total / L)
+        out["band_align_acc_total"] = total_acc / L
+
+        if self.band_decorr_weight > 0:
+            zc = F.normalize(z - z.mean(dim=0, keepdim=True), dim=-1)
+            gram = torch.einsum('bkd,bjd->kj', zc, zc) / B_img
+            eye = torch.eye(K, device=zc.device)
+            decorr = (gram * (1 - eye)).pow(2).sum() / max(K * (K - 1), 1)
+            out["band_decorr_loss"] = (self.band_decorr_weight, decorr)
+
+        with torch.no_grad():
+            low, high = self.filterbank.band_bounds()
+            out["diag_band_level_assignment"] = A.detach()
+            out["diag_band_low_hz"] = low.detach()
+            out["diag_band_high_hz"] = high.detach()
+        return out
 
     # ------------------------------------------------------------------
     # Hemispheric equivariance helpers
@@ -1195,6 +1517,20 @@ class CSBrainAlign(nn.Module):
                 pred_flatten = self.contrastive_proj(semantic_emb)
                 contrastive_loss.update(
                     self._image_contrastive(pred_flatten, batch, has_image))
+        elif self.use_spectral_bands:
+            # Learnable-filterbank band stream: decompose -> per-band embed
+            # (+ band-type) -> shared encoder folded over (B*K) with optional
+            # cross-band mixing -> fuse. Replaces the standard encoder path.
+            global_rep, patch_tokens, band_global = self._encode_spectral_bands(
+                x, batch, mask, ch_coords)
+            branch_embs = band_global  # (B, K, d) -> stored as info['rep']
+            has_image = batch.get('has_image', None)
+            if (not encoder_only
+                    and 'image_encoder_inputs' in batch
+                    and has_image is not None and has_image.any()
+                    and self.alignment_weight > 0):
+                contrastive_loss.update(
+                    self._band_multilevel_align(band_global, batch, has_image))
         else:
             if self.use_volume_conduction:
                 coord_emb = self.volume_conduction(
@@ -1320,6 +1656,9 @@ class CSBrainAlign(nn.Module):
             out = self.source_projector.inverse(patch_tokens, ch_coords,
                                                 valid_channel_mask=valid_ch)
             out = self.proj_out(out)
+        elif self.use_spectral_bands:
+            # patch_tokens is already the fused (B, C, N, d) content (no global rows).
+            out = self.proj_out(patch_tokens)
         else:
             out = self.proj_out(patch_emb)
             if self.add_global:

@@ -168,6 +168,8 @@ class EgoBrainDataset(Dataset):
         max_channels: Optional[int] = None,
         frames_cache_dir: Optional[str] = None,
         ea_matrices: Optional[dict] = None,
+        delta_whiten_g0: float = 1.0,
+        delta_whiten_cutoff_hz: float = 8.0,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -193,6 +195,17 @@ class EgoBrainDataset(Dataset):
         # EEG cache; see datasets/compute_ea.py + euclidean_alignment.py.
         self.ea_matrices = ea_matrices
 
+        # ME->MI "rank-1 delta whitening": a per-channel low-frequency gain
+        # (g0 at DC, raised-cosine ramp to 1.0 at delta_whiten_cutoff_hz) that
+        # attenuates EgoBrain's motor-execution delta floor toward the shallower
+        # motor-imagery (PhysioNet-MI) level. g0>=1.0 is a no-op (default off).
+        # Applied in _load_clip after channel selection. See utils.util
+        # .apply_delta_whiten and project_me_mi_pretrain_manipulation. NOTE: do
+        # not combine with EA without recomputing the EA matrices on the
+        # whitened signal (whitening changes the channel covariance).
+        self.delta_whiten_g0 = delta_whiten_g0
+        self.delta_whiten_cutoff_hz = delta_whiten_cutoff_hz
+
         # If a per-subject HDF5 frame cache exists with attrs matching the
         # current configuration, use the fast path in __getitem__ that
         # reads pre-decoded uint8 frames instead of seeking into the
@@ -209,6 +222,22 @@ class EgoBrainDataset(Dataset):
         self.frames_cache_dir = frames_cache_dir
         self.use_frames_cache = (load_frames and
                                  os.path.isdir(frames_cache_dir))
+        if load_frames and not self.use_frames_cache:
+            # Live-decoding 4-5 GB GoPro MP4s on the fly is slow AND
+            # memory-heavy — it OOM-kills DataLoader workers at scale. The
+            # cache is mandatory; fail fast instead of silently falling back.
+            raise FileNotFoundError(
+                f"[EgoBrain] frame cache not found at '{frames_cache_dir}'.\n"
+                f"  Live GoPro MP4 decode is disabled (too slow / OOMs at "
+                f"scale). Build the cache once with:\n"
+                f"    conda run -n cbramod python -m datasets.egobrain_extract_frames \\\n"
+                f"      --data_dir {data_dir} --subjects all \\\n"
+                f"      --vision_encoder {vision_encoder} \\\n"
+                f"      --window_s {window_s} --stride_s {stride_s} "
+                f"--erp_latency_s {erp_latency_s} --n_windows {n_windows} "
+                f"--num_workers 12\n"
+                f"  (window/stride/erp/n_windows must match this run, or the "
+                f"cache dir name won't match.)")
 
         assert self.window_samples % in_dim == 0, (
             f"window_samples={self.window_samples} must be a multiple of "
@@ -294,6 +323,11 @@ class EgoBrainDataset(Dataset):
         if self.ea_matrices is not None and sub in self.ea_matrices:
             from datasets.euclidean_alignment import apply_ea
             arr = apply_ea(arr, self.ea_matrices[sub])
+        if self.delta_whiten_g0 is not None and self.delta_whiten_g0 < 1.0:
+            from utils.util import apply_delta_whiten
+            arr = apply_delta_whiten(
+                arr, self.fs_out, self.delta_whiten_g0,
+                self.delta_whiten_cutoff_hz)
         return arr
 
     def _video_chapters(self, sub: str) -> list[dict]:

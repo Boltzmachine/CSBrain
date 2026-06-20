@@ -53,6 +53,22 @@ def main():
                         help='number of equal-width frequency bands to split the rFFT axis into for masked-frequency-band reconstruction')
     parser.add_argument('--band_mask_ratio', type=float, default=None,
                         help='fraction of bands to mask per sample for masked-frequency-band reconstruction; k=max(1, round(freq_recon_n_bands * band_mask_ratio)). None (default) keeps the legacy behavior of masking exactly 1 band per sample.')
+    parser.add_argument('--recon_band_split', action='store_true', default=False,
+                        help='reconstruct only the LOW-frequency part of the masked patches (raw signal / time domain): rFFT bins with f >= --recon_phase_cutoff_hz are dropped, so delta-band waveform (phase informative) is reconstructed while induced mu/beta (unpredictable phase) is not penalised. Loss is MSE per retained DOF, so scale stays comparable and a large cutoff reproduces plain MSE exactly. Default off = legacy time-domain MSE. Bin width = --fs / --in_dim.')
+    parser.add_argument('--recon_phase_cutoff_hz', type=float, default=8.0,
+                        help='reconstruct frequencies strictly BELOW this (Hz) in --recon_band_split; a large value (>= Nyquist) or +inf reproduces the plain MSE bit-for-bit, smaller keeps less (only the slow/evoked band).')
+    parser.add_argument('--recon_power_weight', type=float, default=1.0,
+                        help='(unused in the current low-freq-only --recon_band_split; kept for back-compat).')
+    parser.add_argument('--aux_band_pred', action='store_true', default=False,
+                        help='ON TOP of the plain masked MSE, add Hilbert-derived band targets on the masked patches: instantaneous PHASE agreement for the delta band (--aux_delta_band, amplitude-weighted) and POWER-ENVELOPE matching for mu/beta (--aux_power_bands, scale-free relative MSE). Phase is informative at low freq; induced mu/beta phase is not, so only their band-power time course (ERD/ERS) is scored. Targets are computed on the model-completed waveform (true signal at visible patches, predictions at masked ones). See utils.util.band_phase_envelope_loss. Uses --fs for band edges.')
+    parser.add_argument('--aux_delta_band', type=str, default='0.5,4',
+                        help='lo,hi Hz of the delta band whose instantaneous phase is predicted in --aux_band_pred.')
+    parser.add_argument('--aux_power_bands', type=str, default='8,13;13,30',
+                        help='semicolon-separated lo,hi Hz bands (default mu 8-13 and beta 13-30) whose instantaneous power envelope is predicted in --aux_band_pred; the relative-MSE term is averaged across them.')
+    parser.add_argument('--aux_phase_weight', type=float, default=1.0,
+                        help='weight of the delta-phase auxiliary loss in --aux_band_pred. Raw phase loss is a bounded amplitude-weighted cosine distance and runs small (~0.01-0.05 once delta is reconstructed), so the default 1.0 makes its weighted contribution ~20%% of the plain mask_loss at convergence. Watch aux_phase_loss in wandb and retune so weight*aux_phase_loss sits ~10-30%% of mask_loss.')
+    parser.add_argument('--aux_envelope_weight', type=float, default=0.005,
+                        help='weight of the mu/beta power-envelope auxiliary loss in --aux_band_pred. Raw env loss is a log-power (dB-style) MSE and runs large (~1-10), so the default 0.005 makes its weighted contribution ~40%% of the plain mask_loss at convergence. Watch aux_env_loss in wandb and retune so weight*aux_env_loss sits ~10-40%% of mask_loss.')
     parser.add_argument('--dataset_dir', type=str, default='path/to/dataset', help='dataset_dir')
     parser.add_argument('--model_dir', type=str, default='outputs', help='model_dir') # eg. 'CSBrain/pth'
     parser.add_argument('--TemEmbed_kernel_sizes', type=str, default="[(1,), (3,), (5,)]")
@@ -185,6 +201,37 @@ def main():
     parser.add_argument('--egobrain_load_frames', type=int, default=1, help='whether to decode raw video frames (0 disables the alignment term)')
     parser.add_argument('--egobrain_max_channels', type=int, default=32, help='cap on the EgoBrain channel count after 10-20 montage filtering')
     parser.add_argument('--mix_egobrain_weight', type=float, default=1.0, help='sampling weight for EgoBrain in the mix+egobrain dataset')
+    parser.add_argument('--egobrain_delta_whiten_g0', type=float, default=1.0,
+                        help='ME->MI delta-whitening DC gain: per-channel low-freq gain at 0 Hz, '
+                             'raised-cosine ramp up to 1.0 at --egobrain_delta_whiten_cutoff_hz '
+                             '(bins above the cutoff are untouched; per-channel RMS is preserved). '
+                             '1.0 = OFF (no-op). ~0.60-0.78 (pipeline-dependent) attenuates the motor-execution delta '
+                             'floor toward the motor-imagery level; calibrate to the finetune LMDB '
+                             'MI delta level (~46 montage / ~42 central, in percent), do NOT '
+                             'overshoot below it. See project_me_mi_pretrain_manipulation.')
+    parser.add_argument('--egobrain_delta_whiten_cutoff_hz', type=float, default=8.0,
+                        help='upper edge (Hz) of the ME->MI delta-whitening ramp.')
+
+    # --- ActionWorldModel (EEG=action, frozen V-JEPA 2=world) ---
+    parser.add_argument('--eeg_ckpt', type=str, default=None,
+                        help='optional pretraining checkpoint (e.g. masked recon) to warm-start the ActionWorldModel EEG backbone')
+    parser.add_argument('--action_dim', type=int, default=64,
+                        help='dimension of each EEG-decoded action ("moving intention") token')
+    parser.add_argument('--n_action_tokens', type=int, default=8,
+                        help='number of action tokens the EEG action head emits')
+    parser.add_argument('--action_pool_heads', type=int, default=4,
+                        help='attention heads in the EEG action-pooling head')
+    parser.add_argument('--pred_residual', action='store_true', default=False,
+                        help='ActionPredictor predicts the residual s_t + delta (guards against the trivial copy solution)')
+    parser.add_argument('--pred_l1_weight', type=float, default=1.0,
+                        help='weight on the L1 next-world-state prediction loss')
+    parser.add_argument('--pred_cos_weight', type=float, default=0.0,
+                        help='weight on the (1-cosine) auxiliary prediction loss')
+    parser.add_argument('--recon_aux_weight', type=float, default=0.0,
+                        help='ActionWorldModel: weight on the OPTIONAL masked-patch reconstruction co-objective '
+                             '(done as a separate masked EEG forward so the action stays decoded from the full '
+                             'window). 0 disables it. Uses --mask_ratio. Alternatively leave --need_mask on to '
+                             'route recon through the trainer mask_loss instead.')
 
     # --- Euclidean Alignment (per-subject whitening, arXiv:2601.17883 Eq 9-10) ---
     parser.add_argument('--use_euclidean_alignment', action='store_true', default=False,
@@ -462,6 +509,8 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             ea_matrices=ea_egobrain,
+            delta_whiten_g0=params.egobrain_delta_whiten_g0,
+            delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
         )
         print('EgoBrain clips:', len(egobrain_inner))
         egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
@@ -531,6 +580,8 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             ea_matrices=ea_egobrain,
+            delta_whiten_g0=params.egobrain_delta_whiten_g0,
+            delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
         )
         print('EgoBrain clips:', len(egobrain_inner))
         egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
@@ -581,6 +632,8 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             ea_matrices=ea_egobrain,
+            delta_whiten_g0=params.egobrain_delta_whiten_g0,
+            delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
         )
         print('EgoBrain clips:', len(pretrained_dataset))
         num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0

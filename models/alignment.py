@@ -1169,6 +1169,36 @@ class CSBrainAlign(nn.Module):
         # DINOv2-style fallback (also covers any future ViT with a CLS token).
         return self._dinov2_cls_token(image_encoder_inputs, n_levels=n_levels)
 
+    @torch.no_grad()
+    def vjepa2_grid_tokens(self, pixel_values):
+        """Frozen V-JEPA 2 *un-pooled* spatial patch-token grid for a single
+        static frame — the "world state" used by the action-conditioned world
+        model (see ``models/action_world_model.py``).
+
+        ``pixel_values``: (B, 3, H, W). V-JEPA 2 is natively a video tubelet
+        model; we replicate the single frame T=2 times so the temporal patch
+        count collapses to 1, leaving a purely *spatial* grid
+        ``(B, P, image_feature_dim)`` with ``P = (H/patch)*(W/patch)`` (256 for
+        a 256x256 frame at patch=16). Unlike :meth:`_vjepa2_patch_tokens` this
+        returns the full token grid rather than the attention-pooled vector.
+
+        The encoder is frozen at construction; we additionally force ``eval()``
+        for the duration of the call so that an enclosing ``.train()`` on the
+        owning module cannot re-enable any dropout inside the ViT.
+        """
+        assert self.encoder_kind == 'vjepa2', (
+            "vjepa2_grid_tokens requires a V-JEPA 2 vision encoder, got "
+            f"'{self.encoder_kind}'")
+        was_training = self.pretrained_image_encoder.training
+        self.pretrained_image_encoder.eval()
+        try:
+            pv = pixel_values.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()
+            outputs = self.pretrained_image_encoder(pixel_values_videos=pv)
+            return outputs.last_hidden_state  # (B, P, image_feature_dim)
+        finally:
+            if was_training:
+                self.pretrained_image_encoder.train()
+
     # ------------------------------------------------------------------
     # Learnable spectral-band stream
     # ------------------------------------------------------------------

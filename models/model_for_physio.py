@@ -81,22 +81,24 @@ class Model(nn.Module):
             # DataParallel wrapping
             state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
-            # --- Handle WorldModelWrapper checkpoints ---
-            # WorldModelWrapper wraps a CSBrainAlign under "encoder." and
-            # (optionally) a LatentPredictor under "predictor.". Finetuning
-            # only uses the encoder: strip the prefix and drop anything that
-            # doesn't belong to it. CSBrainAlign itself has a top-level
-            # ``encoder`` submodule (the transformer stack), so we can't key
-            # off ``encoder.`` alone -- look for keys that only exist under
-            # the wrapper, e.g. ``encoder.patch_embed.`` or ``predictor.``.
-            is_world_model_ckpt = any(
-                k.startswith("encoder.patch_embed.")
-                or k.startswith("encoder.TemEmbedEEGLayer.")
-                or k.startswith("predictor.")
-                for k in state_dict
-            )
-            if is_world_model_ckpt:
+            # --- Handle world-model wrapper checkpoints ---
+            # Both wrappers store the CSBrainAlign EEG backbone under a prefix,
+            # alongside extra heads we discard when finetuning the encoder:
+            #   WorldModel       -> "encoder."  (+ predictor.)
+            #   ActionWorldModel -> "eeg."      (+ predictor., action_head.)
+            # CSBrainAlign itself has a top-level ``encoder`` submodule (the
+            # transformer stack), so we can't key off ``encoder.`` alone --
+            # use the ``TemEmbedEEGLayer`` sentinel, which only exists directly
+            # under the wrapper's backbone prefix. (ActionWorldModel also has
+            # ``predictor.`` keys, so detecting on ``predictor.`` would
+            # mis-route it to the ``encoder.`` strip and wipe the state dict.)
+            if any(k.startswith("eeg.TemEmbedEEGLayer.") for k in state_dict):
+                use_prefix = "eeg."
+            elif any(k.startswith("encoder.TemEmbedEEGLayer.") for k in state_dict):
                 use_prefix = "encoder."
+            else:
+                use_prefix = None
+            if use_prefix is not None:
                 state_dict = {
                     k[len(use_prefix):]: v
                     for k, v in state_dict.items()
@@ -173,9 +175,20 @@ class Model(nn.Module):
             # n_starts = seq_len - seg_len + 1
             n_starts = 1
 
+            # Which seg_len-patch segment to crop along the time axis. 0 keeps
+            # the original first/native-window behaviour; >0 selects a later
+            # second of the trial (e.g. for PhysioNet's 4s/20-patch input,
+            # segment_index 0..3 -> seconds 1..4).
+            seg_idx = getattr(self.param, 'segment_index', 0)
+            seg_start = seg_idx * seg_len
+            if seg_start + seg_len > seq_len:
+                raise ValueError(
+                    f"segment_index={seg_idx} (start patch {seg_start}, "
+                    f"seg_len {seg_len}) exceeds input time dim {seq_len}")
+
             if n_starts <= 1:
                 # The input already matches seg_len; nothing to crop or ensemble.
-                x = x[:, :, :seg_len, :].contiguous()
+                x = x[:, :, seg_start:seg_start + seg_len, :].contiguous()
                 batch['timeseries'] = x
                 feats = self.backbone(batch)
                 if not isinstance(feats, tuple):

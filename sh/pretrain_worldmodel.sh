@@ -29,10 +29,17 @@
 # the multinomial mix; weights for unused sources are ignored.
 # Each source has its own --{cinebrain,egobrain}_* knobs below; the unused
 # block is ignored by the active branch, so it's safe to leave them all set.
+#
+# --egobrain_delta_whiten_g0 (ME->MI delta whitening): 1.0 = OFF. Set ~0.65-0.78
+# to attenuate EgoBrain's motor-execution delta floor toward the motor-imagery
+# (PhysioNet-MI) level. CALIBRATE g0 to the finetune LMDB MI delta (~46 montage /
+# ~42 central, in percent) with a quick scipy.welch sweep; too-strong a gain
+# overshoots past MI and HURTS. See project_me_mi_pretrain_manipulation.
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --dataset_dir mix+egobrain \
+    --egobrain_n_windows 2 \
     --mix_alljoined_weight 1.0 \
     --mix_cinebrain_weight 1.0 \
     --mix_egobrain_weight 1.0 \
@@ -68,5 +75,4 @@ python pretrain_main.py \
     --predictor_n_layers 4 \
     --model_dir outputs/ \
     --spectral_mode instantaneous \
-    --use_spectral_bands --num_spectral_bands 10 --num_visual_levels 3 \
-    --run_name wm-mix-egobrain-bands-10
+    --run_name wm-mix-reproduce

@@ -90,10 +90,16 @@ def main():
                              '(e.g. world-model pretraining with seq_len=5 applied '
                              'to PhysioNet with time dim 20).')
     parser.add_argument('--use_initial_segment_only', action='store_true', default=False,
-                        help='truncate the finetune input to the first seq_len patches '
-                             '(i.e. the pretrained model native window) instead of '
-                             'processing the full time dim. Takes precedence over '
+                        help='truncate the finetune input to a single seq_len-patch '
+                             'segment (i.e. the pretrained model native window) instead '
+                             'of processing the full time dim. Which segment is chosen '
+                             'is controlled by --segment_index. Takes precedence over '
                              '--segment_forward when both are set.')
+    parser.add_argument('--segment_index', type=int, default=0,
+                        help='with --use_initial_segment_only, index of the seq_len-patch '
+                             'segment to crop along the time axis (0 = first/native window). '
+                             'E.g. for a 4s PhysioNet trial with a 1s pretrained window, '
+                             'segment_index 0..3 selects seconds 1..4.')
 
     # --- SSM/Mamba multi-frequency patch embedding ---
     parser.add_argument('--patch_embed_type', type=str, default='cnn', choices=['cnn', 'mamba'],
@@ -123,6 +129,10 @@ def main():
 
     # --- Learnable spectral-band backbone (must match the pretrained checkpoint) ---
     parser.add_argument('--fs', type=int, default=200, help='sampling rate (Hz) for the learnable filterbank')
+    parser.add_argument('--highpass_hz', type=float, default=0.0,
+                        help='zero-phase high-pass cutoff in Hz applied to the input before '
+                             'patching (0 = off). E.g. 7 strips delta/theta + slow cue-locked '
+                             'evoked drift, keeping mu/beta. Currently wired into PhysioNet.')
     parser.add_argument('--use_spectral_bands', action='store_true', default=False,
                         help='use the learnable SincNet-style filterbank + cross-band + multi-level-alignment backbone (must match pretraining)')
     parser.add_argument('--num_spectral_bands', type=int, default=4, help='number of learnable frequency bands K')

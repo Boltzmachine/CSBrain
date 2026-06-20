@@ -23,6 +23,41 @@ def _spectral_band_kwargs(params):
     )
 
 
+def _load_eeg_ckpt(encoder, ckpt_path):
+    """Warm-start a ``CSBrainAlign`` EEG backbone from a pretraining
+    checkpoint (e.g. masked-patch reconstruction).
+
+    Mirrors the prefix-normalisation in ``models/model_for_physio.py``: drops
+    the ``module.`` (DataParallel) prefix and, for WorldModel /
+    ActionWorldModel wrapper checkpoints, the wrapper's ``encoder.`` / ``eeg.``
+    prefix (detected via the ``TemEmbedEEGLayer`` sentinel, which only appears
+    under a wrapper). Then keeps only keys whose name *and shape* match the
+    target backbone — this forgivingly skips the frozen vision encoder and
+    alignment-only heads (whose dims depend on the vision model) so a DINOv2
+    recon checkpoint can warm-start a V-JEPA 2 ActionWorldModel encoder.
+    """
+    if not ckpt_path:
+        return
+    from utils.util import load_pretrain_checkpoint
+    state_dict, _ = load_pretrain_checkpoint(ckpt_path)
+    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    for prefix in ('encoder.', 'eeg.'):
+        if any(k.startswith(prefix + 'TemEmbedEEGLayer.') for k in state_dict):
+            state_dict = {k[len(prefix):]: v for k, v in state_dict.items()
+                          if k.startswith(prefix)}
+            break
+    model_sd = encoder.state_dict()
+    filtered = {k: v for k, v in state_dict.items()
+                if k in model_sd and model_sd[k].shape == v.shape}
+    encoder.load_state_dict(filtered, strict=False)
+    print(f"[ActionWorldModel] warm-start from {ckpt_path}: loaded "
+          f"{len(filtered)}/{len(model_sd)} backbone tensors "
+          f"({len(state_dict) - len(filtered)} ckpt keys skipped)")
+    if len(filtered) < 0.3 * len(model_sd):
+        print("[ActionWorldModel] WARNING: <30% of the backbone matched the "
+              "checkpoint — check that --eeg_ckpt encoder arch args agree.")
+
+
 def get_model(params, brain_regions, sorted_indices):
     if params.model == 'CSBrain':
         from .CSBrain import CSBrain
@@ -177,6 +212,90 @@ def get_model(params, brain_regions, sorted_indices):
             max_horizon=max_horizon,
             ramp_epochs=getattr(params, 'pred_ramp_epochs', 2),
             target_momentum=getattr(params, 'target_momentum', 0.998),
+        )
+        return model
+    elif params.model == 'ActionWorldModel':
+        # Action-conditioned world model: EEG = action, frozen V-JEPA 2 =
+        # world. See models/action_world_model.py and plans/world_model.md.
+        from .alignment import CSBrainAlign
+        from .action_world_model import (
+            ActionHead, ActionPredictor, ActionWorldModelWrapper,
+        )
+        _mbp = getattr(params, 'mamba_band_periods', None)
+        if isinstance(_mbp, str) and _mbp:
+            _mbp = eval(_mbp)
+        # EEG backbone. Alignment / equivariance / info-max are OFF — this
+        # paradigm has no image-contrastive term; the EEG net only decodes the
+        # action latent. The frozen V-JEPA 2 lives inside as
+        # ``pretrained_image_encoder`` and supplies the world states.
+        eeg = CSBrainAlign(
+            params.in_dim, params.out_dim, params.d_model, params.dim_feedforward,
+            params.seq_len, params.n_layer, params.nhead,
+            eval(params.TemEmbed_kernel_sizes),
+            brain_regions=None,
+            causal=getattr(params, 'causal', False),
+            project_to_source=getattr(params, 'project_to_source', False),
+            num_sources=getattr(params, 'num_sources', 32),
+            source_projector_ckpt=getattr(params, 'source_projector_ckpt', None),
+            freeze_source_projector=getattr(params, 'freeze_source_projector', False),
+            adversarial_weight=0.0,
+            equivariance_weight=0.0,
+            info_max_weight=0.0,
+            alignment_weight=0.0,
+            patch_embed_type=getattr(params, 'patch_embed_type', 'cnn'),
+            mamba_band_periods=_mbp,
+            n_mamba_layers=getattr(params, 'n_mamba_layers', 2),
+            mamba_d_state=getattr(params, 'mamba_d_state', 16),
+            mamba_d_conv=getattr(params, 'mamba_d_conv', 4),
+            mamba_expand=getattr(params, 'mamba_expand', 2),
+            use_llm_vq=getattr(params, 'use_llm_vq', False),
+            spectral_mode=getattr(params, 'spectral_mode', 'static'),
+            stft_n_fft=getattr(params, 'stft_n_fft', 64),
+            stft_hop=getattr(params, 'stft_hop', 1),
+            use_moe=getattr(params, 'use_moe', False),
+            num_experts=getattr(params, 'num_experts', 4),
+            moe_top_k=getattr(params, 'moe_top_k', 2),
+            moe_gate_input_dim=getattr(params, 'moe_gate_input_dim', 32),
+            moe_balance_weight=getattr(params, 'moe_balance_weight', 0.01),
+            moe_band_prior_weight=getattr(params, 'moe_band_prior_weight', 0.1),
+            moe_z_loss_weight=getattr(params, 'moe_z_loss_weight', 1e-3),
+            vision_encoder=getattr(
+                params, 'vision_encoder', 'facebook/vjepa2-vitl-fpc64-256'),
+            image_pool_heads=getattr(params, 'image_pool_heads', 4),
+            use_volume_conduction=getattr(params, 'use_volume_conduction', False),
+            vc_tau_init=getattr(params, 'vc_tau_init', 0.08),
+            **_spectral_band_kwargs(params),
+        )
+        _load_eeg_ckpt(eeg, getattr(params, 'eeg_ckpt', None))
+
+        max_horizon = getattr(params, 'max_horizon', 1)
+        action_dim = getattr(params, 'action_dim', 64)
+        action_head = ActionHead(
+            d_model=params.d_model,
+            action_dim=action_dim,
+            n_action_tokens=getattr(params, 'n_action_tokens', 8),
+            n_heads=getattr(params, 'action_pool_heads', 4),
+        )
+        predictor = ActionPredictor(
+            world_dim=eeg.image_feature_dim,
+            action_dim=action_dim,
+            predictor_d_model=getattr(params, 'predictor_d_model', 512),
+            n_layers=getattr(params, 'predictor_n_layers', 4),
+            n_heads=getattr(params, 'predictor_n_heads', 8),
+            dim_feedforward=getattr(params, 'predictor_dim_feedforward', 1024),
+            dropout=getattr(params, 'dropout', 0.1),
+            max_horizon=max(max_horizon, 1),
+            pred_residual=bool(getattr(params, 'pred_residual', False)),
+        )
+        model = ActionWorldModelWrapper(
+            eeg=eeg,
+            predictor=predictor,
+            action_head=action_head,
+            pred_l1_weight=getattr(params, 'pred_l1_weight', 1.0),
+            pred_cos_weight=getattr(params, 'pred_cos_weight', 0.0),
+            max_horizon=max_horizon,
+            recon_aux_weight=getattr(params, 'recon_aux_weight', 0.0),
+            recon_mask_ratio=getattr(params, 'mask_ratio', 0.5),
         )
         return model
     elif params.model == 'Spectral':

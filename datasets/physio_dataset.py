@@ -15,6 +15,8 @@ class CustomDataset(Dataset):
             mode='train',
             flip_aug=False,
             ea_matrices=None,
+            highpass_hz=0.0,
+            fs=200,
     ):
         super(CustomDataset, self).__init__()
         self.db = lmdb.open(data_dir, readonly=True, lock=False, readahead=True, meminit=False)
@@ -24,6 +26,19 @@ class CustomDataset(Dataset):
         # 'SXXX' subject id, parsed from the LMDB key prefix). When set,
         # whitening is applied in __getitem__ before the /100 rescale.
         self.ea_matrices = ea_matrices
+
+        # Optional zero-phase high-pass to strip sub-``highpass_hz`` content
+        # (e.g. 7 Hz to remove delta/theta + slow cue-locked evoked drift and
+        # keep mu/beta motor-imagery rhythms). Coefficients are precomputed
+        # once; the filter is applied along the flattened time axis in
+        # __getitem__. 0/None disables it.
+        self.highpass_hz = float(highpass_hz or 0.0)
+        self.fs = fs
+        self._hp_sos = None
+        if self.highpass_hz > 0:
+            from scipy.signal import butter
+            self._hp_sos = butter(4, self.highpass_hz / (fs / 2.0),
+                                  btype='high', output='sos')
 
         # Hemisphere-flip augmentation (training only).
         # Swaps homologous electrode pairs and relabels left↔right fist.
@@ -47,6 +62,16 @@ class CustomDataset(Dataset):
             pair = pickle.loads(txn.get(key.encode()))
         data = pair['sample']
         label = pair['label']
+
+        # --- high-pass filter (optional) ---
+        # Zero-phase Butterworth along the continuous time axis. Sample is
+        # (C, n_windows, T); flatten windows*T so the filter sees the trial
+        # as one contiguous series, then restore the shape.
+        if self._hp_sos is not None:
+            from scipy.signal import sosfiltfilt
+            C, W, T = data.shape
+            filtered = sosfiltfilt(self._hp_sos, data.reshape(C, W * T), axis=-1)
+            data = np.ascontiguousarray(filtered, dtype=data.dtype).reshape(C, W, T)
 
         # --- hemisphere-flip augmentation ---
         if self.flip_aug and random.random() < 0.5:
@@ -100,14 +125,20 @@ class LoadDataset(object):
                 self.datasets_dir, 'ea_subject.pt')
             self.ea_matrices = load_ea_matrices(ea_path)
 
+        self.highpass_hz = getattr(params, 'highpass_hz', 0.0)
+        self.fs = getattr(params, 'fs', 200)
+
     def get_data_loader(self):
         train_set = CustomDataset(self.datasets_dir, mode='train',
                                   flip_aug=self.flip_aug,
-                                  ea_matrices=self.ea_matrices)
+                                  ea_matrices=self.ea_matrices,
+                                  highpass_hz=self.highpass_hz, fs=self.fs)
         val_set = CustomDataset(self.datasets_dir, mode='val',
-                                ea_matrices=self.ea_matrices)
+                                ea_matrices=self.ea_matrices,
+                                highpass_hz=self.highpass_hz, fs=self.fs)
         test_set = CustomDataset(self.datasets_dir, mode='test',
-                                 ea_matrices=self.ea_matrices)
+                                 ea_matrices=self.ea_matrices,
+                                 highpass_hz=self.highpass_hz, fs=self.fs)
         print(len(train_set), len(val_set), len(test_set))
         print(len(train_set)+len(val_set)+len(test_set))
         data_loader = {

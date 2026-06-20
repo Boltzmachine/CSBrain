@@ -144,3 +144,10 @@ python pretrain_main.py \
 #     --local_crop_time_scale "(0.3, 0.7)" \
 #     --local_crop_channel_scale "(0.5, 1.0)" \
 #     --run_name dino-v2-multicrop-v2
+
+# ============================================================
+# Action-conditioned world model (EEG = action, frozen V-JEPA 2 = world).
+# Full launch + prerequisites live in sh/pretrain_actionworldmodel.sh.
+#   --model ActionWorldModel --dataset_dir egobrain \
+#   --vision_encoder facebook/vjepa2-vitl-fpc64-256 --need_mask '' --max_horizon 1
+# See plans/world_model.md (Action-Conditioned variant).

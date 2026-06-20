@@ -120,6 +120,8 @@ with `K_max=1`, ramp to 4 once losses are stable.
   in-model `self.pretrained_image_encoder` at train time, the same path
   the current alignment loss uses — no separate cache file.
 
+(update: change to egobrain)
+
 ### Window size / stride (reconsidered with EEG domain knowledge)
 
 Constraints from EEG:
@@ -209,3 +211,68 @@ raw.notch_filter((60))
 
 ## Dataset
 The dataset is downloaded into `data/CineBrain`. Refer to the official codebase `./CineBrain` for potential data loading pipeline.
+---
+
+## Action-Conditioned variant (EEG = action, V-JEPA 2 = world)
+
+The design above treats **EEG as the world** (predict the next EEG latent;
+video only for CLS alignment). This variant is the **inverse** and a faithful
+**V-JEPA 2-AC analog** — implemented separately as model type
+`ActionWorldModel` (`models/action_world_model.py`), leaving the `WorldModel`
+path untouched.
+
+- **World `g`** = a *frozen* V-JEPA 2 (`facebook/vjepa2-vitl-fpc64-256`,
+  hidden 1024). A single static frame is replicated to the T=2 tubelet →
+  **1 temporal patch × 16×16 = 256 spatial tokens × 1024**, i.e. a purely
+  *spatial* grid `s_t` (no temporal axis). Exposed via
+  `CSBrainAlign.vjepa2_grid_tokens` (un-pooled `last_hidden_state`).
+- **Action `a_t`** = a learned "moving intention" latent the EEG model decodes
+  (`ActionHead`: K attention-pooled tokens over the EEG patch tokens).
+  *Unsupervised* — no IMU/motion targets; trained end-to-end by the prediction
+  loss only.
+- **Predictor `p`** (`ActionPredictor`) prepends the action tokens to the
+  projected world grid (+pos +horizon embeds), encodes, and reads out
+  `ŝ_{t+k}` (optionally as a residual `s_t + Δ`).
+
+```
+ frame_t   ─▶ frozen V-JEPA2 ─▶ s_t (B,256,1024) ─┐
+ x_t (EEG) ─▶ CSBrainAlign ─▶ ActionHead ─▶ a_t ──┤
+                                                   ▼
+                                       ActionPredictor ─▶ ŝ_{t+1}
+                                                   │
+                       L1(+cos) vs sg[VJEPA2(frame_{t+1})] ◀┘  (frozen target)
+```
+
+**Objective:** `L = L_pred` (L1 over the 256 tokens, optional `+ (1−cos)`).
+Frozen target ⇒ **no EMA teacher, no loss ramp, no collapse risk** (the major
+simplification over `WorldModel`).
+
+**Optional masked-patch reconstruction co-objective.** The action is *always*
+decoded from the full, unmasked window; recon (when enabled) is a *separate*
+masked EEG forward so it never corrupts the action signal. Two routes:
+- `--recon_aux_weight W` (with `--need_mask ''`): the wrapper masks internally
+  (ratio `--mask_ratio`) and adds an MSE `recon_aux_loss` to the loss dict.
+- leave `--need_mask` on: the trainer passes a mask, the wrapper returns the
+  reconstruction `out`, and the trainer's existing `mask_loss` handles it
+  (band-split / freq-mask options for free). `recon_aux_weight` is ignored on
+  this route to avoid double-counting.
+
+Both default off (`--need_mask ''`, `recon_aux_weight=0`).
+
+**EEG warm-start:** `--eeg_ckpt <recon.pt>` loads a masked-recon backbone
+(shape-matched, vision/alignment heads skipped) via `_load_eeg_ckpt` in
+`models/__init__.py`.
+
+**Data:** EgoBrain only (video subjects P0001–P0024); egocentric self-motion is
+the natural match for "moving intention". Reuses the existing `egobrain`
+dataset branch + `collate_egobrain` (already emits `timeseries_future`,
+`pixel_values_future`, `has_image_future`). One-time prerequisite: build the
+V-JEPA 2 256px frame cache (`datasets.egobrain_extract_frames
+--vision_encoder facebook/vjepa2-vitl-fpc64-256`).
+
+**Action-utility diagnostics (critical):** the classic failure is the
+predictor ignoring the action (consecutive frames look alike). The wrapper logs
+`diag_action_gap` = `L_pred(zeroed a) − L_pred(a)` (must be > 0) and
+`diag_pred_cos` vs `diag_copy_cos` (must beat the trivial-copy baseline).
+
+Launch: `sh/pretrain_actionworldmodel.sh`.

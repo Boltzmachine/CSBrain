@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import signal
@@ -60,6 +61,234 @@ def apply_freq_band_mask(x, n_bands, mask_ratio=None):
     masked_spec = spec * (1.0 - band_mask).unsqueeze(1)
     masked_ts = torch.fft.irfft(masked_spec, n=T, dim=-1)
     return masked_ts.reshape(B, C, N, d), band_mask
+
+
+def apply_delta_whiten(x, fs, g0, cutoff_hz, eps=1e-8):
+    """Per-channel low-frequency (delta) attenuation toward a motor-imagery
+    spectral profile — the ME->MI "rank-1 delta whitening".
+
+    Each channel's rFFT is multiplied by a real, zero-phase raised-cosine gain
+    that ramps from ``g0`` (<1) at DC up to ``1.0`` at ``cutoff_hz``; bins at or
+    above ``cutoff_hz`` are untouched. This flattens the execution-heavy delta
+    floor of motor-EXECUTION EEG (EgoBrain) toward the shallower delta level of
+    motor-IMAGERY (PhysioNet-MI). Per-channel RMS is preserved after filtering
+    so the downstream ``/100`` magnitude convention is unchanged — only the
+    relative spectral SHAPE moves. ``g0 >= 1`` (or ``cutoff_hz <= 0``) is a
+    no-op, so the default leaves the signal byte-for-byte identical.
+
+    NOTE on the neuroscience/limits: the delta surplus this attenuates is a
+    mix of execution-bound MRCP/reafferent slow potentials that imagery lacks
+    AND motion/EOG artifact; the filter is non-selective and removes both. It
+    is a calibrated domain-shift + denoise, not a clean reproduction of the MI
+    neural state. See project_me_mi_pretrain_manipulation.
+
+    Parameters
+    ----------
+    x : ndarray ``(C, T)`` — channels x time (uV).
+    fs : float — sampling rate in Hz.
+    g0 : float — DC gain of the ramp. Calibrate so the corpus' montage-avg
+        relative delta lands on the *finetune target* (preprocessed PhysioNet-MI
+        LMDB, ~46 montage / ~42 central, percent), NOT the raw-EDF literature
+        value — too strong a gain overshoots past MI and grows the distance.
+    cutoff_hz : float — upper edge of the ramp (bins >= it are left alone).
+
+    Returns
+    -------
+    ndarray ``(C, T)`` — same shape and dtype as ``x``.
+    """
+    if g0 is None or g0 >= 1.0 or cutoff_hz is None or cutoff_hz <= 0:
+        return x
+    x = np.asarray(x)
+    in_dtype = x.dtype
+    xf = x.astype(np.float64, copy=False)
+    T = xf.shape[-1]
+    freqs = np.fft.rfftfreq(T, d=1.0 / float(fs))            # (T//2+1,)
+    gain = np.ones_like(freqs)
+    ramp = freqs < cutoff_hz
+    gain[ramp] = g0 + (1.0 - g0) * 0.5 * (
+        1.0 - np.cos(np.pi * freqs[ramp] / cutoff_hz))       # g0 -> 1.0
+    out = np.fft.irfft(np.fft.rfft(xf, axis=-1) * gain, n=T, axis=-1)
+    # Preserve per-channel RMS: reshape the spectrum, not the amplitude.
+    pre = np.sqrt((xf ** 2).mean(axis=-1, keepdims=True))
+    post = np.sqrt((out ** 2).mean(axis=-1, keepdims=True))
+    out = out * (pre / (post + eps))
+    return out.astype(in_dtype, copy=False)
+
+
+def band_split_recon_loss(pred, target, fs, phase_cutoff_hz, power_weight=1.0):
+    """Low-frequency-only masked-patch reconstruction loss (raw signal space).
+
+    Reconstructs only the LOW-frequency part of the waveform: both ``pred`` and
+    ``target`` are conceptually low-pass filtered (rFFT bins with
+    ``f >= phase_cutoff_hz`` dropped) and compared by time-domain MSE. The
+    slow / evoked low-freq content (delta), whose phase is informative, is
+    reconstructed in full (phase included); the induced high-freq content
+    (mu/beta), whose phase is unpredictable, is simply not penalised — so we
+    stop injecting noise gradients there instead of trying to nail it.
+
+    Scale: computed as the mean squared error PER RETAINED real degree of
+    freedom (DC and Nyquist carry 1 DOF, interior bins 2). This keeps the
+    magnitude comparable to the plain MSE for any cutoff, and makes the loss
+    EXACTLY the plain time-domain MSE when all bins are retained
+    (``phase_cutoff_hz >= Nyquist``). Evaluated in the frequency domain via
+    Parseval — numerically equivalent to time-domain MSE of the low-passed
+    signals, but exact and without an inverse FFT.
+
+    ``power_weight`` is accepted for arg/call back-compat but UNUSED here.
+
+    No-op guarantee: returns the plain time-domain MSE bit-for-bit when
+    ``phase_cutoff_hz`` is ``>= Nyquist`` or non-finite (all bins retained); the
+    caller also skips this function entirely when ``--recon_band_split`` is off.
+    ``phase_cutoff_hz <= 0`` retains nothing → zero loss (reconstruction off).
+
+    Args:
+        pred, target: (..., P) — per-masked-patch waveforms, ``P = in_dim``
+            samples. Typically ``y[mask == 1]`` / ``x[mask == 1]``, i.e. (M, P).
+        fs: patch sampling rate in Hz (rFFT bin width = ``fs / P``).
+        phase_cutoff_hz: reconstruct frequencies strictly below this; a large
+            value (``>= Nyquist``) or non-finite reproduces the plain MSE.
+        power_weight: ignored (kept for back-compat).
+    """
+    P = pred.size(-1)
+    F_ = P // 2 + 1
+    bin_hz = fs / P
+    nyquist = (F_ - 1) * bin_hz
+
+    # All bins retained -> plain time-domain MSE, bit-identical to baseline.
+    if not math.isfinite(float(phase_cutoff_hz)) or float(phase_cutoff_hz) > nyquist:
+        return ((pred - target) ** 2).mean()
+
+    # Per-bin real DOF == Parseval weight for an ortho rFFT of a length-P real
+    # signal: DC (and Nyquist when P is even) carry 1, interior bins carry 2.
+    freqs = torch.arange(F_, device=pred.device) * bin_hz
+    pw = torch.full((F_,), 2.0, device=pred.device, dtype=pred.dtype)
+    pw[0] = 1.0
+    if P % 2 == 0:
+        pw[F_ - 1] = 1.0
+    pw = pw * (freqs < float(phase_cutoff_hz)).to(pw.dtype)   # keep low-freq bins
+
+    dof = pw.sum()
+    if float(dof) == 0.0:
+        return (pred - target).pow(2).mean() * 0.0           # nothing retained
+
+    D = torch.fft.rfft(pred - target, dim=-1, norm="ortho")  # (..., F)
+    energy = D.real.pow(2) + D.imag.pow(2)                    # |D_k|^2
+    return (energy * pw).sum(dim=-1).mean() / dof            # MSE per retained DOF
+
+
+def _analytic_bandlimited(sig, fs, lo, hi):
+    """Band-limited analytic (Hilbert) signal of a real tensor via FFT.
+
+    Equivalent to ``scipy.signal.hilbert`` applied to the band-passed signal:
+    full FFT, keep only the *positive* in-band frequencies (doubled), zero the
+    DC/negative/out-of-band bins, inverse FFT to a complex analytic signal whose
+    modulus is the instantaneous amplitude envelope and whose argument is the
+    instantaneous phase. Differentiable w.r.t. ``sig``.
+
+    Args:
+        sig: (..., T) real tensor.
+        fs: sampling rate in Hz.
+        lo, hi: band edges in Hz; bins with ``lo <= f < hi`` are kept.
+
+    Returns:
+        Complex tensor of shape (..., T).
+    """
+    T = sig.shape[-1]
+    Xf = torch.fft.fft(sig, dim=-1)
+    freqs = torch.fft.fftfreq(T, d=1.0 / float(fs)).to(sig.device)
+    nyq = float(fs) / 2.0
+    H = torch.zeros(T, device=sig.device, dtype=sig.dtype)
+    in_band_pos = (
+        (freqs > 0) & (freqs < nyq) & (freqs >= float(lo)) & (freqs < float(hi))
+    )
+    H[in_band_pos] = 2.0                                     # positive freqs doubled
+    if float(lo) <= 0.0 < float(hi):
+        H[0] = 1.0                                          # DC (no doubling)
+    if T % 2 == 0 and float(lo) <= nyq < float(hi):
+        H[T // 2] = 1.0                                     # Nyquist (no doubling)
+    return torch.fft.ifft(Xf * H.to(Xf.dtype), dim=-1)
+
+
+def band_phase_envelope_loss(pred, target, mask, fs,
+                             delta_band=(0.5, 4.0),
+                             power_bands=((8.0, 13.0), (13.0, 30.0)),
+                             complete=True, eps=1e-8):
+    """Auxiliary masked-recon objectives layered ON TOP of the plain MSE.
+
+    Adds two band-specific instantaneous targets, motivated by what each band
+    can actually predict from masked context:
+
+    * **delta (slow / evoked) -> instantaneous PHASE.** Low-frequency phase is
+      informative, so we align the analytic-signal phase of the reconstruction
+      with the target's. The per-sample term is ``1 - cos(Δφ)`` weighted by the
+      *target* delta amplitude, so phase-meaningless silent moments don't
+      dominate.
+    * **mu / beta (induced) -> instantaneous POWER ENVELOPE** ``|analytic|^2``.
+      Their phase is largely unpredictable, but the band-power time course
+      (ERD/ERS) is — so we score the squared-magnitude envelope in the
+      **log-power (dB-style) domain**, how band power / ERD is conventionally
+      compared. ``log`` is scale-free (a ratio), robust to the ``/100``
+      amplitude convention, and — unlike a relative MSE on raw ``|z|^2`` —
+      bounded under large recon error (raw power MSE grows ~quartically in the
+      noise and explodes); a relative floor at 1% of the band's mean target
+      power keeps silent samples from blowing up the log.
+
+    Both terms are restricted to the masked patches. With ``complete=True`` the
+    Hilbert transform is taken on the model-completed waveform (true signal at
+    visible patches, predictions at masked ones) so it sees a realistic
+    continuous signal and gradients only flow through the masked region.
+
+    Args:
+        pred, target: (B, C, N, d) full reconstruction / ground-truth patches.
+        mask: (B, C, N) with ``1`` on masked patches (loss support); ``None``
+            applies the loss everywhere.
+        fs: sampling rate in Hz.
+        delta_band: (lo, hi) Hz for the phase term.
+        power_bands: iterable of (lo, hi) Hz bands for the power-envelope term
+            (averaged across bands).
+        complete: take the Hilbert transform on the completed waveform.
+
+    Returns:
+        ``(phase_loss, envelope_loss)`` scalar tensors.
+    """
+    B, C, N, d = pred.shape
+    T = N * d
+
+    if mask is not None:
+        m = mask.to(pred.dtype).unsqueeze(-1)                # (B, C, N, 1)
+        if complete:
+            pred = target * (1.0 - m) + pred * m             # fill masked patches
+        loss_mask = m.expand(B, C, N, d).reshape(B, C, T)
+    else:
+        loss_mask = torch.ones(B, C, T, device=pred.device, dtype=pred.dtype)
+
+    yp = pred.reshape(B, C, T)
+    yt = target.reshape(B, C, T)
+
+    # --- delta: instantaneous phase agreement (amplitude-weighted) ---
+    zp = _analytic_bandlimited(yp, fs, delta_band[0], delta_band[1])
+    zt = _analytic_bandlimited(yt, fs, delta_band[0], delta_band[1])
+    ap, at = zp.abs(), zt.abs()
+    cos_dphi = (zp.real * zt.real + zp.imag * zt.imag) / (ap * at + eps)
+    w = at * loss_mask                                       # weight by target amp
+    phase_loss = ((1.0 - cos_dphi) * w).sum() / w.sum().clamp(min=eps)
+
+    # --- mu / beta: instantaneous power envelope (scale-free log-power MSE) ---
+    denom = loss_mask.sum().clamp(min=eps)
+    env_terms = []
+    for (lo, hi) in power_bands:
+        zpb = _analytic_bandlimited(yp, fs, lo, hi)
+        ztb = _analytic_bandlimited(yt, fs, lo, hi)
+        pp = zpb.real.pow(2) + zpb.imag.pow(2)               # |z|^2 power envelope
+        pt = ztb.real.pow(2) + ztb.imag.pow(2)
+        # Relative floor at 1% of the band's mean target power -> scale-free,
+        # and keeps near-silent samples from exploding the log.
+        floor = 0.01 * (pt * loss_mask).sum() / denom + eps
+        lp = torch.log((pp + floor) / (pt + floor))          # dB-style log ratio
+        env_terms.append((lp.pow(2) * loss_mask).sum() / denom)
+    envelope_loss = torch.stack(env_terms).mean()
+
+    return phase_loss, envelope_loss
 
 
 def bandpass_decompose(x, fs, cutoffs):
@@ -287,8 +516,9 @@ def apply_arch_params(params, saved_params):
 
     Wrapper flags (dino_mode, WorldModel) are intentionally not overlayed:
     finetuning always builds the plain encoder, and the state_dict loader
-    strips wrapper prefixes. ``model`` is mapped WorldModel -> Align for
-    the same reason.
+    strips wrapper prefixes. ``model`` is mapped WorldModel / ActionWorldModel
+    -> Align for the same reason (the EEG backbone is finetuned alone; the
+    predictor / action head / V-JEPA 2 world encoder are discarded).
     """
     if saved_params is None:
         return
@@ -296,7 +526,7 @@ def apply_arch_params(params, saved_params):
         if field in saved_params:
             setattr(params, field, saved_params[field])
     saved_model = saved_params.get('model')
-    if saved_model == 'WorldModel':
+    if saved_model in ('WorldModel', 'ActionWorldModel'):
         params.model = 'Align'
     elif saved_model is not None:
         params.model = saved_model

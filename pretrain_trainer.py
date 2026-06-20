@@ -6,7 +6,19 @@ from tqdm import tqdm
 from utils.util import (
     generate_mask, save_pretrain_checkpoint, build_muon_optimizer,
     apply_freq_band_mask, bandpass_decompose, symmetric_band_infonce,
+    band_split_recon_loss, band_phase_envelope_loss,
 )
+
+
+def _parse_band(s):
+    """\"8,13\" -> (8.0, 13.0)."""
+    lo, hi = [float(v) for v in str(s).split(',')]
+    return (lo, hi)
+
+
+def _parse_bands(s):
+    """\"8,13;13,30\" -> [(8.0, 13.0), (13.0, 30.0)]."""
+    return [_parse_band(p) for p in str(s).split(';') if p.strip()]
 import os
 import wandb
 import time
@@ -250,9 +262,40 @@ class Trainer(object):
                         else:
                             masked_x = x[mask == 1]
                             masked_y = y[mask == 1]
-                            mask_loss = self.criterion(masked_y, masked_x)
+                            if getattr(self.params, 'recon_band_split', False):
+                                # Phase-sensitive only below the cutoff; induced
+                                # (mu/beta/gamma) bands scored on power alone.
+                                mask_loss = band_split_recon_loss(
+                                    masked_y, masked_x,
+                                    fs=float(getattr(self.params, 'fs', 200)),
+                                    phase_cutoff_hz=self.params.recon_phase_cutoff_hz,
+                                    power_weight=getattr(
+                                        self.params, 'recon_power_weight', 1.0),
+                                )
+                            else:
+                                mask_loss = self.criterion(masked_y, masked_x)
                             loss = mask_loss + sum(loss_dict.values())
                             logs["mask_loss"] = mask_loss.data.cpu().numpy()
+
+                            # On top of the plain MSE, predict instantaneous
+                            # delta-band PHASE and mu/beta-band POWER ENVELOPE on
+                            # the masked patches (Hilbert-derived band targets).
+                            if getattr(self.params, 'aux_band_pred', False):
+                                phase_loss, env_loss = band_phase_envelope_loss(
+                                    y, x, mask,
+                                    fs=float(getattr(self.params, 'fs', 200)),
+                                    delta_band=_parse_band(
+                                        getattr(self.params, 'aux_delta_band', '0.5,4')),
+                                    power_bands=_parse_bands(
+                                        getattr(self.params, 'aux_power_bands', '8,13;13,30')),
+                                )
+                                loss = (
+                                    loss
+                                    + self.params.aux_phase_weight * phase_loss
+                                    + self.params.aux_envelope_weight * env_loss
+                                )
+                                logs["aux_phase_loss"] = phase_loss.data.cpu().numpy()
+                                logs["aux_env_loss"] = env_loss.data.cpu().numpy()
                     else:
                         out = self.model.training_step(batch, mask=None)
 

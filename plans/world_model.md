@@ -1,4 +1,4 @@
-# EEG World-Model / Video-Prediction Extension of CSBrainAlign
+# (Might be stale) EEG World-Model / Video-Prediction Extension of CSBrainAlign
 
 ## 1. Motivation
 

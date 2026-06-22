@@ -127,9 +127,15 @@ class WorldModelWrapper(nn.Module):
         max_horizon: int = 1,
         ramp_epochs: int = 2,
         target_momentum: float = 0.998,
+        flip_pred_weight: float = 1.0,
     ):
         super().__init__()
         self.encoder = encoder
+        # Multiplier on the bilateralization flipped-prediction terms (predict
+        # the flipped-future EEG latent from the flipped-current). Only active
+        # when the encoder has the learned x_bi/x_lat split (lateralization_flip)
+        # and a predictor; 0 disables it.
+        self.flip_pred_weight = float(flip_pred_weight)
         # ``max_horizon == 0`` reduces the wrapper to the plain CSBrainAlign
         # pipeline (masked recon + image alignment). In that mode no
         # predictor is built at all, so no extra parameters enter the
@@ -312,12 +318,40 @@ class WorldModelWrapper(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def _compute_flip_motion(self, batch: dict) -> Optional[torch.Tensor]:
+        """Per-sample motion = mean|frame_{t+1} - frame_t| from the future
+        frame stack, for the encoder's flip-alignment motion weighting.
+
+        Returns a (B,) tensor aligned with ``batch['timeseries']`` rows; rows
+        without a future frame stack get a -1 sentinel (the encoder maps that
+        to weight 1). Returns None when no future frames are present.
+        """
+        pvf = batch.get('pixel_values_future')          # (M, W, 3, H, W) or None
+        if pvf is None or pvf.size(1) < 2:
+            return None
+        if 'cinebrain_idx' in batch:
+            rows = batch['cinebrain_idx']
+        else:
+            rows = torch.arange(pvf.size(0), device=pvf.device)
+        B = batch['timeseries'].size(0)
+        motion = batch['timeseries'].new_full((B,), -1.0)
+        m = (pvf[:, 1] - pvf[:, 0]).abs().mean(dim=(1, 2, 3))   # (M,)
+        motion[rows] = m.to(motion.dtype)
+        return motion
+
     def training_step(self, batch: dict, mask: Optional[torch.Tensor] = None):
         # 1. Primary forward on window t — produces the existing
         #    reconstruction output + alignment/recon loss terms. Runs on
         #    the full mixed batch (CineBrain + Alljoined) so masked recon
         #    and image alignment train on every sample.
         encoder_batch = self._build_alignment_batch(batch, window_idx=0)
+        # Supply a per-sample motion score (t->t+1 frame diff) so the encoder's
+        # flip-alignment can down-weight static frames (whose horizontal flip is
+        # near-vacuous). Only when that weighting is enabled on the encoder.
+        if getattr(self.encoder, 'flip_motion_ref', 0.0) > 0:
+            motion = self._compute_flip_motion(batch)
+            if motion is not None:
+                encoder_batch['flip_motion'] = motion
         out, info = self.encoder(encoder_batch, mask=mask)
 
         # 2. Latent prediction on a random horizon.
@@ -402,6 +436,75 @@ class WorldModelWrapper(nn.Module):
             )
             info['diag_pred_ramp_scale'] = torch.tensor(
                 scale, device=pred_patch.device)
+
+        # ------------------------------------------------------------------
+        # Bilateralization flipped prediction: predict the flipped-FUTURE EEG
+        # latent from the flipped-CURRENT latent. The flipped stream is built
+        # by applying the encoder's learned x_bi + flip(x_lat) split to each
+        # raw window, so the next-step scene is mirrored (the prediction target
+        # is the EEG latent of the flipped future window — symmetric with the
+        # main prediction). Trains encoder + split + predictor; the split now
+        # also gets a temporal (dynamics) gradient, not just image alignment.
+        # ------------------------------------------------------------------
+        if (getattr(self.encoder, 'lateralization_flip', False)
+                and self.flip_pred_weight > 0):
+            cb_list = cb_idx.tolist()
+
+            def _sub(src, ts_key='timeseries'):
+                sub = {
+                    'timeseries': src[ts_key].index_select(0, cb_idx),
+                    'ch_coords': src['ch_coords'].index_select(0, cb_idx),
+                    'ch_names': [src['ch_names'][i] for i in cb_list],
+                }
+                for mk in ('valid_channel_mask', 'valid_length_mask'):
+                    if mk in src:
+                        sub[mk] = src[mk].index_select(0, cb_idx)
+                return sub
+
+            # Current flipped window (online, with grad) -> s_flip_t latent.
+            # Use the un-mutated wrapper ``batch`` (the window-0 forward above
+            # mutated only its own encoder_batch copy's masks).
+            cur = _sub(batch)
+            x_flip_t, _ = self.encoder.build_lateral_flip(
+                cur['timeseries'], cur['ch_coords'], cur['ch_names'],
+                cur.get('valid_channel_mask'))
+            _, info_flip_t = self.encoder(
+                {**cur, 'timeseries': x_flip_t}, encoder_only=True)
+            s_flip_t_patch = info_flip_t['patch_tokens']
+
+            # Flipped future window (EMA target, detached). ``future_batch``
+            # already holds the k-th future window for the cb rows. Build the
+            # flip with the SAME (EMA) split that ``_encode_future`` encodes
+            # with — using the online split here would make the regression
+            # target move every step (the predictor could chase it instead of
+            # learning stable dynamics).
+            flip_target_enc = (self.target_encoder
+                               if self.target_encoder is not None
+                               else self.encoder)
+            with torch.no_grad():
+                x_flip_tpk, _ = flip_target_enc.build_lateral_flip(
+                    future_batch['timeseries'], future_batch['ch_coords'],
+                    future_batch['ch_names'],
+                    future_batch.get('valid_channel_mask'))
+            s_flip_tpk_cls, s_flip_tpk_patch = self._encode_future(
+                {**future_batch, 'timeseries': x_flip_tpk})
+            s_flip_tpk_patch = s_flip_tpk_patch.detach()
+            s_flip_tpk_cls = s_flip_tpk_cls.detach()
+
+            pred_flip_patch, pred_flip_cls = self.predictor(
+                s_flip_t_patch, horizon=k)
+            flip_pred_loss = F.l1_loss(pred_flip_patch, s_flip_tpk_patch)
+            flip_cls_loss = F.l1_loss(pred_flip_cls, s_flip_tpk_cls)
+            info['flip_latent_pred_loss'] = (
+                self.latent_pred_weight * self.flip_pred_weight * scale,
+                flip_pred_loss)
+            info['flip_latent_cls_loss'] = (
+                self.cls_pred_weight * self.flip_pred_weight * scale,
+                flip_cls_loss)
+            with torch.no_grad():
+                a = F.normalize(pred_flip_patch.flatten(end_dim=-2), dim=-1)
+                b = F.normalize(s_flip_tpk_patch.flatten(end_dim=-2), dim=-1)
+                info['diag_flip_latent_pred_cos'] = (a * b).sum(-1).mean()
 
         return out, info
 

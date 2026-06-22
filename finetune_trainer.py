@@ -117,8 +117,11 @@ class Trainer(object):
             for batch in tqdm(self.data_loader['train'], mininterval=10):
                 self.optimizer.zero_grad()
                 batch = to_device(batch, "cuda")
-                x = batch['x']
-                y = batch['y']
+                # Bilateralization-prior augmentations (no-ops unless their
+                # flags are set): flip (left<->right) then symmetrize
+                # (single-hand -> both fists). Both may edit x and remap y.
+                y = self.model.flip_augment(batch)
+                y = self.model.symmetrize_augment(batch, y)
                 pred = self.model(batch)
                 if self.params.downstream_dataset == 'ISRUC':
                     loss = self.criterion(pred.transpose(1, 2), y)

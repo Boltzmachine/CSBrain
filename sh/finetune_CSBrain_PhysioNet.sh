@@ -46,9 +46,14 @@ SEED="${2:-42}"
 NUM_WORKERS="${3:-4}"
 SEGMENT_INDEX="${4:-0}"
 HIGHPASS_HZ="${5:-0}"
+SYM_PROB="${6:-0.25}"   # 思路1 symmetrize-aug probability
 CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
 EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
-WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}_seed${SEED}_seg${SEGMENT_INDEX}_hp${HIGHPASS_HZ}"
+# Current config: 思路1 ONLY (--symmetrize_aug) for a clean A/B vs the no-aug
+# baseline. The lateralization-flip aug + TTA are left commented below (they
+# target the already-solved left/right axis and slightly hurt). Tag the
+# run/results so tracks don't collide in wandb / the CSV.
+WANDB_RUN_NAME="${CKPT_NAME}_${EPOCH}_seed${SEED}_seg${SEGMENT_INDEX}_hp${HIGHPASS_HZ}_symp${SYM_PROB}"
 
 python finetune_main.py \
     --model Align \
@@ -59,7 +64,7 @@ python finetune_main.py \
     --foundation_dir "$FOUNDATION_DIR" \
     --seed "$SEED" \
     --wandb_run_name "$WANDB_RUN_NAME" \
-    --results_csv outputs/finetune_results.csv \
+    --results_csv "outputs/finetune_results_symp${SYM_PROB}.csv" \
     --use_pretrained_weights \
     --use_initial_segment_only \
     --segment_index "$SEGMENT_INDEX" \
@@ -67,7 +72,21 @@ python finetune_main.py \
     --num_workers "$NUM_WORKERS" \
     --dropout 0.3 \
     --weight_decay  0.01 \
-    --lr 0.00005
+    --lr 0.00005 \
+    --symmetrize_aug \
+    --symmetrize_aug_prob "$SYM_PROB"
+    # 思路1: synthesize 'both fists' from single-hand trials via the symmetric
+    # projection x_sym = 0.5*(x + flip(x)) (raw channel swap), relabeled to
+    # --symmetrize_target_label (default 2). Targets the bilateral-extent
+    # confusion (both fists <-> single fist); needs no pretrained split.
+    #
+    # To re-enable the lateralization-flip aug / TTA instead (or in addition),
+    # add: --lateral_flip_aug --lateral_flip_prob 0.5 --lateral_flip_tta
+    # (those require a --lateralization_flip-pretrained FOUNDATION_DIR).
+    # --lateral_flip_aug reuses the pretrained x_bi/x_lat split (so FOUNDATION_DIR
+    # must be a --lateralization_flip checkpoint) to augment with
+    # x_flip = x_bi + flip(x_lat) and remap labels (--flip_label_map "1,0,2,3":
+    # left fist<->right fist; both fists / both feet unchanged).
 
 # VISION_ENCODER="facebook/dinov2-base"   # swap to DINOv3 id once access is granted
 # IMAGE_MODE="raw"                        # 'raw' matches the paper; 'spectrogram' = STFT grid

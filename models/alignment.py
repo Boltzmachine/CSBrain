@@ -96,6 +96,61 @@ def build_flip_perm_batch(ch_names_batch, valid_channel_mask=None):
     return perm
 
 
+class LateralizationSplit(nn.Module):
+    """Learned additive split of the raw EEG into bilateral + lateral streams.
+
+    Given raw per-channel patches ``x`` (B, C, N, d) a small per-channel
+    network predicts a gate ``g in (0, 1)`` of the *same* shape and splits the
+    signal additively::
+
+        x_lat = g * x            # lateralization features
+        x_bi  = (1 - g) * x      # bilateral features
+        x_bi + x_lat == x        # exact, by construction
+
+    Only ``x_lat`` is acted on by the hemispheric channel-swap downstream, so
+    ``g`` learns *which* signal components are lateralized (and therefore swap
+    hemispheres when the visual scene is mirrored). The gate is conditioned on
+    the per-patch signal and on a spherical channel positional encoding, so
+    different scalp locations can carry different lateral fractions. It is
+    initialised near zero (``x_lat ~= 0``) so training starts from
+    ``x_flip ~= x`` and grows the lateral stream only as the flip-alignment
+    objective demands — this is the standard "start as identity" stabiliser.
+    """
+
+    def __init__(self, in_dim, coord_pe_dim, hidden=64, gate_init_bias=-2.0):
+        super().__init__()
+        self.in_dim = in_dim
+        self.gate_init_bias = float(gate_init_bias)
+        self.sig_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.GELU(),
+        )
+        self.coord_proj = nn.Linear(coord_pe_dim, hidden)
+        self.gate_head = nn.Linear(hidden, in_dim)
+        self.reset_gate_init()
+
+    def reset_gate_init(self):
+        """(Re)apply the near-zero gate init. Call after the owner's global
+        ``apply(_weights_init)`` pass, which would otherwise overwrite it."""
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, self.gate_init_bias)
+
+    def forward(self, x, coord_pe, valid_channel_mask=None):
+        """x: (B, C, N, d); coord_pe: (B, C, coord_pe_dim).
+
+        Returns ``(x_lat, gate)`` both (B, C, N, d). ``x_bi`` is just
+        ``x - x_lat`` for the caller; we return the gate so the caller can
+        regularise the lateral fraction.
+        """
+        h = self.sig_proj(x)                                   # (B, C, N, hidden)
+        h = h + self.coord_proj(coord_pe).unsqueeze(2)         # +channel context
+        gate = torch.sigmoid(self.gate_head(h))                # (B, C, N, d)
+        if valid_channel_mask is not None:
+            m = valid_channel_mask.to(x.dtype).view(
+                *valid_channel_mask.shape, 1, 1)
+            gate = gate * m
+        return gate * x, gate
+
+
 class SourceProjector(nn.Module):
     """
     Standalone sensor-to-source projector.
@@ -720,7 +775,10 @@ class CSBrainAlign(nn.Module):
                  fs=200, filterbank_kernel_size=101,
                  filterbank_min_bw_hz=1.0, use_cross_band_attn=True,
                  cross_band_every=1, use_band_type_embedding=True,
-                 num_visual_levels=3, band_decorr_weight=0.01):
+                 num_visual_levels=3, band_decorr_weight=0.01,
+                 lateralization_flip=False, flip_align_weight=1.0,
+                 lat_sparsity_weight=0.01, flip_split_hidden=64,
+                 flip_n_col_bands=2, flip_motion_ref=0.0, flip_motion_min=0.0):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
@@ -1016,7 +1074,51 @@ class CSBrainAlign(nn.Module):
                 nn.Linear(d_model, d_model),
             )
 
+        # --- Bilateralization prior: learned x = x_bi + x_lat split + a
+        # flip-equivariant image-alignment objective (see _flip_alignment).
+        # This is a *separate* mechanism from the legacy equivariance_weight
+        # path above; it does not touch the main encode of ``x`` (the split is
+        # the identity there) and only adds a second, channel-swapped encode.
+        self.lateralization_flip = bool(lateralization_flip)
+        self.flip_align_weight = float(flip_align_weight)
+        self.lat_sparsity_weight = float(lat_sparsity_weight)
+        # Image-side flip target: the global CLS is ~horizontal-flip-invariant
+        # (probe: cos(img, flip(img)) ~ 0.97 on EgoBrain) so it makes the
+        # objective vacuous. Instead we align to a CENTERED column-band spatial
+        # descriptor: split the patch grid into ``flip_n_col_bands`` vertical
+        # bands, mean-pool each, and remove the cross-band mean. This is
+        # strongly flip-sensitive (cos ~ 0.09 on motion frames) so the gate is
+        # forced to engage. ``flip_n_col_bands=2`` is the left/right descriptor.
+        self.flip_n_col_bands = int(flip_n_col_bands)
+        # Optional per-sample motion weighting of the flip loss: EgoBrain has
+        # static stretches where a horizontal flip changes little; weight each
+        # row by clamp(motion / flip_motion_ref, flip_motion_min, 1) where
+        # ``motion`` is the t->t+1 frame difference supplied by the wrapper.
+        # 0 disables (uniform weights). Rows with no motion info -> weight 1.
+        self.flip_motion_ref = float(flip_motion_ref)
+        self.flip_motion_min = float(flip_motion_min)
+        if self.lateralization_flip:
+            assert self.flip_n_col_bands >= 1, "flip_n_col_bands must be >= 1"
+            coord_pe_dim = 3 * 2 * self.spherical_num_freqs
+            self.lateralization_split = LateralizationSplit(
+                in_dim=in_dim, coord_pe_dim=coord_pe_dim,
+                hidden=flip_split_hidden,
+            )
+            # Maps the global token into the (band-concatenated) image-feature
+            # space; shared between the un-flipped and flipped halves so the
+            # equivariance (input flip <-> image flip) is measured in one
+            # consistent space.
+            self.flip_align_proj = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(),
+                nn.Linear(d_model, self.flip_n_col_bands * self.image_feature_dim),
+            )
+
         self.apply(_weights_init)
+
+        # Restore the near-zero gate init that the generic apply() above
+        # overwrote, so the lateral stream starts ~0 (x_flip ~= x).
+        if self.lateralization_flip:
+            self.lateralization_split.reset_gate_init()
 
         # Zero-init cross-band attention out_proj AFTER the generic init pass so
         # the band stream starts as an identity mix (controlled, near-baseline).
@@ -1458,6 +1560,198 @@ class CSBrainAlign(nn.Module):
             out[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
         return out
 
+    @staticmethod
+    def _symmetric_infonce(pred, target, temperature=0.07, weight=None):
+        """Symmetric InfoNCE between L2-normalised ``pred`` and ``target``
+        (both (M, D)). ``weight`` (M,) optionally down-weights each row's
+        positive term (used for motion weighting) — every row still serves as
+        a negative for the others. Returns ``(loss, acc)``."""
+        pred = F.normalize(pred, dim=-1)
+        target = F.normalize(target, dim=-1)
+        logits = torch.matmul(pred, target.t()) / temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        if weight is None:
+            loss = 0.5 * (F.cross_entropy(logits, labels)
+                          + F.cross_entropy(logits.t(), labels))
+        else:
+            ce = 0.5 * (F.cross_entropy(logits, labels, reduction='none')
+                        + F.cross_entropy(logits.t(), labels, reduction='none'))
+            loss = (weight * ce).sum() / weight.sum().clamp(min=1e-6)
+        with torch.no_grad():
+            acc = 0.5 * ((logits.argmax(1) == labels).float().mean()
+                         + (logits.argmax(0) == labels).float().mean())
+        return loss, acc
+
+    @torch.no_grad()
+    def _image_patch_grid(self, pixel_values):
+        """Frozen vision-encoder patch tokens reshaped to (B, s, s, d_img).
+
+        Dispatches on ``encoder_kind``: V-JEPA 2 -> un-pooled tubelet grid via
+        :meth:`vjepa2_grid_tokens`; DINOv2-style ViTs -> ``last_hidden_state``
+        with the CLS (and any register) tokens dropped. The width axis (last
+        spatial dim) is the horizontal/left-right axis.
+        """
+        if self.encoder_kind == 'vjepa2':
+            tok = self.vjepa2_grid_tokens(pixel_values)          # (B, P, d_img)
+        else:
+            was_training = self.pretrained_image_encoder.training
+            self.pretrained_image_encoder.eval()
+            try:
+                out = self.pretrained_image_encoder(pixel_values=pixel_values)
+            finally:
+                if was_training:
+                    self.pretrained_image_encoder.train()
+            hs = out.last_hidden_state                           # (B, T, d_img)
+            n_reg = getattr(self.pretrained_image_encoder.config,
+                            'num_register_tokens', 0) or 0
+            tok = hs[:, 1 + n_reg:, :]                           # drop CLS(+reg)
+        B, P, d = tok.shape
+        s = int(round(math.sqrt(P)))
+        assert s * s == P, (
+            f"vision patch grid is not square (P={P}); cannot build the "
+            f"column-band flip descriptor")
+        return tok.reshape(B, s, s, d)
+
+    def _image_lateral_descriptor(self, pixel_values):
+        """Centered column-band spatial descriptor — the flip-sensitive image
+        target for the bilateralization prior. Returns (B, n_bands * d_img).
+
+        Splits the patch grid into ``flip_n_col_bands`` equal vertical (column)
+        bands, mean-pools each, and (for n_bands>=2) removes the cross-band
+        mean so the flip-invariant common component is gone, leaving the
+        spatial left-right structure that a horizontal flip actually changes.
+        """
+        grid = self._image_patch_grid(pixel_values)              # (B, s, s, d)
+        B, s, _, d = grid.shape
+        nb = self.flip_n_col_bands
+        assert s % nb == 0, (
+            f"flip_n_col_bands={nb} must divide the patch-grid width {s}")
+        w = s // nb
+        bands = torch.stack(
+            [grid[:, :, k * w:(k + 1) * w, :].mean(dim=(1, 2)) for k in range(nb)],
+            dim=1)                                               # (B, nb, d)
+        if nb >= 2:
+            bands = bands - bands.mean(dim=1, keepdim=True)
+        return bands.reshape(B, nb * d)
+
+    def build_lateral_flip(self, x, ch_coords, ch_names,
+                           valid_channel_mask=None):
+        """Bilateralization flip of the raw input: x_flip = x_bi + flip(x_lat).
+
+        Learns the additive split x = x_bi + x_lat (gate), then hemisphere-swaps
+        only the lateral stream (C3<->C4, ...). ``x``: (B, C, N, in_dim).
+        Returns ``(x_flip, gate)`` — the gate is returned so callers can
+        regularise the lateral fraction. Shared by the image flip-alignment and
+        the world-model flipped prediction so both use one flip construction.
+        """
+        B, C, N, d = x.shape
+        coord_pe, _ = self._spherical_positional_encoding(ch_coords)
+        x_lat, gate = self.lateralization_split(x, coord_pe, valid_channel_mask)
+        perm = build_flip_perm_batch(ch_names, valid_channel_mask).to(x.device)
+        perm_exp = perm[:, :C].view(B, C, 1, 1).expand(B, C, N, d)
+        return x - x_lat + torch.gather(x_lat, 1, perm_exp), gate
+
+    def _flip_alignment(self, batch, global_rep, has_image,
+                        orig_vcm, orig_vlm, orig_mask):
+        """Bilateralization-prior flip-equivariant alignment.
+
+        Decompose the raw signal ``x = x_bi + x_lat`` with a learned gate,
+        build ``x_flip = x_bi + flip(x_lat)`` by swapping homologous channels
+        (C3<->C4, ...) of the *lateral* stream only, and encode ``x_flip``
+        through the shared backbone. The objective ties an *input* flip to an
+        *image* flip via ONE stacked InfoNCE: queries ``[pred_i ; pred_flip_i]``
+        match targets ``[d_i ; d_flip_i]`` (original / mirrored frame
+        descriptors), so the same-sample opposite-flip frame is an explicit
+        hard negative. This forces the gate to engage — with ``g=0`` a sample's
+        two queries are identical yet need different targets. An optional
+        minimality penalty on the gate keeps ``x_lat`` small.
+
+        Operates only on the ``has_image`` rows (alignment needs a frame), so
+        the extra encode is restricted to those samples.
+        """
+        idx = has_image.nonzero(as_tuple=True)[0]
+        x = batch['timeseries'].index_select(0, idx)            # (M, C, N, d)
+        ch_coords = batch['ch_coords'].index_select(0, idx)     # (M, C, 3)
+        ch_names = [batch['ch_names'][i] for i in idx.tolist()]
+        vcm = orig_vcm.index_select(0, idx) if orig_vcm is not None else None
+        vlm = orig_vlm.index_select(0, idx) if orig_vlm is not None else None
+        mask = orig_mask.index_select(0, idx) if orig_mask is not None else None
+        M, C, N, d = x.shape
+
+        # 1-2. Learned split x = x_bi + x_lat, then hemispheric swap of the
+        #      lateral stream only -> x_flip = x_bi + flip(x_lat).
+        x_flip, gate = self.build_lateral_flip(x, ch_coords, ch_names, vcm)
+
+        # 3. Encode the flipped signal through the shared backbone.
+        flip_batch = {'timeseries': x_flip, 'ch_coords': ch_coords}
+        if vcm is not None:
+            flip_batch['valid_channel_mask'] = vcm
+        if vlm is not None:
+            flip_batch['valid_length_mask'] = vlm
+        _, info_flip = self.forward(flip_batch, mask=mask, encoder_only=True)
+        global_rep_flip = info_flip['global_rep']                     # (M, d)
+
+        # 4. Flip-sensitive image target: centered column-band spatial
+        #    descriptor of the original + horizontally-flipped frame. (The
+        #    global CLS is ~flip-invariant, which makes the objective vacuous.)
+        pixel_values = batch['image_encoder_inputs']['pixel_values'].index_select(0, idx)
+        img_emb = self._image_lateral_descriptor(pixel_values)        # (M, nb*d_img)
+        img_emb_flip = self._image_lateral_descriptor(
+            torch.flip(pixel_values, dims=[-1]))
+
+        # 4b. Per-sample motion weight (down-weights static frames whose flip
+        #     is near-vacuous). Sentinel <0 (no motion info, e.g. single-image
+        #     Alljoined rows) -> weight 1.
+        weight = None
+        motion = batch.get('flip_motion')
+        if motion is not None and self.flip_motion_ref > 0:
+            m = motion.index_select(0, idx).to(global_rep.dtype)      # (M,)
+            weight = torch.where(
+                m >= 0, (m / self.flip_motion_ref), torch.ones_like(m))
+            weight = weight.clamp(min=self.flip_motion_min, max=1.0)
+
+        # 5. Stacked symmetric InfoNCE with the same-sample opposite-flip frame
+        #    as an explicit HARD NEGATIVE. Queries [pred_i ; pred_flip_i] must
+        #    match targets [d_i ; d_flip_i]. With g=0 a sample's two queries are
+        #    the SAME vector yet need DIFFERENT targets -> impossible, so the
+        #    gate is forced to engage (un-flipped rep -> original image, flipped
+        #    rep -> mirrored image). Cross-sample rows remain negatives too.
+        #    (Two *separate* matrices instead let g=0 survive via a bisector
+        #    between d_i and d_flip_i — observed gate collapse, run vocstdci.)
+        pred = self.flip_align_proj(global_rep.index_select(0, idx))   # (M, D)
+        pred_flip = self.flip_align_proj(global_rep_flip)              # (M, D)
+        Q = torch.cat([pred, pred_flip], dim=0)                       # (2M, D)
+        T = torch.cat([img_emb, img_emb_flip], dim=0)                 # (2M, D)
+        W = torch.cat([weight, weight], dim=0) if weight is not None else None
+        loss, acc = self._symmetric_infonce(Q, T, weight=W)
+
+        out = {
+            'flip_align_loss': (self.flip_align_weight, loss),
+            'flip_align_acc': acc,
+        }
+        # Per-sample flip DISCRIMINATION (chance 0.5): does each rep prefer its
+        # own orientation's image over the opposite one? Direct signal that the
+        # gate is being used — if this stays ~0.5 the flip is being ignored.
+        with torch.no_grad():
+            pn = F.normalize(pred, dim=-1); pfn = F.normalize(pred_flip, dim=-1)
+            dn = F.normalize(img_emb, dim=-1); dfn = F.normalize(img_emb_flip, dim=-1)
+            out['diag_flip_discrim_acc'] = 0.5 * (
+                ((pn * dn).sum(-1) > (pn * dfn).sum(-1)).float().mean()
+                + ((pfn * dfn).sum(-1) > (pfn * dn).sum(-1)).float().mean())
+        if weight is not None:
+            out['diag_flip_motion_weight'] = weight.mean().detach()
+
+        # 6. Minimality of the lateral stream -> most signal stays bilateral.
+        if vcm is not None:
+            m = vcm.to(gate.dtype).view(M, C, 1, 1)
+            lat_frac = (gate * m).sum() / m.expand_as(gate).sum().clamp(min=1)
+        else:
+            lat_frac = gate.mean()
+        if self.lat_sparsity_weight > 0:
+            out['lat_sparsity_loss'] = (self.lat_sparsity_weight, lat_frac)
+        out['diag_lat_gate_mean'] = lat_frac.detach()
+        return out
+
     def forward(self, batch, mask=None, encoder_only=False, band_idx=None):
         """Encode ``batch`` and (unless ``encoder_only``) compute losses.
 
@@ -1747,6 +2041,24 @@ class CSBrainAlign(nn.Module):
                     equiv_losses["info_max_loss"] = (
                         self.info_max_weight, info_loss)
 
+        # ------------------------------------------------------------------
+        # Bilateralization-prior flip-equivariant alignment (only when images
+        # are present). Skipped for the source-projector path (its ``x`` is in
+        # source space, not sensor space, so a channel swap is ill-defined).
+        # ------------------------------------------------------------------
+        flip_losses = {}
+        has_image = batch.get('has_image')
+        if (self.lateralization_flip
+                and self.flip_align_weight > 0
+                and not self.project_to_source
+                and batch.get('ch_names') is not None
+                and 'image_encoder_inputs' in batch
+                and has_image is not None and has_image.any()):
+            flip_losses = self._flip_alignment(
+                batch, global_rep, has_image,
+                _orig_vcm, _orig_vlm, _orig_mask,
+            )
+
         moe_losses = {}
         if self.use_moe and not self.project_to_source:
             n_layers = self.encoder.num_layers
@@ -1769,6 +2081,7 @@ class CSBrainAlign(nn.Module):
             # "zero_lag_sync_loss": (0.1, zero_lag_sync_loss),
             **contrastive_loss,
             **equiv_losses,
+            **flip_losses,
             **moe_losses,
         }
     

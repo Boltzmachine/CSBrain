@@ -13,7 +13,6 @@ class CustomDataset(Dataset):
             self,
             data_dir,
             mode='train',
-            flip_aug=False,
             ea_matrices=None,
             highpass_hz=0.0,
             fs=200,
@@ -40,19 +39,6 @@ class CustomDataset(Dataset):
             self._hp_sos = butter(4, self.highpass_hz / (fs / 2.0),
                                   btype='high', output='sos')
 
-        # Hemisphere-flip augmentation (training only).
-        # Swaps homologous electrode pairs and relabels left↔right fist.
-        self.flip_aug = flip_aug and mode == 'train'
-        if self.flip_aug:
-            from models.alignment import build_flip_perm_batch
-            with self.db.begin(write=False) as txn:
-                pair = pickle.loads(txn.get(self.keys[0].encode()))
-            self.flip_perm = build_flip_perm_batch(
-                [pair['ch_names']])[0].numpy()
-            # PhysioNet-MI labels: 0=left fist, 1=right fist,
-            #                      2=both fists, 3=both feet
-            self._label_flip = {0: 1, 1: 0}
-
     def __len__(self):
         return len((self.keys))
 
@@ -72,11 +58,6 @@ class CustomDataset(Dataset):
             C, W, T = data.shape
             filtered = sosfiltfilt(self._hp_sos, data.reshape(C, W * T), axis=-1)
             data = np.ascontiguousarray(filtered, dtype=data.dtype).reshape(C, W, T)
-
-        # --- hemisphere-flip augmentation ---
-        if self.flip_aug and random.random() < 0.5:
-            data = data[self.flip_perm]
-            label = self._label_flip.get(label, label)
 
         # --- Euclidean Alignment (optional) ---
         # Sample shape is (C, n_windows, T). EA whitens along the channel
@@ -106,6 +87,10 @@ class CustomDataset(Dataset):
             'x': to_tensor(x_data),
             'y': to_tensor(y_label).long(),
             'ch_coords': to_tensor(ch_coords),
+            # Per-sample channel names — needed by the bilateralization-flip
+            # augmentation (model_for_physio.flip_augment) to build the
+            # homologous-channel swap permutation in the true data order.
+            'ch_names': [x['ch_names'] for x in batch],
         }
 
 
@@ -113,7 +98,6 @@ class LoadDataset(object):
     def __init__(self, params):
         self.params = params
         self.datasets_dir = params.datasets_dir
-        self.flip_aug = getattr(params, 'hemisphere_flip_aug', False)
         # Lazy-load the EA matrices sidecar only when the flag is set, so
         # default behaviour is unchanged. Sidecar path defaults to
         # ``<datasets_dir>/ea_subject.pt`` (next to the LMDB) but can be
@@ -130,7 +114,6 @@ class LoadDataset(object):
 
     def get_data_loader(self):
         train_set = CustomDataset(self.datasets_dir, mode='train',
-                                  flip_aug=self.flip_aug,
                                   ea_matrices=self.ea_matrices,
                                   highpass_hz=self.highpass_hz, fs=self.fs)
         val_set = CustomDataset(self.datasets_dir, mode='val',

@@ -95,6 +95,23 @@ def main():
     parser.add_argument('--equivariance_weight', type=float, default=0.0, help='weight for hemispheric equivariance loss (0 = disabled)')
     parser.add_argument('--info_max_weight', type=float, default=0.0, help='weight for VICReg-style info-max regulariser on inv/eq subspaces (0 = disabled)')
     parser.add_argument('--alignment_weight', type=float, default=1.0, help='weight for EEG-image contrastive alignment loss (0 = disabled)')
+    # --- Bilateralization prior (learned x = x_bi + x_lat split + flip-equivariant alignment) ---
+    parser.add_argument('--lateralization_flip', action='store_true', default=False,
+                        help='enable the bilateralization prior: a learned frontend splits the raw EEG into bilateral (x_bi) + lateral (x_lat) streams (x_bi + x_lat = x); flipping only x_lat across homologous channels (C3<->C4) builds x_flip whose encoding is aligned to the horizontally-flipped frame')
+    parser.add_argument('--flip_align_weight', type=float, default=1.0,
+                        help='weight for the flip-equivariant image-alignment loss (0 = disabled)')
+    parser.add_argument('--lat_sparsity_weight', type=float, default=0.01,
+                        help='weight for the lateral-gate minimality penalty (keeps x_lat small so most signal stays bilateral; 0 = disabled)')
+    parser.add_argument('--flip_split_hidden', type=int, default=64,
+                        help='hidden width of the LateralizationSplit gate network')
+    parser.add_argument('--flip_pred_weight', type=float, default=1.0,
+                        help='WorldModel: multiplier on the flipped-prediction terms (predict the flipped-future EEG latent from the flipped-current via x_bi+flip(x_lat)); 0 disables. Active only with --lateralization_flip and a predictor')
+    parser.add_argument('--flip_n_col_bands', type=int, default=2,
+                        help='number of vertical column bands for the centered spatial image descriptor (the flip target); 2 = left/right (strongest horizontal-flip signal), more = finer spatial detail; 1 = global pool (~flip-invariant CLS, ablation only)')
+    parser.add_argument('--flip_motion_ref', type=float, default=0.0,
+                        help='per-sample motion weighting of the flip loss: weight=clamp(motion/ref, flip_motion_min, 1) where motion=mean|frame_t+1 - frame_t|; 0 disables (uniform). EgoBrain static stretches have a near-vacuous flip, so ~15-20 down-weights them')
+    parser.add_argument('--flip_motion_min', type=float, default=0.0,
+                        help='floor on the per-sample flip motion weight so no row is fully zeroed')
     parser.add_argument('--use_volume_conduction', action='store_true', default=False,
                         help='replace the sinusoidal spherical-coord channel positional encoding with a volume-conduction-aware encoding (arXiv 2601.06134): learnable exp(-d/tau) distance kernel over per-sample 3D electrode positions, row-normalised, smoothed positions projected to d_model and added per channel')
     parser.add_argument('--vc_tau_init', type=float, default=0.08,

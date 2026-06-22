@@ -73,8 +73,24 @@ def main():
     parser.add_argument('--project_to_source', action='store_true', default=False, help='project sensors to source space before transformer')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name')
     parser.add_argument('--results_csv', type=str, default=None, help='path to CSV file for logging results')
-    parser.add_argument('--hemisphere_flip_aug', action='store_true', default=False,
-                        help='hemisphere-flip data augmentation with label swap (motor imagery)')
+    parser.add_argument('--lateral_flip_aug', action='store_true', default=False,
+                        help='bilateralization-prior flip augmentation (MI): reuse the pretrained learned x_bi/x_lat split to build x_flip = x_bi + flip(x_lat) and remap labels. Requires a --lateralization_flip-pretrained checkpoint')
+    parser.add_argument('--lateral_flip_prob', type=float, default=0.5,
+                        help='per-sample probability of applying the lateral-flip augmentation (training only)')
+    parser.add_argument('--lateral_flip_tta', action='store_true', default=False,
+                        help='test-time flip augmentation: average logits(x) with the label-aligned logits(x_flip). Uses the same learned split + flip_label_map')
+    parser.add_argument('--symmetrize_aug', action='store_true', default=False,
+                        help='思路1 augmentation: synthesize the hard bilateral class (both fists) from single-hand trials via x_sym = 0.5*(x + flip(x)) (raw full channel swap), relabeled to --symmetrize_target_label')
+    parser.add_argument('--symmetrize_aug_prob', type=float, default=0.25,
+                        help='per-sample probability of symmetrizing an eligible (single-hand) trial')
+    parser.add_argument('--symmetrize_src_labels', type=str, default='0,1',
+                        help='CSV of eligible source labels to symmetrize (PhysioNet-MI: 0,1 = left/right fist)')
+    parser.add_argument('--symmetrize_target_label', type=int, default=2,
+                        help='label assigned to symmetrized trials (PhysioNet-MI: 2 = both fists)')
+    parser.add_argument('--flip_label_map', type=str, default='1,0,2,3',
+                        help='CSV label remap under the flip, index->flipped index. PhysioNet-MI default 1,0,2,3 = left fist<->right fist, both fists/both feet unchanged. Length must equal --num_of_classes')
+    parser.add_argument('--flip_split_hidden', type=int, default=64,
+                        help='hidden width of the pretrained LateralizationSplit gate (must match the pretraining value)')
     parser.add_argument('--use_euclidean_alignment', action='store_true', default=False,
                         help='apply per-subject Euclidean Alignment whitening before patching. '
                              'Requires a precomputed sidecar at <datasets_dir>/ea_subject.pt '

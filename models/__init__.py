@@ -140,6 +140,13 @@ def get_model(params, brain_regions, sorted_indices):
             image_pool_heads=getattr(params, 'image_pool_heads', 4),
             use_volume_conduction=getattr(params, 'use_volume_conduction', False),
             vc_tau_init=getattr(params, 'vc_tau_init', 0.08),
+            lateralization_flip=getattr(params, 'lateralization_flip', False),
+            flip_align_weight=getattr(params, 'flip_align_weight', 1.0),
+            lat_sparsity_weight=getattr(params, 'lat_sparsity_weight', 0.01),
+            flip_split_hidden=getattr(params, 'flip_split_hidden', 64),
+            flip_n_col_bands=getattr(params, 'flip_n_col_bands', 2),
+            flip_motion_ref=getattr(params, 'flip_motion_ref', 0.0),
+            flip_motion_min=getattr(params, 'flip_motion_min', 0.0),
             **_spectral_band_kwargs(params),
         )
     elif params.model == 'WorldModel':
@@ -186,6 +193,13 @@ def get_model(params, brain_regions, sorted_indices):
             image_pool_heads=getattr(params, 'image_pool_heads', 4),
             use_volume_conduction=getattr(params, 'use_volume_conduction', False),
             vc_tau_init=getattr(params, 'vc_tau_init', 0.08),
+            lateralization_flip=getattr(params, 'lateralization_flip', False),
+            flip_align_weight=getattr(params, 'flip_align_weight', 1.0),
+            lat_sparsity_weight=getattr(params, 'lat_sparsity_weight', 0.01),
+            flip_split_hidden=getattr(params, 'flip_split_hidden', 64),
+            flip_n_col_bands=getattr(params, 'flip_n_col_bands', 2),
+            flip_motion_ref=getattr(params, 'flip_motion_ref', 0.0),
+            flip_motion_min=getattr(params, 'flip_motion_min', 0.0),
             **_spectral_band_kwargs(params),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
@@ -212,6 +226,7 @@ def get_model(params, brain_regions, sorted_indices):
             max_horizon=max_horizon,
             ramp_epochs=getattr(params, 'pred_ramp_epochs', 2),
             target_momentum=getattr(params, 'target_momentum', 0.998),
+            flip_pred_weight=getattr(params, 'flip_pred_weight', 1.0),
         )
         return model
     elif params.model == 'ActionWorldModel':

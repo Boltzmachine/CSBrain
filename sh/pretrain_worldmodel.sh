@@ -30,6 +30,21 @@
 # Each source has its own --{cinebrain,egobrain}_* knobs below; the unused
 # block is ignored by the active branch, so it's safe to leave them all set.
 #
+# --lateralization_flip (bilateralization prior): a learned frontend splits the
+# raw EEG additively into a bilateral stream x_bi and a lateral stream x_lat
+# (x_bi + x_lat = x). Swapping only x_lat across homologous channels (C3<->C4)
+# yields x_flip = x_bi + flip(x_lat); its encoding is aligned (InfoNCE, shared
+# projector) to the HORIZONTALLY-FLIPPED frame while the un-flipped encoding
+# aligns to the original frame — tying an EEG hemisphere swap to an image
+# mirror. --flip_align_weight scales that loss; --lat_sparsity_weight keeps
+# x_lat minimal so most signal stays bilateral. Needs frames (EgoBrain rows).
+# The image flip target is a CENTERED column-band spatial descriptor of the
+# patch grid (--flip_n_col_bands; 2 = left/right), NOT the global CLS — the CLS
+# is ~horizontal-flip-invariant (cos~0.97) so it makes the loss vacuous, while
+# the centered left/right descriptor is strongly flip-sensitive (cos~0.09 on
+# motion frames). --flip_motion_ref>0 down-weights static frames (whose flip is
+# near-vacuous) by the t->t+1 frame motion; 0 = uniform weighting.
+#
 # --egobrain_delta_whiten_g0 (ME->MI delta whitening): 1.0 = OFF. Set ~0.65-0.78
 # to attenuate EgoBrain's motor-execution delta floor toward the motor-imagery
 # (PhysioNet-MI) level. CALIBRATE g0 to the finetune LMDB MI delta (~46 montage /
@@ -38,7 +53,7 @@
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
-    --dataset_dir mix+egobrain \
+    --dataset_dir egobrain \
     --egobrain_n_windows 2 \
     --mix_alljoined_weight 1.0 \
     --mix_cinebrain_weight 1.0 \
@@ -67,6 +82,12 @@ python pretrain_main.py \
     --mask_ratio 0.5 \
     --clip_value 0.8 \
     --alignment_weight 0.1 \
+    --lateralization_flip \
+    --flip_align_weight 0.1 \
+    --lat_sparsity_weight 0.0 \
+    --flip_n_col_bands 2 \
+    --flip_motion_ref 0.0 \
+    --flip_pred_weight 1.0 \
     --latent_pred_weight 1.0 \
     --cls_pred_weight 0.1 \
     --max_horizon 1 \
@@ -75,4 +96,9 @@ python pretrain_main.py \
     --predictor_n_layers 4 \
     --model_dir outputs/ \
     --spectral_mode instantaneous \
-    --run_name wm-mix-reproduce
+    --aux_band_pred \
+    --aux_delta_band "0.5,4" \
+    --aux_power_bands "8,13;13,30" \
+    --aux_phase_weight 1.0 \
+    --aux_envelope_weight 0.005 \
+    --run_name wm-bilat

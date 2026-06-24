@@ -345,6 +345,17 @@ class WorldModelWrapper(nn.Module):
         #    the full mixed batch (CineBrain + Alljoined) so masked recon
         #    and image alignment train on every sample.
         encoder_batch = self._build_alignment_batch(batch, window_idx=0)
+        # Equivariant frame-averaging frontend (plans/eeg-wm.md): sample ONE
+        # ``flip`` for the whole step and share it across the current and future
+        # window encodes so the presentation (z vs P(z), original vs mirrored
+        # frame) is consistent. Eval is canonical (no flip).
+        frame_avg = getattr(self.encoder, 'frame_averaging', False)
+        flip = False
+        if frame_avg:
+            flip = (bool(torch.rand(()) < getattr(
+                        self.encoder, 'frame_avg_flip_prob', 0.5))
+                    if self.training else False)
+            encoder_batch['flip'] = flip
         # Supply a per-sample motion score (t->t+1 frame diff) so the encoder's
         # flip-alignment can down-weight static frames (whose horizontal flip is
         # near-vacuous). Only when that weighting is enabled on the encoder.
@@ -395,6 +406,12 @@ class WorldModelWrapper(nn.Module):
 
         future_batch = self._build_future_subbatch(
             batch, cb_idx, window_idx=k)
+        if frame_avg:
+            # Present the future window with the SAME flip so the regression
+            # target is the flipped-future EEG latent when this is a flip step
+            # (predict flipped future from flipped current — the bilateral
+            # control signal that makes the lateral decomposition non-trivial).
+            future_batch['flip'] = flip
         s_tpk_cls, s_tpk_patch = self._encode_future(future_batch)
         s_tpk_patch = s_tpk_patch.detach()
         s_tpk_cls = s_tpk_cls.detach()
@@ -446,8 +463,13 @@ class WorldModelWrapper(nn.Module):
         # main prediction). Trains encoder + split + predictor; the split now
         # also gets a temporal (dynamics) gradient, not just image alignment.
         # ------------------------------------------------------------------
+        # The legacy (raw-space split) flipped-prediction branch. Superseded by
+        # the frame-averaging path, where the shared per-step ``flip`` already
+        # presents both windows flipped — so the standard prediction loss above
+        # IS the flipped-prediction loss on flip steps. Skip it then.
         if (getattr(self.encoder, 'lateralization_flip', False)
-                and self.flip_pred_weight > 0):
+                and self.flip_pred_weight > 0
+                and not frame_avg):
             cb_list = cb_idx.tolist()
 
             def _sub(src, ts_key='timeseries'):

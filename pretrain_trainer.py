@@ -259,6 +259,14 @@ class Trainer(object):
                             freq_loss = (mag_diff_sq * bm).sum() / bm.sum().clamp(min=1)
                             loss = freq_loss + sum(loss_dict.values())
                             logs["freq_mask_loss"] = freq_loss.data.cpu().numpy()
+                        elif isinstance(out, tuple) and info.get('skip_external_recon', False):
+                            # Frame-averaging flip step: there is no ground-truth
+                            # flipped timeseries, so the model self-supervises the
+                            # reconstruction internally (frame_recon_loss in info).
+                            # Skip the external MSE(y, x) / aux-band terms here.
+                            # (frame_recon_loss is already in loss_dict + logs via
+                            # the info loop above, since its key contains 'loss'.)
+                            loss = sum(loss_dict.values())
                         else:
                             masked_x = x[mask == 1]
                             masked_y = y[mask == 1]

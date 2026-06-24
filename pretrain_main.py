@@ -112,6 +112,13 @@ def main():
                         help='per-sample motion weighting of the flip loss: weight=clamp(motion/ref, flip_motion_min, 1) where motion=mean|frame_t+1 - frame_t|; 0 disables (uniform). EgoBrain static stretches have a near-vacuous flip, so ~15-20 down-weights them')
     parser.add_argument('--flip_motion_min', type=float, default=0.0,
                         help='floor on the per-sample flip motion weight so no row is fully zeroed')
+    # --- Equivariant frame-averaging frontend (plans/eeg-wm.md) ---
+    parser.add_argument('--frame_averaging', action='store_true', default=False,
+                        help='upgrade the bilateral/lateral design into an invariance/equivariance decomposition under the homologous-channel swap P (P^2=I): a channel-independent frontend f produces z=z_bi+z_lat in feature space, then the transformer T is wrapped by frame averaging over {I,P} so h_bi=(T(z)+T(Pz))/2 is P-invariant and h_lat=(T(z)-P T(Pz))/2 is P-anti-equivariant; tokens split half-bilateral/half-lateral. A random per-step flip presents z or P(z) and the original/mirrored frame. Supersedes --lateralization_flip (mutually exclusive paths; frame_averaging takes precedence)')
+    parser.add_argument('--frame_avg_flip_prob', type=float, default=0.5,
+                        help='probability per training step of presenting the flipped orientation P(z) + horizontally-mirrored frame (frame averaging). 0.5 = balanced')
+    parser.add_argument('--frame_avg_recon_weight', type=float, default=1.0,
+                        help='weight of the flip-step reconstruction self-consistency loss: f(recon) matched to the presented clean latent P(z_clean) on masked patches (there is no ground-truth flipped timeseries). Non-flip steps use the standard masked MSE')
     parser.add_argument('--use_volume_conduction', action='store_true', default=False,
                         help='replace the sinusoidal spherical-coord channel positional encoding with a volume-conduction-aware encoding (arXiv 2601.06134): learnable exp(-d/tau) distance kernel over per-sample 3D electrode positions, row-normalised, smoothed positions projected to d_model and added per channel')
     parser.add_argument('--vc_tau_init', type=float, default=0.08,

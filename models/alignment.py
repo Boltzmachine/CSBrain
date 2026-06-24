@@ -778,7 +778,9 @@ class CSBrainAlign(nn.Module):
                  num_visual_levels=3, band_decorr_weight=0.01,
                  lateralization_flip=False, flip_align_weight=1.0,
                  lat_sparsity_weight=0.01, flip_split_hidden=64,
-                 flip_n_col_bands=2, flip_motion_ref=0.0, flip_motion_min=0.0):
+                 flip_n_col_bands=2, flip_motion_ref=0.0, flip_motion_min=0.0,
+                 frame_averaging=False, frame_avg_flip_prob=0.5,
+                 frame_avg_align_weight=1.0, frame_avg_recon_weight=1.0):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
@@ -1113,12 +1115,61 @@ class CSBrainAlign(nn.Module):
                 nn.Linear(d_model, self.flip_n_col_bands * self.image_feature_dim),
             )
 
+        # --- Equivariant frame-averaging frontend (plans/eeg-wm.md). Upgrades
+        # the raw-space bilateral/lateral split into a proper invariance/
+        # equivariance decomposition under the homologous-channel swap P
+        # (P^2 = I). A channel-independent frontend f produces z = z_bi + z_lat
+        # (split in *feature* space, on the patch embedding), and the transformer
+        # body T is wrapped by frame averaging over the 2-element group {I, P}:
+        #   h_bi  = (T(z) + T(P z)) / 2          (P-invariant  -> bilateral half)
+        #   h_lat = (T(z) - P T(P z)) / 2        (P-anti-equivariant -> lateral half)
+        # Tokens are split along the feature dim: h = [h_bi[:d/2] ; h_lat[d/2:]].
+        # A random per-step ``flip`` chooses whether to PRESENT z or P(z) (and the
+        # original vs horizontally-mirrored video frame); presenting P(z) only
+        # negates the lateral half, so the architecture is exactly equivariant.
+        self.frame_averaging = bool(frame_averaging)
+        self.frame_avg_flip_prob = float(frame_avg_flip_prob)
+        self.frame_avg_recon_weight = float(frame_avg_recon_weight)
+        if self.frame_averaging:
+            assert not self.project_to_source and not self.use_spectral_bands \
+                and not self.use_moe and not self.contrastive_band, (
+                "frame_averaging requires the plain CNN encoder path "
+                "(no project_to_source / use_spectral_bands / use_moe / "
+                "contrastive_band).")
+            assert self.add_global, (
+                "frame_averaging needs add_global for the global-token rep.")
+            assert self.patch_embed_type == 'cnn', (
+                "frame_averaging requires patch_embed_type='cnn'.")
+            # f must commute with P -> drop the cross-channel conv positional
+            # encoding so the patch embedding is channel-independent.
+            self.patch_embedding.drop_pos_conv = True
+            coord_pe_dim = 3 * 2 * self.spherical_num_freqs
+            # Feature-space split: a per-channel gate on the d_model patch
+            # embedding (not the raw signal). z_lat = g * z, z_bi = (1-g) * z.
+            self.frame_split = LateralizationSplit(
+                in_dim=d_model, coord_pe_dim=coord_pe_dim, hidden=flip_split_hidden,
+            )
+            assert self.flip_n_col_bands >= 1, "flip_n_col_bands must be >= 1"
+            # Projects the global token into the centered column-band image
+            # descriptor space for the same-sample hard-negative alignment (the
+            # presented vs opposite-orientation global rep must match the
+            # presented vs MIRRORED frame). Mirrors flip_align_proj but for the
+            # frame-averaging path.
+            self.frame_flip_align_proj = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(),
+                nn.Linear(d_model, self.flip_n_col_bands * self.image_feature_dim),
+            )
+
         self.apply(_weights_init)
 
         # Restore the near-zero gate init that the generic apply() above
         # overwrote, so the lateral stream starts ~0 (x_flip ~= x).
         if self.lateralization_flip:
             self.lateralization_split.reset_gate_init()
+        if self.frame_averaging:
+            # Start near-identity: z_lat ~ 0 so P(z) ~ z; the lateral stream
+            # grows only as the flipped-prediction objective demands.
+            self.frame_split.reset_gate_init()
 
         # Zero-init cross-band attention out_proj AFTER the generic init pass so
         # the band stream starts as an identity mix (controlled, near-baseline).
@@ -1752,6 +1803,258 @@ class CSBrainAlign(nn.Module):
         out['diag_lat_gate_mean'] = lat_frac.detach()
         return out
 
+    # ------------------------------------------------------------------
+    # Equivariant frame-averaging frontend (plans/eeg-wm.md)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _swap_channels(t, perm, channel_offset=0):
+        """Homologous-channel swap P on the channel axis of ``t`` (B, Ctot, N, d).
+
+        ``perm`` (B, C) is the per-sample real-channel permutation from
+        :func:`build_flip_perm_batch`. ``channel_offset`` is the number of
+        leading rows P must leave fixed (1 when a global channel sits at index 0,
+        0 on the raw per-channel tokens). P is an involution (perm is)."""
+        B, Ctot, N, d = t.shape
+        C = perm.size(1)
+        idx = torch.arange(Ctot, device=t.device).unsqueeze(0).expand(B, -1).clone()
+        idx[:, channel_offset:channel_offset + C] = perm + channel_offset
+        idx_exp = idx.view(B, Ctot, 1, 1).expand(B, Ctot, N, d)
+        return torch.gather(t, 1, idx_exp)
+
+    def _frame_transformer_body(self, z, ch_coords, vcm=None, vlm=None):
+        """The transformer block ``T`` over per-channel tokens ``z`` (B, C, N, d).
+
+        Adds the coord positional embedding, prepends the global channel/token
+        rows, and runs the encoder layer loop. Returns the full token grid
+        (B, C+1, N+1, d) (with the global rows) when ``add_global`` else
+        (B, C, N, d). Pure: it does NOT mutate ``batch`` masks (frame averaging
+        calls it twice per forward), and it computes no inline contrastive/recon
+        loss — those live in :meth:`_forward_frame_averaging` on the
+        frame-averaged representation.
+        """
+        B, C, N, d = z.shape
+        coord_pe, _ = self._spherical_positional_encoding(ch_coords)
+        coord_emb = self.coord_enhancement(coord_pe)            # (B, C, d)
+        patch_emb = z + coord_emb.unsqueeze(2)                  # (B, C, N, d)
+
+        if self.add_global:
+            patch_emb = torch.cat(
+                [self.global_channel.expand(B, -1, patch_emb.size(2), -1),
+                 patch_emb], dim=1)
+            patch_emb = torch.cat(
+                [self.global_token.expand(B, patch_emb.size(1), -1, -1),
+                 patch_emb], dim=2)
+            if vcm is not None:
+                vcm = torch.cat(
+                    [torch.ones_like(vcm[:, :1], dtype=torch.bool), vcm], dim=1)
+            if vlm is not None:
+                vlm = torch.cat(
+                    [torch.ones_like(vlm[:, :1], dtype=torch.bool), vlm], dim=1)
+
+        inter_window = ~vlm if vlm is not None else None
+        inter_region = ~vcm if vcm is not None else None
+        for layer_idx in range(self.encoder.num_layers):
+            patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
+            patch_emb = self.encoder.layers[layer_idx](
+                patch_emb, self.area_config,
+                inter_window_attn_mask=inter_window,
+                inter_region_attn_mask=inter_region,
+            )
+        return patch_emb
+
+    def _build_Pz(self, z, coord_pe, perm, vcm):
+        """Apply the operator P in feature space: P(z) = z_bi + flip(z_lat),
+        where z_lat = gate * z (learned per-channel split) and ``flip`` is the
+        homologous channel swap. Returns ``(P(z), gate)``. The body T is run on
+        BOTH z and P(z); ``flip`` only picks which combination is presented."""
+        z_lat, gate = self.frame_split(z, coord_pe, vcm)        # z_lat = g * z
+        z_lat_swapped = self._swap_channels(z_lat, perm, channel_offset=0)
+        Pz = z - z_lat + z_lat_swapped                          # z_bi + flip(z_lat)
+        return Pz, gate
+
+    def _forward_frame_averaging(self, batch, mask=None, encoder_only=False):
+        """Equivariant frame-averaging forward (see plans/eeg-wm.md).
+
+        1. Channel-independent frontend f: z = patch_embedding(x) (conv pos-enc
+           dropped) split additively into z_bi + z_lat in feature space.
+        2. P(z) = z_bi + flip(z_lat) (homologous channel swap of z_lat only).
+        3. Frame averaging over {I, P}: run T on z and P(z), combine into the
+           invariant (bilateral) and anti-equivariant (lateral) parts; the token
+           feature dim is split half-bilateral / half-lateral.
+        4. A random per-step ``flip`` presents z or P(z) and (downstream) the
+           original or horizontally-mirrored frame.
+        """
+        x = batch['timeseries']                                 # (B, C, N, in_dim)
+        ch_coords = batch['ch_coords']
+        ch_names = batch['ch_names']
+        vcm = batch.get('valid_channel_mask')
+        vlm = batch.get('valid_length_mask')
+        B, C, N, in_dim = x.shape
+
+        # Decide the presentation. The world-model wrapper sets a shared ``flip``
+        # so the current and future windows are presented consistently; a bare
+        # encoder samples per forward in train and is canonical (no flip) in eval
+        # so the equivariance test is deterministic.
+        if 'flip' in batch:
+            flip = bool(batch['flip'])
+        elif self.training:
+            flip = bool(torch.rand(()) < self.frame_avg_flip_prob)
+        else:
+            flip = False
+
+        # 1-2. Frontend + feature-space split + P operator.
+        z = self.patch_embedding(x, mask)                       # (B, C, N, d)
+        coord_pe, _ = self._spherical_positional_encoding(ch_coords)
+        perm = build_flip_perm_batch(ch_names, vcm).to(z.device)   # (B, C)
+        Pz, gate = self._build_Pz(z, coord_pe, perm, vcm)
+
+        # 3. Frame averaging: run T on z and P(z) (always both, independent of
+        #    `flip`), combine. Both orientations are available from this single
+        #    pair of body passes — `flip` only selects which combination is the
+        #    presented lateral half vs the opposite (hard-negative) one.
+        a = self._frame_transformer_body(z,  ch_coords, vcm, vlm)
+        b = self._frame_transformer_body(Pz, ch_coords, vcm, vlm)
+        off = 1 if self.add_global else 0
+        Pa = self._swap_channels(a, perm, channel_offset=off)
+        Pb = self._swap_channels(b, perm, channel_offset=off)
+        inv = 0.5 * (a + b)                                     # P-invariant
+        # P-anti-equivariant. Presenting P(z) swaps (a,b) -> the lateral half
+        # negates: eq(P z) = (b - P a)/2 = -P( (a - P b)/2 ).
+        eq = 0.5 * (b - Pa) if flip else 0.5 * (a - Pb)
+        # The OPPOSITE orientation's lateral half (free: just the other combo).
+        # Its global token is the present one with the lateral half negated, so
+        # it serves as the same-sample hard negative for image alignment.
+        eq_opp = 0.5 * (a - Pb) if flip else 0.5 * (b - Pa)
+        half = inv.size(-1) // 2
+        h = torch.cat([inv[..., :half], eq[..., half:]], dim=-1)   # (B, C+1, N+1, d)
+
+        if self.add_global:
+            global_rep = h[:, 0, 0, :]
+            patch_tokens = h[:, 1:, 1:, :]
+            opp_global = torch.cat(
+                [inv[:, 0, 0, :half], eq_opp[:, 0, 0, half:]], dim=-1)
+        else:
+            global_rep = h.mean(dim=(1, 2))
+            patch_tokens = h
+            opp_global = torch.cat(
+                [inv.mean((1, 2))[:, :half], eq_opp.mean((1, 2))[:, half:]], dim=-1)
+
+        if encoder_only:
+            return None, {"global_rep": global_rep, "patch_tokens": patch_tokens}
+
+        # Reconstruction head.
+        out = self.proj_out(h)
+        if self.add_global:
+            out = out[:, 1:, 1:, :]                             # (B, C, N, out_dim)
+
+        info = {"global_rep": global_rep, "patch_tokens": patch_tokens, "rep": None}
+
+        # Alignment loss: present-orientation global token -> present-orientation
+        # frame (original / horizontally-mirrored). Standard symmetric InfoNCE,
+        # reusing the image-contrastive machinery (self.alignment_weight).
+        has_image = batch.get('has_image')
+        if (self.alignment_weight > 0 and 'image_encoder_inputs' in batch
+                and has_image is not None and has_image.any()):
+            semantic_emb = self.semantic_readout(global_rep[has_image])
+            pred_flatten = self.contrastive_proj(semantic_emb)
+            align_batch = batch
+            if flip:
+                pv = batch['image_encoder_inputs']['pixel_values']
+                pv = torch.flip(pv, dims=[-1])                  # mirror horizontally
+                align_batch = {**batch, 'image_encoder_inputs': {
+                    **batch['image_encoder_inputs'], 'pixel_values': pv}}
+            info.update(self._image_contrastive(pred_flatten, align_batch, has_image))
+
+        # Same-sample HARD-NEGATIVE alignment on the global rep (restored from the
+        # legacy _flip_alignment). The presented and opposite-orientation global
+        # reps differ ONLY in the sign of the lateral half; they must align to the
+        # presented vs MIRRORED frame's CENTERED column-band descriptor (the CLS
+        # is ~flip-invariant -> vacuous). With a trivial (L-R symmetric) split the
+        # two reps coincide yet need different targets, so this directly penalises
+        # the trivial flip and forces the lateral half (and z_lat) to carry
+        # laterality. Cheap here: the opposite rep is already computed (eq_opp);
+        # no second EEG encode is needed.
+        if (self.flip_align_weight > 0 and 'image_encoder_inputs' in batch
+                and has_image is not None and has_image.any()):
+            idx = has_image.nonzero(as_tuple=True)[0]
+            pv = batch['image_encoder_inputs']['pixel_values'].index_select(0, idx)
+            desc_orig = self._image_lateral_descriptor(pv)
+            desc_mirror = self._image_lateral_descriptor(torch.flip(pv, dims=[-1]))
+            present_desc, opposite_desc = (
+                (desc_mirror, desc_orig) if flip else (desc_orig, desc_mirror))
+            pred_present = self.frame_flip_align_proj(global_rep.index_select(0, idx))
+            pred_opp = self.frame_flip_align_proj(opp_global.index_select(0, idx))
+            # Optional per-sample motion weighting (static frames flip ~vacuously).
+            weight = None
+            motion = batch.get('flip_motion')
+            if motion is not None and self.flip_motion_ref > 0:
+                mm = motion.index_select(0, idx).to(global_rep.dtype)
+                weight = torch.where(
+                    mm >= 0, mm / self.flip_motion_ref, torch.ones_like(mm)
+                ).clamp(min=self.flip_motion_min, max=1.0)
+            Q = torch.cat([pred_present, pred_opp], dim=0)
+            T = torch.cat([present_desc, opposite_desc], dim=0)
+            W = torch.cat([weight, weight], dim=0) if weight is not None else None
+            floss, facc = self._symmetric_infonce(Q, T, weight=W)
+            info['flip_align_loss'] = (self.flip_align_weight, floss)
+            info['flip_align_acc'] = facc
+            with torch.no_grad():
+                pn = F.normalize(pred_present, dim=-1)
+                po = F.normalize(pred_opp, dim=-1)
+                dp = F.normalize(present_desc, dim=-1)
+                do = F.normalize(opposite_desc, dim=-1)
+                info['diag_flip_discrim_acc'] = 0.5 * (
+                    ((pn * dp).sum(-1) > (pn * do).sum(-1)).float().mean()
+                    + ((po * do).sum(-1) > (po * dp).sum(-1)).float().mean())
+            if weight is not None:
+                info['diag_flip_motion_weight'] = weight.mean().detach()
+
+        # Reconstruction loss on flip steps. ALWAYS skip the trainer's external
+        # masked MSE(out, x): ``out`` reconstructs the PRESENTED (flipped) signal,
+        # so comparing it to the original ``x`` is wrong. The frontend-space
+        # self-consistency (no ground-truth flipped timeseries exists) — f(out)
+        # should match the presented CLEAN latent P(z_clean) on masked patches —
+        # is ALWAYS computed and logged so it stays monitorable, but it is only
+        # added to the optimised loss when --frame_avg_recon_weight > 0. Weight 0
+        # therefore disables recon's CONTRIBUTION on flip steps while still
+        # logging diag_frame_recon (compute is detached, so no backward cost).
+        if flip:
+            info['skip_external_recon'] = True
+            want_grad = self.frame_avg_recon_weight > 0
+            with torch.set_grad_enabled(want_grad):
+                z_recon = self.patch_embedding(out, None)       # f(reconstruction)
+                with torch.no_grad():
+                    z_clean = self.patch_embedding(x, None)
+                    zlat_clean, _ = self.frame_split(z_clean, coord_pe, vcm)
+                    Pz_clean = (z_clean - zlat_clean
+                                + self._swap_channels(zlat_clean, perm, 0))
+                if mask is not None and (mask == 1).any():
+                    m = (mask == 1)
+                    recon = F.mse_loss(z_recon[m], Pz_clean[m])
+                else:
+                    recon = F.mse_loss(z_recon, Pz_clean)
+            if want_grad:
+                info['frame_recon_loss'] = (self.frame_avg_recon_weight, recon)
+            else:
+                info['diag_frame_recon'] = recon.detach()
+
+        # Diagnostics.
+        with torch.no_grad():
+            if vcm is not None:
+                m = vcm.to(gate.dtype).view(B, C, 1, 1)
+                lat_frac = (gate * m).sum() / m.expand_as(gate).sum().clamp(min=1)
+            else:
+                lat_frac = gate.mean()
+            info['diag_frame_lat_gate_mean'] = lat_frac.detach()
+            info['diag_frame_flip'] = torch.tensor(float(flip), device=x.device)
+            info['diag_frame_lat_half_norm'] = (
+                eq[..., half:].norm(dim=-1).mean().detach())
+            info['diag_frame_bi_half_norm'] = (
+                inv[..., :half].norm(dim=-1).mean().detach())
+
+        return out, info
+
     def forward(self, batch, mask=None, encoder_only=False, band_idx=None):
         """Encode ``batch`` and (unless ``encoder_only``) compute losses.
 
@@ -1768,6 +2071,10 @@ class CSBrainAlign(nn.Module):
         ``self.band_patch_embeddings`` (requires ``contrastive_band=True``).
         When None the default ``self.patch_embedding`` is used.
         """
+        if self.frame_averaging:
+            return self._forward_frame_averaging(
+                batch, mask=mask, encoder_only=encoder_only)
+
         x = batch['timeseries'] # (B, n_ch, seq_len, in_dim)
         ch_coords = batch['ch_coords']
 
@@ -2261,10 +2568,17 @@ class MambaPatchEmbedding(nn.Module):
 
 class PatchEmbedding(nn.Module):
     def __init__(self, in_dim, out_dim, d_model, seq_len, causal=False,
-                 spectral_mode='static', stft_n_fft=64, stft_hop=1):
+                 spectral_mode='static', stft_n_fft=64, stft_hop=1,
+                 drop_pos_conv=False):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
+        # ``drop_pos_conv`` skips the depthwise Conv2d positional encoding (kernel
+        # 19 along the channel axis) — the only cross-channel mixer in this
+        # module. With it off the patch embedding is channel-independent and so
+        # commutes with the homologous-channel swap P (up to GroupNorm pooling),
+        # which is what the equivariant frame-averaging frontend f needs.
+        self.drop_pos_conv = bool(drop_pos_conv)
         if spectral_mode not in ('static', 'instantaneous'):
             raise ValueError(f"Unknown spectral_mode: {spectral_mode}")
         self.spectral_mode = spectral_mode
@@ -2407,13 +2721,14 @@ class PatchEmbedding(nn.Module):
             spectral_emb = self.spectral_proj(feats).view(bz, ch_num, patch_num, self.d_model)
         patch_emb = patch_emb + spectral_emb
 
-        pe_input = patch_emb.permute(0, 3, 1, 2)  # (B, d_model, ch, time)
-        if self.causal:
-            pe_input = F.pad(pe_input, (self.pos_time_pad, 0))  # left-pad time dim
-        positional_embedding = self.positional_encoding(pe_input)
-        positional_embedding = positional_embedding.permute(0, 2, 3, 1)
+        if not self.drop_pos_conv:
+            pe_input = patch_emb.permute(0, 3, 1, 2)  # (B, d_model, ch, time)
+            if self.causal:
+                pe_input = F.pad(pe_input, (self.pos_time_pad, 0))  # left-pad time dim
+            positional_embedding = self.positional_encoding(pe_input)
+            positional_embedding = positional_embedding.permute(0, 2, 3, 1)
 
-        patch_emb = patch_emb + positional_embedding
+            patch_emb = patch_emb + positional_embedding
 
         return patch_emb
 

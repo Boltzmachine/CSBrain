@@ -165,9 +165,13 @@ class Model(nn.Module):
             # the finetune backbone — tolerate (drop) them, fail loudly on
             # anything else. ``equiv_projector``: equivariance head;
             # ``lateralization_split`` / ``flip_align_proj``: bilateralization-
-            # prior heads (learned x_bi/x_lat split + horizontal-flip alignment).
+            # prior heads (learned x_bi/x_lat split + horizontal-flip alignment);
+            # ``frame_split``: feature-space split gate of the equivariant
+            # frame-averaging frontend (equi 2.0); ``frame_flip_align_proj``:
+            # its flip-alignment head — both pretrain-only like the above.
             _pretrain_only = ('equiv_projector', 'lateralization_split',
-                              'flip_align_proj')
+                              'flip_align_proj', 'frame_split',
+                              'frame_flip_align_proj')
             unexpected_keys = [k for k in unexpected_keys
                                if not any(t in k for t in _pretrain_only)]
             if unexpected_keys:

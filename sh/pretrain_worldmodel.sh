@@ -30,20 +30,32 @@
 # Each source has its own --{cinebrain,egobrain}_* knobs below; the unused
 # block is ignored by the active branch, so it's safe to leave them all set.
 #
-# --lateralization_flip (bilateralization prior): a learned frontend splits the
-# raw EEG additively into a bilateral stream x_bi and a lateral stream x_lat
-# (x_bi + x_lat = x). Swapping only x_lat across homologous channels (C3<->C4)
-# yields x_flip = x_bi + flip(x_lat); its encoding is aligned (InfoNCE, shared
-# projector) to the HORIZONTALLY-FLIPPED frame while the un-flipped encoding
-# aligns to the original frame — tying an EEG hemisphere swap to an image
-# mirror. --flip_align_weight scales that loss; --lat_sparsity_weight keeps
-# x_lat minimal so most signal stays bilateral. Needs frames (EgoBrain rows).
-# The image flip target is a CENTERED column-band spatial descriptor of the
-# patch grid (--flip_n_col_bands; 2 = left/right), NOT the global CLS — the CLS
-# is ~horizontal-flip-invariant (cos~0.97) so it makes the loss vacuous, while
-# the centered left/right descriptor is strongly flip-sensitive (cos~0.09 on
-# motion frames). --flip_motion_ref>0 down-weights static frames (whose flip is
-# near-vacuous) by the t->t+1 frame motion; 0 = uniform weighting.
+# --frame_averaging (equivariant frame-averaging frontend; plans/eeg-wm.md):
+# upgrades the bilateral/lateral split into a proper invariance/equivariance
+# decomposition under the homologous-channel swap P (C3<->C4, P^2=I). A
+# channel-independent frontend f (the CNN PatchEmbedding with its cross-channel
+# conv positional encoding dropped) produces z = z_bi + z_lat in FEATURE space;
+# P(z) = z_bi + flip(z_lat). The transformer T is then wrapped by frame
+# averaging over the 2-element group {I, P}:
+#   h_bi  = (T(z) + T(P z)) / 2     (P-invariant      -> bilateral half)
+#   h_lat = (T(z) - P T(P z)) / 2   (P-anti-equivariant -> lateral half)
+# Tokens split along the feature dim into a bilateral half and a lateral half.
+# --frame_avg_flip_prob is the per-step probability of PRESENTING P(z) together
+# with the HORIZONTALLY-MIRRORED frame; presenting P(z) only negates the lateral
+# half, so the architecture is exactly equivariant (verified in
+# tests/test_frame_averaging.py). On flip steps there is no ground-truth flipped
+# timeseries, so the reconstruction self-supervises in frontend space
+# (--frame_avg_recon_weight: f(recon) -> presented clean latent P(z_clean) on
+# masked patches) and the world-model predictor predicts the flipped-future EEG
+# latent from the flipped-current — the bilateral control signal that makes the
+# decomposition non-trivial. Alignment has TWO terms: (1) present-orientation
+# global token -> present frame CLS (--alignment_weight), and (2) a same-sample
+# HARD-NEGATIVE on the global rep (--flip_align_weight): the presented vs
+# opposite-orientation global rep must align to the presented vs MIRRORED frame's
+# centered column-band descriptor (--flip_n_col_bands; 2=left/right, the CLS is
+# ~flip-invariant so it can't serve here). Term (2) directly penalises a trivial
+# (L-R symmetric) split, forcing z_lat to carry laterality. Needs frames
+# (EgoBrain rows). Supersedes --lateralization_flip (do not set both).
 #
 # --egobrain_delta_whiten_g0 (ME->MI delta whitening): 1.0 = OFF. Set ~0.65-0.78
 # to attenuate EgoBrain's motor-execution delta floor toward the motor-imagery
@@ -82,12 +94,11 @@ python pretrain_main.py \
     --mask_ratio 0.5 \
     --clip_value 0.8 \
     --alignment_weight 0.1 \
-    --lateralization_flip \
+    --frame_averaging \
+    --frame_avg_flip_prob 0.5 \
+    --frame_avg_recon_weight 0.0 \
     --flip_align_weight 0.1 \
-    --lat_sparsity_weight 0.0 \
     --flip_n_col_bands 2 \
-    --flip_motion_ref 0.0 \
-    --flip_pred_weight 1.0 \
     --latent_pred_weight 1.0 \
     --cls_pred_weight 0.1 \
     --max_horizon 1 \
@@ -101,4 +112,4 @@ python pretrain_main.py \
     --aux_power_bands "8,13;13,30" \
     --aux_phase_weight 1.0 \
     --aux_envelope_weight 0.005 \
-    --run_name wm-bilat
+    --run_name wm-equi-flipalign-nofliprecon

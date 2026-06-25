@@ -185,8 +185,12 @@ class Trainer(object):
                             for key, value in info.items():
                                 if 'loss' in key:
                                     coef, lss = value
-                                    loss_dict[key] = coef * lss
+                                    # Always log the raw loss under its key; only
+                                    # ADD it to the optimised loss when its weight
+                                    # is nonzero (no weight*loss when weight==0).
                                     logs[key] = lss.data.cpu().numpy()
+                                    if coef != 0:
+                                        loss_dict[key] = coef * lss
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
                                 elif key.startswith('diag_'):
@@ -238,8 +242,12 @@ class Trainer(object):
                             for key, value in info.items():
                                 if 'loss' in key:
                                     coef, lss = value
-                                    loss_dict[key] = coef * lss
+                                    # Always log the raw loss under its key; only
+                                    # ADD it to the optimised loss when its weight
+                                    # is nonzero (no weight*loss when weight==0).
                                     logs[key] = lss.data.cpu().numpy()
+                                    if coef != 0:
+                                        loss_dict[key] = coef * lss
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
                                 elif key.startswith('diag_'):
@@ -297,13 +305,14 @@ class Trainer(object):
                                     power_bands=_parse_bands(
                                         getattr(self.params, 'aux_power_bands', '8,13;13,30')),
                                 )
-                                loss = (
-                                    loss
-                                    + self.params.aux_phase_weight * phase_loss
-                                    + self.params.aux_envelope_weight * env_loss
-                                )
+                                # Log both always; add each only when its weight
+                                # is nonzero (no weight*loss at weight==0).
                                 logs["aux_phase_loss"] = phase_loss.data.cpu().numpy()
                                 logs["aux_env_loss"] = env_loss.data.cpu().numpy()
+                                if self.params.aux_phase_weight != 0:
+                                    loss = loss + self.params.aux_phase_weight * phase_loss
+                                if self.params.aux_envelope_weight != 0:
+                                    loss = loss + self.params.aux_envelope_weight * env_loss
                     else:
                         out = self.model.training_step(batch, mask=None)
 
@@ -314,8 +323,12 @@ class Trainer(object):
                             for key, value in info.items():
                                 if 'loss' in key:
                                     coef, lss = value
-                                    loss_dict[key] = coef * lss
+                                    # Always log the raw loss under its key; only
+                                    # ADD it to the optimised loss when its weight
+                                    # is nonzero (no weight*loss when weight==0).
                                     logs[key] = lss.data.cpu().numpy()
+                                    if coef != 0:
+                                        loss_dict[key] = coef * lss
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
                                 elif key.startswith('diag_'):

@@ -62,6 +62,16 @@
 # (PhysioNet-MI) level. CALIBRATE g0 to the finetune LMDB MI delta (~46 montage /
 # ~42 central, in percent) with a quick scipy.welch sweep; too-strong a gain
 # overshoots past MI and HURTS. See project_me_mi_pretrain_manipulation.
+#
+# --aux_hand_pred (hand-movement decoding auxiliary; EgoBrain rows only): regress
+# the CONTINUOUS per-window left/right hand-movement intensity (the WiLoR
+# annotations in data/EgoBrain/cache_hand_labels_*; see
+# datasets/egobrain_hand_labels.py) off each window's global rep with a small MLP
+# head + masked SmoothL1 (per-column valid; undetected hand skipped). The
+# --egobrain_hand_labels_dir slug (w1.0s1.0_e0.5_nw2_k7_c4.0_fs200) MUST match the
+# egobrain window knobs above, or the (clip,window) keys misalign. On
+# frame-averaging flip steps the left/right targets swap (mirrored scene). Watch
+# hand_pred_loss / diag_hand_mae / diag_hand_valid_frac in wandb. Off without the flag.
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
@@ -112,4 +122,7 @@ python pretrain_main.py \
     --aux_power_bands "8,13;13,30" \
     --aux_phase_weight 1.0 \
     --aux_envelope_weight 0.005 \
-    --run_name wm-equi-flipalign-nofliprecon
+    --run_name wm-noequi-v2-flipnorecon-hand \
+    --aux_hand_pred \
+    --aux_hand_weight 0.1 \
+    --egobrain_hand_labels_dir data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200 \

@@ -10,6 +10,7 @@ from models.CSBrain_transformerlayer import *
 from models.CSBrain_transformer import *
 from models.adversarial import SessionDiscriminator
 from models.llm_vq import LLMEmbeddingVQ
+from utils.util import hand_regression_loss
 from collections import Counter
 from collections import defaultdict
 
@@ -780,9 +781,16 @@ class CSBrainAlign(nn.Module):
                  lat_sparsity_weight=0.01, flip_split_hidden=64,
                  flip_n_col_bands=2, flip_motion_ref=0.0, flip_motion_min=0.0,
                  frame_averaging=False, frame_avg_flip_prob=0.5,
-                 frame_avg_align_weight=1.0, frame_avg_recon_weight=1.0):
+                 frame_avg_align_weight=1.0, frame_avg_recon_weight=1.0,
+                 aux_hand_pred=False, aux_hand_weight=0.1, aux_hand_dim=2):
         super().__init__()
         self.d_model = d_model
+        # Auxiliary objective: decode continuous per-hand movement intensity
+        # (EgoBrain annotations) from the window's global rep. See
+        # _hand_pred_losses + utils.util.hand_regression_loss.
+        self.aux_hand_pred = aux_hand_pred
+        self.aux_hand_weight = aux_hand_weight
+        self.aux_hand_dim = aux_hand_dim
         self.causal = causal
         self.project_to_source = project_to_source # Does not work
         self.adversarial_weight = adversarial_weight
@@ -964,6 +972,14 @@ class CSBrainAlign(nn.Module):
         self.proj_out = nn.Sequential(
             nn.Linear(d_model, out_dim),
         )
+
+        # Auxiliary hand-movement regression head: global_rep (B, d_model) ->
+        # per-hand intensity (B, aux_hand_dim) = [left, right].
+        if aux_hand_pred:
+            hidden = max(64, d_model)
+            self.hand_pred_head = nn.Sequential(
+                nn.Linear(d_model, hidden), nn.GELU(),
+                nn.Linear(hidden, aux_hand_dim))
 
         self.add_global = True
         if self.add_global:
@@ -1822,22 +1838,29 @@ class CSBrainAlign(nn.Module):
         idx_exp = idx.view(B, Ctot, 1, 1).expand(B, Ctot, N, d)
         return torch.gather(t, 1, idx_exp)
 
-    def _frame_transformer_body(self, z, ch_coords, vcm=None, vlm=None):
-        """The transformer block ``T`` over per-channel tokens ``z`` (B, C, N, d).
+    @property
+    def _frame_backbone_layers(self):
+        """Layer indices of the equivariant BACKBONE: 0 .. num_layers-3 (the
+        readout/branch depth the standard path uses). The last 2 layers
+        (num_layers-2, num_layers-1) are the reconstruction decoder, applied
+        ONCE to the frame-averaged backbone output — not part of the equivariant
+        wrap."""
+        return range(self.encoder.num_layers - 2)
 
-        Adds the coord positional embedding, prepends the global channel/token
-        rows, and runs the encoder layer loop. Returns the full token grid
-        (B, C+1, N+1, d) (with the global rows) when ``add_global`` else
-        (B, C, N, d). Pure: it does NOT mutate ``batch`` masks (frame averaging
-        calls it twice per forward), and it computes no inline contrastive/recon
-        loss — those live in :meth:`_forward_frame_averaging` on the
-        frame-averaged representation.
-        """
+    @property
+    def _frame_recon_layers(self):
+        return range(self.encoder.num_layers - 2, self.encoder.num_layers)
+
+    def _frame_add_context(self, z, ch_coords, vcm=None, vlm=None):
+        """Add the coord positional embedding + global channel/token rows to the
+        per-channel tokens ``z`` (B, C, N, d). Returns
+        ``(patch_emb, vcm_g, vlm_g)`` where the masks are the global-expanded
+        versions. Pure: does NOT mutate ``batch`` (frame averaging calls it
+        twice per forward)."""
         B, C, N, d = z.shape
         coord_pe, _ = self._spherical_positional_encoding(ch_coords)
         coord_emb = self.coord_enhancement(coord_pe)            # (B, C, d)
         patch_emb = z + coord_emb.unsqueeze(2)                  # (B, C, N, d)
-
         if self.add_global:
             patch_emb = torch.cat(
                 [self.global_channel.expand(B, -1, patch_emb.size(2), -1),
@@ -1851,10 +1874,15 @@ class CSBrainAlign(nn.Module):
             if vlm is not None:
                 vlm = torch.cat(
                     [torch.ones_like(vlm[:, :1], dtype=torch.bool), vlm], dim=1)
+        return patch_emb, vcm, vlm
 
-        inter_window = ~vlm if vlm is not None else None
-        inter_region = ~vcm if vcm is not None else None
-        for layer_idx in range(self.encoder.num_layers):
+    def _frame_run_layers(self, patch_emb, layer_indices, vcm_g, vlm_g):
+        """Run the given encoder layers (with the TemEmbed residual) on
+        ``patch_emb`` (already has global rows). ``vcm_g``/``vlm_g`` are the
+        global-expanded masks from :meth:`_frame_add_context`."""
+        inter_window = ~vlm_g if vlm_g is not None else None
+        inter_region = ~vcm_g if vcm_g is not None else None
+        for layer_idx in layer_indices:
             patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
             patch_emb = self.encoder.layers[layer_idx](
                 patch_emb, self.area_config,
@@ -1909,12 +1937,17 @@ class CSBrainAlign(nn.Module):
         perm = build_flip_perm_batch(ch_names, vcm).to(z.device)   # (B, C)
         Pz, gate = self._build_Pz(z, coord_pe, perm, vcm)
 
-        # 3. Frame averaging: run T on z and P(z) (always both, independent of
-        #    `flip`), combine. Both orientations are available from this single
-        #    pair of body passes — `flip` only selects which combination is the
+        # 3. Frame averaging at the BACKBONE OUTPUT (layer num_layers-3). The
+        #    equivariant wrap covers only the backbone (layers 0..num_layers-3);
+        #    the last 2 layers are the reconstruction decoder (below). Run the
+        #    backbone on z and P(z) (always both, independent of `flip`) and
+        #    combine. Both orientations are available from this single pair of
+        #    backbone passes — `flip` only selects which combination is the
         #    presented lateral half vs the opposite (hard-negative) one.
-        a = self._frame_transformer_body(z,  ch_coords, vcm, vlm)
-        b = self._frame_transformer_body(Pz, ch_coords, vcm, vlm)
+        emb_z, vcm_g, vlm_g = self._frame_add_context(z, ch_coords, vcm, vlm)
+        emb_Pz, _, _ = self._frame_add_context(Pz, ch_coords, vcm, vlm)
+        a = self._frame_run_layers(emb_z, self._frame_backbone_layers, vcm_g, vlm_g)
+        b = self._frame_run_layers(emb_Pz, self._frame_backbone_layers, vcm_g, vlm_g)
         off = 1 if self.add_global else 0
         Pa = self._swap_channels(a, perm, channel_offset=off)
         Pb = self._swap_channels(b, perm, channel_offset=off)
@@ -1927,6 +1960,7 @@ class CSBrainAlign(nn.Module):
         # it serves as the same-sample hard negative for image alignment.
         eq_opp = 0.5 * (a - Pb) if flip else 0.5 * (b - Pa)
         half = inv.size(-1) // 2
+        # h = [bi_half ; lat_half] is the BACKBONE OUTPUT (the readout) at L-3.
         h = torch.cat([inv[..., :half], eq[..., half:]], dim=-1)   # (B, C+1, N+1, d)
 
         if self.add_global:
@@ -1943,12 +1977,44 @@ class CSBrainAlign(nn.Module):
         if encoder_only:
             return None, {"global_rep": global_rep, "patch_tokens": patch_tokens}
 
-        # Reconstruction head.
-        out = self.proj_out(h)
+        # Reconstruction decoder: the post-backbone layers (num_layers-2 ..
+        # num_layers-1) applied ONCE to the frame-averaged backbone output h,
+        # then proj_out. These layers are a decoder, not part of the equivariant
+        # wrap.
+        dec = self._frame_run_layers(h, self._frame_recon_layers, vcm_g, vlm_g)
+        out = self.proj_out(dec)
         if self.add_global:
             out = out[:, 1:, 1:, :]                             # (B, C, N, out_dim)
 
-        info = {"global_rep": global_rep, "patch_tokens": patch_tokens, "rep": None}
+        # ``rep`` is the finetune-facing representation (model_for_physio reads
+        # info['rep']): the FULL frame-averaged backbone grid h (B, C+1, N+1, d)
+        # at L-3 — INCLUDING the global-channel/global-token rows, exactly like
+        # the standard path's branch_embs. The global token [:,0,0] is where the
+        # image alignment, the same-sample hard negative, the world-model
+        # prediction (global_rep) and the hand-pred head all apply their loss, so
+        # it carries the bulk of the supervised signal and must be in the
+        # finetune readout. Each token is h = [bi_half ; lat_half].
+        # Finetune-readout ablation. The backbone token is h=[inv_half;eq_half].
+        # ``frame_rep_mode`` selects which half of the PATCH tokens the classifier
+        # reads: the P-INVARIANT (bilateral) half 'inv', the P-ANTI-EQUIVARIANT
+        # (lateral) half 'eq', or both (default, full grid h). The global token
+        # global_rep = h[:,0,0] is ALWAYS kept in FULL (both halves) and prepended
+        # — the supervised readout anchor (image align / hand-pred / WM predict
+        # all apply there) is never halved, even in inv/eq mode. No effect on
+        # pretraining (mode defaults to 'both').
+        # 'inv'/'eq': global token kept FULL, only patch tokens sliced to the
+        # half. 'inv_split'/'eq_split': the global token is ALSO split — slice the
+        # WHOLE grid h (global rows + patches) to the half.
+        _rep_mode = getattr(self, 'frame_rep_mode', 'both')
+        if _rep_mode in ('inv', 'eq'):
+            p = patch_tokens[..., :half] if _rep_mode == 'inv' else patch_tokens[..., half:]
+            rep = torch.cat([global_rep, p.reshape(global_rep.size(0), -1)], dim=1)
+        elif _rep_mode in ('inv_split', 'eq_split'):
+            rep = h[..., :half] if _rep_mode == 'inv_split' else h[..., half:]
+        else:
+            rep = h
+        info = {"global_rep": global_rep, "patch_tokens": patch_tokens,
+                "rep": rep}
 
         # Alignment loss: present-orientation global token -> present-orientation
         # frame (original / horizontally-mirrored). Standard symmetric InfoNCE,
@@ -2015,10 +2081,11 @@ class CSBrainAlign(nn.Module):
         # so comparing it to the original ``x`` is wrong. The frontend-space
         # self-consistency (no ground-truth flipped timeseries exists) — f(out)
         # should match the presented CLEAN latent P(z_clean) on masked patches —
-        # is ALWAYS computed and logged so it stays monitorable, but it is only
-        # added to the optimised loss when --frame_avg_recon_weight > 0. Weight 0
-        # therefore disables recon's CONTRIBUTION on flip steps while still
-        # logging diag_frame_recon (compute is detached, so no backward cost).
+        # is ALWAYS computed and emitted under the SINGLE key ``frame_recon_loss``
+        # (one consistent log key). The trainer logs every loss key but only ADDS
+        # it to the optimised loss when its weight != 0 — so weight 0 disables the
+        # CONTRIBUTION while keeping the metric logged (and here we also skip the
+        # backward graph via set_grad_enabled, so 0 weight costs nothing).
         if flip:
             info['skip_external_recon'] = True
             want_grad = self.frame_avg_recon_weight > 0
@@ -2034,10 +2101,7 @@ class CSBrainAlign(nn.Module):
                     recon = F.mse_loss(z_recon[m], Pz_clean[m])
                 else:
                     recon = F.mse_loss(z_recon, Pz_clean)
-            if want_grad:
-                info['frame_recon_loss'] = (self.frame_avg_recon_weight, recon)
-            else:
-                info['diag_frame_recon'] = recon.detach()
+            info['frame_recon_loss'] = (self.frame_avg_recon_weight, recon)
 
         # Diagnostics.
         with torch.no_grad():
@@ -2053,7 +2117,29 @@ class CSBrainAlign(nn.Module):
             info['diag_frame_bi_half_norm'] = (
                 inv[..., :half].norm(dim=-1).mean().detach())
 
+        # Auxiliary hand-movement regression (flip step -> swap L/R targets).
+        info.update(self._hand_pred_losses(global_rep, batch, flip=flip))
         return out, info
+
+    def _hand_pred_losses(self, global_rep, batch, flip=False):
+        """Auxiliary continuous hand-movement regression from the window's
+        global rep. Emits ``info['hand_pred_loss']=(weight, loss)`` — auto-summed
+        and logged by the trainer — only when the objective is enabled AND the
+        batch carries targets (EgoBrain rows; Alljoined/CineBrain rows arrive as
+        None). ``flip`` (a frame-averaging flip step) swaps the left/right target
+        columns to match the mirrored scene. Returns ``{}`` otherwise, so steps
+        with no EgoBrain rows contribute nothing."""
+        if not self.aux_hand_pred or batch.get('hand_targets') is None:
+            return {}
+        pred = self.hand_pred_head(global_rep)                  # (B, aux_hand_dim)
+        loss, mae = hand_regression_loss(
+            pred, batch['hand_targets'].to(pred.dtype),
+            batch['hand_valid'], flip=flip)
+        return {
+            'hand_pred_loss': (self.aux_hand_weight, loss),
+            'diag_hand_mae': mae,
+            'diag_hand_valid_frac': batch['hand_valid'].float().mean().detach(),
+        }
 
     def forward(self, batch, mask=None, encoder_only=False, band_idx=None):
         """Encode ``batch`` and (unless ``encoder_only``) compute losses.
@@ -2390,6 +2476,7 @@ class CSBrainAlign(nn.Module):
             **equiv_losses,
             **flip_losses,
             **moe_losses,
+            **self._hand_pred_losses(global_rep, batch),
         }
     
     def training_step(self, *args, **kwargs):

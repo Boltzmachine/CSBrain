@@ -53,6 +53,22 @@ def _get_h5_frame_handle(path: str):
     return h
 
 
+# Per-worker cache of opened HDF5 hand-label-cache file handles (same fork
+# rationale as the frame handles above).
+_H5_HAND_HANDLES: dict = {}
+
+
+def _get_h5_hand_handle(path: str):
+    """Return (and cache) an open h5py File for the per-subject hand-label cache
+    (datasets/egobrain_hand_labels.py output: arrays (n_clips, n_windows))."""
+    h = _H5_HAND_HANDLES.get(path)
+    if h is None:
+        import h5py
+        h = h5py.File(path, 'r')
+        _H5_HAND_HANDLES[path] = h
+    return h
+
+
 # Cache the (mean, std) tensors for the active vision encoder so the fast
 # path can do tensor normalization in one call without re-allocating.
 _NORMALIZE_CACHE: dict = {}
@@ -167,6 +183,7 @@ class EgoBrainDataset(Dataset):
         clip_s: float = 4.0,
         max_channels: Optional[int] = None,
         frames_cache_dir: Optional[str] = None,
+        hand_labels_dir: Optional[str] = None,
         ea_matrices: Optional[dict] = None,
         delta_whiten_g0: float = 1.0,
         delta_whiten_cutoff_hz: float = 8.0,
@@ -222,6 +239,17 @@ class EgoBrainDataset(Dataset):
         self.frames_cache_dir = frames_cache_dir
         self.use_frames_cache = (load_frames and
                                  os.path.isdir(frames_cache_dir))
+
+        # Optional per-subject HDF5 hand-movement-annotation cache
+        # (datasets/egobrain_hand_labels.py): per-window continuous
+        # left/right intensities surfaced as 'hand_targets'/'hand_valid' for the
+        # auxiliary regression objective. Off (zeros + all-False mask) when the
+        # dir is absent. The cache's window slug MUST match this dataset's
+        # window_s/stride_s/erp_latency_s/n_windows/clip_s/fs_out or the
+        # (clip, window) keys silently misalign — same contract as the frames.
+        self.hand_labels_dir = hand_labels_dir
+        self.use_hand_labels = (hand_labels_dir is not None
+                                and os.path.isdir(hand_labels_dir))
         if load_frames and not self.use_frames_cache:
             # Live-decoding 4-5 GB GoPro MP4s on the fly is slow AND
             # memory-heavy — it OOM-kills DataLoader workers at scale. The
@@ -484,17 +512,54 @@ class EgoBrainDataset(Dataset):
                         print(f'[egobrain] batch frame load failed for '
                               f'{ch_path} @ {t_videos}: {_e}')
 
+        # Auxiliary continuous hand-movement targets (W, 2) = [left, right]
+        # intensity, with a per-column valid mask (undetected hand -> NaN -> 0 +
+        # invalid, so the regression loss skips it). Zeros + all-invalid when no
+        # hand-label cache is configured (then the aux loss masks this row out).
+        if self.use_hand_labels:
+            hand_targets, hand_valid = self._load_hand_labels(sub, c)
+        else:
+            hand_targets = torch.zeros(self.n_windows, 2, dtype=torch.float32)
+            hand_valid = torch.zeros(self.n_windows, 2, dtype=torch.bool)
+
         return {
             'timeseries': timeseries,
             'ch_coords': ch_coords,
             'ch_names': ch_names,
             'pixel_values': pixel_values,
             'has_image': has_image,
+            'hand_targets': hand_targets,
+            'hand_valid': hand_valid,
             'source': 'egobrain',
             'session_id': sub,
             'subject': sub,
             'local_clip_idx': c,
         }
+
+    def _load_hand_labels(self, sub, c):
+        """Per-window continuous hand targets + per-column valid mask for clip
+        ``c`` of ``sub``. Returns (hand_targets (W,2) float32, hand_valid (W,2)
+        bool). Mirrors the frame-cache read: index the (n_clips, n_windows)
+        arrays at [c]. Column 0 = left, 1 = right intensity; a hand is valid iff
+        the window has video AND its intensity is finite (undetected -> NaN)."""
+        W = self.n_windows
+        path = os.path.join(self.hand_labels_dir, f'{sub}.h5')
+        if not os.path.exists(path):
+            return (torch.zeros(W, 2, dtype=torch.float32),
+                    torch.zeros(W, 2, dtype=torch.bool))
+        h = _get_h5_hand_handle(path)
+        li = np.asarray(h['left_intensity'][c], dtype=np.float32)    # (nw,)
+        ri = np.asarray(h['right_intensity'][c], dtype=np.float32)
+        hv = np.asarray(h['has_video'][c]).astype(bool)
+        tgt = np.stack([np.nan_to_num(li), np.nan_to_num(ri)], axis=-1)  # (nw,2)
+        val = np.stack([hv & np.isfinite(li), hv & np.isfinite(ri)], axis=-1)
+        nw = tgt.shape[0]
+        if nw < W:                                  # pad (cache nw should match)
+            tgt = np.concatenate([tgt, np.zeros((W - nw, 2), np.float32)], 0)
+            val = np.concatenate([val, np.zeros((W - nw, 2), bool)], 0)
+        elif nw > W:
+            tgt, val = tgt[:W], val[:W]
+        return torch.from_numpy(tgt).float(), torch.from_numpy(val).bool()
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +603,11 @@ def collate_egobrain(batch):
             'pixel_values': pixel_values_all[:, 0],
         },
         'has_image': has_image_all[:, 0],
+        # Window-0 hand-movement regression targets + per-column valid mask.
+        # The encoder's masked-recon / global_rep is computed on window 0, so the
+        # aux target is window 0's (B, 2) = [left, right] intensity.
+        'hand_targets': torch.stack([b['hand_targets'][0] for b in batch]),
+        'hand_valid': torch.stack([b['hand_valid'][0] for b in batch]),
         'source': [b['source'] for b in batch],
         'session_id': [b.get('session_id', 'unknown') for b in batch],
     }
@@ -579,6 +649,8 @@ class EgoBrainIterableWrapper(IterableDataset):
                 'source': sample['source'],
                 'session_id': sample['session_id'],
                 'sfreq': sfreq,
+                'hand_targets': sample['hand_targets'][0],   # (2,) window 0
+                'hand_valid': sample['hand_valid'][0],       # (2,) window 0
             }
             if bool(sample['has_image'][0].item()):
                 out['pixel_values'] = sample['pixel_values'][0]

@@ -5,6 +5,7 @@ import signal
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from tqdm import tqdm
 import random
@@ -291,6 +292,39 @@ def band_phase_envelope_loss(pred, target, mask, fs,
     return phase_loss, envelope_loss
 
 
+def hand_regression_loss(pred, target, valid, flip=False):
+    """Masked SmoothL1 regression of per-hand movement intensity.
+
+    The continuous EgoBrain hand annotations (left/right intensity in
+    hand-lengths/s, see datasets/egobrain_hand_labels.py) decoded from the EEG
+    window representation as an auxiliary objective.
+
+    ``pred``/``target``/``valid`` are all ``(B, D)`` with column 0 = left hand,
+    column 1 = right hand (D is typically 2). ``valid`` is a PER-COLUMN mask:
+    an undetected hand has a NaN intensity (already replaced by 0 in ``target``)
+    AND ``valid=False`` for that column, so the loss never sees the NaN and never
+    penalises a hand we did not observe. ``flip=True`` marks a frame-averaging
+    flip step (the scene is horizontally mirrored, so left<->right swap): we swap
+    columns 0,1 of BOTH target and valid so the rep that saw the mirrored scene is
+    scored against the mirrored labels.
+
+    Returns ``(loss, mae)`` — scalar tensors; both are 0 when no column is valid
+    (so steps with no EgoBrain rows contribute nothing).
+    """
+    if flip and target.size(-1) >= 2:
+        idx = list(range(target.size(-1)))
+        idx[0], idx[1] = 1, 0
+        target = target[:, idx]
+        valid = valid[:, idx]
+    valid = valid.to(pred.dtype)
+    err = F.smooth_l1_loss(pred, target, reduction='none')      # (B, D)
+    denom = valid.sum().clamp(min=1.0)
+    loss = (err * valid).sum() / denom
+    with torch.no_grad():
+        mae = ((pred - target).abs() * valid).sum() / denom
+    return loss, mae
+
+
 def bandpass_decompose(x, fs, cutoffs):
     """Split ``x`` into ``len(cutoffs) + 1`` frequency-band time-domain views.
 
@@ -410,6 +444,16 @@ ARCH_PARAM_FIELDS = (
     'filterbank_kernel_size', 'filterbank_min_bw_hz',
     'use_cross_band_attn', 'cross_band_every', 'use_band_type_embedding',
     'num_visual_levels',
+    # Equivariant frame-averaging frontend (plans/eeg-wm.md). These change the
+    # encoder's FORWARD (channel-independent patch embed via drop_pos_conv +
+    # frame averaging over {I,P}) and add the frame_split / frame_flip_align_proj
+    # modules, so finetuning MUST rebuild the backbone with frame_averaging=True
+    # — otherwise the pretrained weights run in a different architecture
+    # (untrained conv pos-enc injected + no frame averaging). flip_split_hidden /
+    # flip_n_col_bands set those modules' weight shapes; flip_align_weight is
+    # carried for config consistency.
+    'frame_averaging', 'frame_avg_flip_prob', 'frame_avg_recon_weight',
+    'flip_split_hidden', 'flip_n_col_bands', 'flip_align_weight',
 )
 
 

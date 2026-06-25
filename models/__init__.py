@@ -150,6 +150,8 @@ def get_model(params, brain_regions, sorted_indices):
             frame_averaging=getattr(params, 'frame_averaging', False),
             frame_avg_flip_prob=getattr(params, 'frame_avg_flip_prob', 0.5),
             frame_avg_recon_weight=getattr(params, 'frame_avg_recon_weight', 1.0),
+            aux_hand_pred=getattr(params, 'aux_hand_pred', False),
+            aux_hand_weight=getattr(params, 'aux_hand_weight', 0.1),
             **_spectral_band_kwargs(params),
         )
     elif params.model == 'WorldModel':
@@ -206,6 +208,8 @@ def get_model(params, brain_regions, sorted_indices):
             frame_averaging=getattr(params, 'frame_averaging', False),
             frame_avg_flip_prob=getattr(params, 'frame_avg_flip_prob', 0.5),
             frame_avg_recon_weight=getattr(params, 'frame_avg_recon_weight', 1.0),
+            aux_hand_pred=getattr(params, 'aux_hand_pred', False),
+            aux_hand_weight=getattr(params, 'aux_hand_weight', 0.1),
             **_spectral_band_kwargs(params),
         )
         max_horizon = getattr(params, 'max_horizon', 1)

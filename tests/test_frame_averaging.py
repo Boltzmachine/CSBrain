@@ -181,10 +181,10 @@ class TestFrameAveragingForward(unittest.TestCase):
             self.assertTrue(proj_grad, f'proj got no grad (flip={flip})')
             self.assertTrue(split_grad, f'split got no grad (flip={flip})')
 
-    def test_recon_weight_zero_disables_flip_recon(self):
-        # frame_avg_recon_weight=0 -> recon does NOT contribute to the loss on
-        # flip steps (no frame_recon_loss), the external MSE(out, x) is STILL
-        # skipped (out is flipped), but the value is still logged (diag_frame_recon).
+    def test_recon_weight_zero_emits_one_key_with_zero_weight(self):
+        # frame_avg_recon_weight=0 -> recon is STILL emitted under the single key
+        # 'frame_recon_loss' (always logged), but with weight 0 so the trainer
+        # does not add it to the loss. The external MSE(out, x) is still skipped.
         enc = CSBrainAlign(
             in_dim=40, out_dim=40, d_model=40, dim_feedforward=160,
             seq_len=self.N, n_layer=3, nhead=4,
@@ -194,9 +194,11 @@ class TestFrameAveragingForward(unittest.TestCase):
         enc.train()
         _, info = enc({**self.batch, 'flip': True}, mask=self.mask)
         self.assertTrue(info.get('skip_external_recon', False))
-        self.assertNotIn('frame_recon_loss', info)
-        self.assertIn('diag_frame_recon', info)
-        self.assertTrue(torch.isfinite(info['diag_frame_recon']).item())
+        self.assertIn('frame_recon_loss', info)            # one consistent key
+        self.assertNotIn('diag_frame_recon', info)         # no separate diag key
+        coef, val = info['frame_recon_loss']
+        self.assertEqual(coef, 0.0)                        # -> trainer won't add it
+        self.assertTrue(torch.isfinite(val).item())
 
     def test_flip_recon_trains_split(self):
         _, info = self.enc({**self.batch, 'flip': True}, mask=self.mask)

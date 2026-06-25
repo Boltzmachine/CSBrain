@@ -91,6 +91,16 @@ def main():
                         help='CSV label remap under the flip, index->flipped index. PhysioNet-MI default 1,0,2,3 = left fist<->right fist, both fists/both feet unchanged. Length must equal --num_of_classes')
     parser.add_argument('--flip_split_hidden', type=int, default=64,
                         help='hidden width of the pretrained LateralizationSplit gate (must match the pretraining value)')
+    parser.add_argument('--frame_rep_mode', type=str, default='both',
+                        choices=['both', 'inv', 'eq', 'inv_split', 'eq_split'],
+                        help="frame-averaging finetune readout: which half of the "
+                             "backbone token h=[inv_half;eq_half] the classifier reads. "
+                             "'both' (default) = full h; 'inv'/'eq' = P-invariant "
+                             "(bilateral) / P-anti-equivariant (lateral) half of the PATCH "
+                             "tokens, with the global token kept FULL; 'inv_split'/'eq_split' "
+                             "= same half but the global token is ALSO split (whole grid h "
+                             "sliced). No-op unless the checkpoint is a frame-averaging "
+                             "(equi) model.")
     parser.add_argument('--use_euclidean_alignment', action='store_true', default=False,
                         help='apply per-subject Euclidean Alignment whitening before patching. '
                              'Requires a precomputed sidecar at <datasets_dir>/ea_subject.pt '

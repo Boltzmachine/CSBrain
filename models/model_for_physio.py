@@ -168,10 +168,12 @@ class Model(nn.Module):
             # prior heads (learned x_bi/x_lat split + horizontal-flip alignment);
             # ``frame_split``: feature-space split gate of the equivariant
             # frame-averaging frontend (equi 2.0); ``frame_flip_align_proj``:
-            # its flip-alignment head — both pretrain-only like the above.
+            # its flip-alignment head; ``hand_pred_head``: the continuous
+            # hand-movement regression aux head (gated on batch['hand_targets'],
+            # which finetune never supplies) — all pretrain-only like the above.
             _pretrain_only = ('equiv_projector', 'lateralization_split',
                               'flip_align_proj', 'frame_split',
-                              'frame_flip_align_proj')
+                              'frame_flip_align_proj', 'hand_pred_head')
             unexpected_keys = [k for k in unexpected_keys
                                if not any(t in k for t in _pretrain_only)]
             if unexpected_keys:
@@ -217,6 +219,20 @@ class Model(nn.Module):
                     persistent=False)
 
         self.backbone.proj_out = nn.Identity()
+
+        # Equivariant frame-averaging backbone: it auto-samples a random per-step
+        # ``flip`` whenever the encoder is in train() mode, which would corrupt
+        # finetune labels (the presented orientation would flip without a
+        # left<->right label remap). Pin the probability to 0 so the finetune
+        # forward is always the canonical (non-flipped) frame-averaged pass;
+        # controlled flip augmentation, if added, passes batch['flip']=True
+        # explicitly with a label remap.
+        if getattr(self.backbone, 'frame_averaging', False):
+            self.backbone.frame_avg_flip_prob = 0.0
+            # Readout ablation: which half of h=[inv_half;eq_half] the classifier
+            # sees — 'both' (default) | 'inv' (bilateral) | 'eq' (lateral). The
+            # global-token rows are kept in every mode.
+            self.backbone.frame_rep_mode = getattr(param, 'frame_rep_mode', 'both')
 
         if getattr(param, 'linear_probe', False):
             self.classifier = nn.LazyLinear(param.num_of_classes)

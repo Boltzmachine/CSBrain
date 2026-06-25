@@ -88,6 +88,17 @@
 # patches at the same (channel, time-patch) position of the same sample
 # together; other samples at that position are negatives.
 # ============================================================
+# --aux_hand_pred wires the EgoBrain hand-movement-decoding auxiliary (regress
+# the continuous per-window left/right hand intensity off the global rep; see
+# datasets/egobrain_hand_labels.py + utils.util.hand_regression_loss). NOTE it
+# only TRAINS when an EgoBrain source is in --dataset_dir; under the plain 'mix'
+# (Alljoined-only) branch below it is INERT (the head is built but never receives
+# targets -> the loss masks to nothing). To ACTIVATE: set --dataset_dir
+# mix+egobrain (or egobrain) and add the EgoBrain window knobs from
+# sh/pretrain_worldmodel.sh (--egobrain_window_s 1.0 --egobrain_stride_s 1.0
+# --egobrain_erp_latency_s 0.5 --egobrain_n_windows 2 --egobrain_clip_s 4.0) with
+# --seq_len 5, so the window patch count AND the hand-label cache slug
+# (w1.0s1.0_e0.5_nw2_k7_c4.0_fs200) both match.
 python pretrain_main.py \
     --model Align \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
@@ -103,6 +114,9 @@ python pretrain_main.py \
     --sessions_per_batch 16 \
     --spectral_mode instantaneous \
     --use_volume_conduction \
+    --aux_hand_pred \
+    --aux_hand_weight 0.1 \
+    --egobrain_hand_labels_dir data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200 \
     --run_name Align-time-volume
 
 

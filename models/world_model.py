@@ -293,7 +293,7 @@ class WorldModelWrapper(nn.Module):
             'ch_coords': batch['ch_coords'],
         }
         for k in ('ch_names', 'valid_channel_mask', 'valid_length_mask',
-                  'source'):
+                  'source', 'hand_targets', 'hand_valid'):
             if k in batch:
                 out[k] = batch[k]
         if window_idx == 0:

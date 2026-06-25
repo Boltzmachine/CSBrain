@@ -125,7 +125,23 @@ def collate_cached(batch):
             for x in batch
         ], dim=0)
 
+    # Auxiliary hand-movement regression targets (EgoBrain rows carry them;
+    # Alljoined/CineBrain rows do not -> zeros + an all-False per-column mask so
+    # the encoder's masked regression loss skips them). None when no row has any.
+    _hand = next((x['hand_targets'] for x in batch if 'hand_targets' in x), None)
+    hand_targets = hand_valid = None
+    if _hand is not None:
+        Dh = _hand.shape[-1]
+        hand_targets = torch.stack([
+            x['hand_targets'] if 'hand_targets' in x
+            else torch.zeros(Dh, dtype=_hand.dtype) for x in batch], dim=0)
+        hand_valid = torch.stack([
+            x['hand_valid'] if 'hand_valid' in x
+            else torch.zeros(Dh, dtype=torch.bool) for x in batch], dim=0)
+
     return {
+        'hand_targets': hand_targets,
+        'hand_valid': hand_valid,
         'timeseries': torch.stack([x['timeseries'] for x in batch], dim=0),
         'ch_coords': torch.stack([x['ch_coords'] for x in batch], dim=0),
         'ch_names': [x['ch_names'] for x in batch],

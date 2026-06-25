@@ -69,6 +69,10 @@ def main():
                         help='weight of the delta-phase auxiliary loss in --aux_band_pred. Raw phase loss is a bounded amplitude-weighted cosine distance and runs small (~0.01-0.05 once delta is reconstructed), so the default 1.0 makes its weighted contribution ~20%% of the plain mask_loss at convergence. Watch aux_phase_loss in wandb and retune so weight*aux_phase_loss sits ~10-30%% of mask_loss.')
     parser.add_argument('--aux_envelope_weight', type=float, default=0.005,
                         help='weight of the mu/beta power-envelope auxiliary loss in --aux_band_pred. Raw env loss is a log-power (dB-style) MSE and runs large (~1-10), so the default 0.005 makes its weighted contribution ~40%% of the plain mask_loss at convergence. Watch aux_env_loss in wandb and retune so weight*aux_env_loss sits ~10-40%% of mask_loss.')
+    parser.add_argument('--aux_hand_pred', action='store_true', default=False,
+                        help='Auxiliary objective: decode the CONTINUOUS EgoBrain hand-movement annotations (per-window left/right hand intensity in hand-lengths/s; see datasets/egobrain_hand_labels.py) from each EEG window global rep via a small MLP head + masked SmoothL1 regression, added to the pretrain loss as info["hand_pred_loss"]. Per-column masked to EgoBrain rows with a detected hand (undetected hand -> NaN -> skipped); non-EgoBrain rows contribute nothing. On frame-averaging flip steps the left/right targets are swapped to match the mirrored scene. Requires --egobrain_hand_labels_dir + an EgoBrain source. Watch hand_pred_loss / diag_hand_mae in wandb.')
+    parser.add_argument('--aux_hand_weight', type=float, default=0.1,
+                        help='weight of the --aux_hand_pred regression loss. Targets are O(0.05-4) hand-lengths/s (mostly <1) so SmoothL1 runs ~0.1-0.5; default 0.1 keeps weight*hand_pred_loss a small fraction of mask_loss. Retune so it sits ~5-20%% of mask_loss.')
     parser.add_argument('--dataset_dir', type=str, default='path/to/dataset', help='dataset_dir')
     parser.add_argument('--model_dir', type=str, default='outputs', help='model_dir') # eg. 'CSBrain/pth'
     parser.add_argument('--TemEmbed_kernel_sizes', type=str, default="[(1,), (3,), (5,)]")
@@ -224,6 +228,8 @@ def main():
     parser.add_argument('--egobrain_erp_latency_s', type=float, default=0.0, help='time shift added to the frame-lookup timestamp')
     parser.add_argument('--egobrain_load_frames', type=int, default=1, help='whether to decode raw video frames (0 disables the alignment term)')
     parser.add_argument('--egobrain_max_channels', type=int, default=32, help='cap on the EgoBrain channel count after 10-20 montage filtering')
+    parser.add_argument('--egobrain_hand_labels_dir', type=str, default=None,
+                        help='dir of per-subject hand-movement-annotation HDF5 (datasets/egobrain_hand_labels.py output, e.g. data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200). Enables the --aux_hand_pred objective. The window slug MUST match the egobrain_window_s/stride_s/erp_latency_s/n_windows/clip_s/fs_out used here or the (clip,window) label keys misalign.')
     parser.add_argument('--mix_egobrain_weight', type=float, default=1.0, help='sampling weight for EgoBrain in the mix+egobrain dataset')
     parser.add_argument('--egobrain_delta_whiten_g0', type=float, default=1.0,
                         help='ME->MI delta-whitening DC gain: per-channel low-freq gain at 0 Hz, '
@@ -532,6 +538,7 @@ def main():
             load_frames=bool(params.egobrain_load_frames),
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
+            hand_labels_dir=params.egobrain_hand_labels_dir,
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
@@ -603,6 +610,7 @@ def main():
             load_frames=bool(params.egobrain_load_frames),
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
+            hand_labels_dir=params.egobrain_hand_labels_dir,
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
@@ -655,6 +663,7 @@ def main():
             load_frames=bool(params.egobrain_load_frames),
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
+            hand_labels_dir=params.egobrain_hand_labels_dir,
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,

@@ -261,8 +261,34 @@ class Model(nn.Module):
             # global-token rows are kept in every mode.
             self.backbone.frame_rep_mode = getattr(param, 'frame_rep_mode', 'both')
 
+        # Bilateral two-bit head (PhysioNet-MI only): instead of a 4-way softmax,
+        # predict two independent sigmoids [left_hand_active, right_hand_active].
+        # The 4 classes are the joint code -- left fist=[1,0], right fist=[0,1],
+        # both fists=[1,1], both feet=[0,0]. Trained with BCE on the bit targets
+        # (see Trainer) and decoded back to the 4-class label for metrics. This
+        # bakes the lateralization structure (each bit = one hemisphere's hand)
+        # into the head instead of leaving it for a flat 4-way softmax to learn.
+        self.bilateral_head = getattr(param, 'bilateral_head', False)
+        if self.bilateral_head:
+            if param.num_of_classes != 4:
+                raise ValueError(
+                    "bilateral_head assumes the 4 PhysioNet-MI classes "
+                    "(left/right fist, both fists, both feet); got "
+                    f"num_of_classes={param.num_of_classes}")
+            # 4-class label -> (left_bit, right_bit) BCE target.
+            self.register_buffer(
+                'bilateral_bit_lut',
+                torch.tensor([[1., 0.], [0., 1.], [1., 1.], [0., 0.]]),
+                persistent=False)
+            # (left_bit * 2 + right_bit) -> 4-class label.
+            self.register_buffer(
+                'bilateral_decode_lut',
+                torch.tensor([3, 1, 0, 2], dtype=torch.long),
+                persistent=False)
+        n_out = 2 if self.bilateral_head else param.num_of_classes
+
         if getattr(param, 'linear_probe', False):
-            self.classifier = nn.LazyLinear(param.num_of_classes)
+            self.classifier = nn.LazyLinear(n_out)
         else:
             self.classifier = nn.Sequential(
                 nn.LazyLinear(4 * 200),
@@ -271,7 +297,7 @@ class Model(nn.Module):
                 nn.Linear(4 * 200, 200),
                 nn.ELU(),
                 nn.Dropout(param.dropout),
-                nn.Linear(200, param.num_of_classes)
+                nn.Linear(200, n_out)
             )
 
     def train(self, mode=True):
@@ -368,28 +394,44 @@ class Model(nn.Module):
         y[idx] = self.symmetrize_target_label
         return y
 
-    @torch.no_grad()
-    def frame_flip_augment(self, batch, y):
-        """Frame-native equivariance flip augmentation (training only).
+    def bilateral_bit_targets(self, y):
+        """Map 4-class labels (N,) -> two-bit BCE targets (N,2):
+        left fist->[1,0], right fist->[0,1], both fists->[1,1], both feet->[0,0].
+        Used by the Trainer's BCE loss when --bilateral_head is set."""
+        return self.bilateral_bit_lut.to(y.device)[y]
 
-        Per training step, with prob ``frame_flip_prob``, present the whole batch
-        in the MIRRORED orientation by setting ``batch['flip']=True`` (the
-        frame-averaging forward turns this into the channel-swapped/sign-negated
-        lateral half = the mirror's representation, no raw-signal edit) and remap
-        the labels left<->right via ``frame_flip_label_lut``. Otherwise pins
-        ``batch['flip']=False`` (canonical). No-op when disabled, in eval mode, or
-        on a non-frame-averaging backbone. Batch-level because the frame-avg
-        forward's ``flip`` is a single scalar."""
-        if not (self.frame_flip_aug and self.training):
-            return y
-        if not getattr(self.backbone, 'frame_averaging', False):
-            return y
-        if bool(torch.rand(()) < self.frame_flip_prob):
-            batch['flip'] = True
-            y = self.frame_flip_label_lut.to(y.device)[y]
-        else:
-            batch['flip'] = False
-        return y
+    @torch.no_grad()
+    def bilateral_decode(self, logits):
+        """Decode two-bit logits (N,2) -> 4-class label (N,). Threshold each bit
+        at 0 (sigmoid > 0.5), then look up the joint code via bilateral_decode_lut
+        ((left_bit*2 + right_bit) -> class). Used by the Evaluator."""
+        bits = (logits > 0).long()
+        idx = bits[:, 0] * 2 + bits[:, 1]
+        return self.bilateral_decode_lut.to(logits.device)[idx]
+
+    def frame_flip_forward(self, batch, y):
+        """Frame-native equivariance flip augmentation (training only) as a
+        2x-batch CONCAT. Run the canonical (flip=False) and mirrored (flip=True)
+        views of the WHOLE batch and stack them, pairing the mirrored half with
+        the left<->right label remap (frame_flip_label_lut). Every sample thus
+        contributes BOTH views every step, so there is no per-step all-or-nothing
+        instability (the frame-avg forward's ``flip`` is a single batch scalar, so
+        a per-batch coin flip would swing the entire batch). Returns
+        ``(logits, y)`` — doubled to 2B when active, else the plain forward. No
+        raw-signal edit, no learned split; ~2x forward compute/memory. ``flip=True``
+        gives the mirror's representation for free (lateral half negates &
+        channel-swaps; bilateral half unchanged). No-op (single forward) when
+        disabled, in eval, or on a non-frame-averaging backbone.
+
+        (--frame_flip_prob is unused in this concat scheme: both views always
+        appear; the flag is kept for a possible per-sample stochastic variant.)"""
+        if (self.frame_flip_aug and self.training
+                and getattr(self.backbone, 'frame_averaging', False)):
+            pred_o = self._forward_core({**batch, 'flip': False})
+            pred_f = self._forward_core({**batch, 'flip': True})
+            y_f = self.frame_flip_label_lut.to(y.device)[y]
+            return torch.cat([pred_o, pred_f], dim=0), torch.cat([y, y_f], dim=0)
+        return self(batch), y
 
     @torch.no_grad()
     def _forward_tta(self, batch):
@@ -421,7 +463,13 @@ class Model(nn.Module):
         learned split. Shallow copies so each _forward_core pops its own 'x'."""
         logits_o = self._forward_core({**batch, 'flip': False})
         logits_f = self._forward_core({**batch, 'flip': True})
-        lut = self.frame_flip_label_lut.to(logits_f.device)
+        if self.bilateral_head:
+            # The two output bits are [left_hand, right_hand]; the mirror swaps
+            # hemispheres, so the flipped pass's bits are realigned by swapping
+            # the two columns before averaging.
+            lut = torch.tensor([1, 0], device=logits_f.device)
+        else:
+            lut = self.frame_flip_label_lut.to(logits_f.device)
         return 0.5 * (logits_o + logits_f.index_select(1, lut))
 
     def forward(self, batch):

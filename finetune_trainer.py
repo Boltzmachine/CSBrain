@@ -46,6 +46,12 @@ class Trainer(object):
         elif self.params.downstream_dataset == 'SEED-VIG':
             self.criterion = MSELoss().cuda()
 
+        # Bilateral two-bit head: the model emits two independent sigmoids
+        # [left_hand, right_hand] instead of a 4-way logit, so train it with BCE
+        # on the bit targets (overrides the CrossEntropyLoss picked above for
+        # PhysioNet-MI). Decoding back to 4 classes happens in the Evaluator.
+        if getattr(self.params, 'bilateral_head', False):
+            self.criterion = BCEWithLogitsLoss().cuda()
 
         self.best_model_states = None
 
@@ -122,9 +128,13 @@ class Trainer(object):
                 # (single-hand -> both fists). Both may edit x and remap y.
                 y = self.model.flip_augment(batch)
                 y = self.model.symmetrize_augment(batch, y)
-                y = self.model.frame_flip_augment(batch, y)
-                pred = self.model(batch)
-                if self.params.downstream_dataset == 'ISRUC':
+                # Frame-native equivariance flip aug: 2x-batch concat of canonical
+                # + mirrored views (returns the plain forward when disabled).
+                pred, y = self.model.frame_flip_forward(batch, y)
+                if getattr(self.params, 'bilateral_head', False):
+                    # BCE over the two hemisphere bits; map 4-class y -> (N,2) bits.
+                    loss = self.criterion(pred, self.model.bilateral_bit_targets(y))
+                elif self.params.downstream_dataset == 'ISRUC':
                     loss = self.criterion(pred.transpose(1, 2), y)
                 else:
                     loss = self.criterion(pred, y)

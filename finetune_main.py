@@ -107,6 +107,14 @@ def main():
                              'the flipped logits remapped left<->right (--flip_label_map). '
                              'Symmetrizes the prediction over the reflection group. Needs no '
                              'split; no-op on a non-frame-averaging checkpoint.')
+    parser.add_argument('--bilateral_head', action='store_true', default=False,
+                        help='PhysioNet-MI only: replace the 4-way softmax with a '
+                             'two-bit sigmoid head [left_hand_active, '
+                             'right_hand_active]. The 4 classes are the joint code '
+                             '(left fist=[1,0], right fist=[0,1], both fists=[1,1], '
+                             'both feet=[0,0]); trained with BCE on the bit targets '
+                             'and decoded back to the 4-class label for metrics. '
+                             'Bakes the lateralization structure into the head.')
     parser.add_argument('--frame_rep_mode', type=str, default='both',
                         choices=['both', 'inv', 'eq', 'inv_split', 'eq_split'],
                         help="frame-averaging finetune readout: which half of the "

@@ -32,7 +32,11 @@ class Evaluator:
             y = batch['y']
 
             pred = model(batch)
-            pred_y = torch.max(pred, dim=-1)[1]
+            if getattr(model, 'bilateral_head', False):
+                # Two-bit head: decode [left,right] sigmoids -> 4-class label.
+                pred_y = model.bilateral_decode(pred)
+            else:
+                pred_y = torch.max(pred, dim=-1)[1]
 
             truths += y.cpu().squeeze().numpy().tolist()
             #preds += pred_y.cpu().squeeze().numpy().tolist()

@@ -40,6 +40,33 @@ class Model(nn.Module):
                 if t.strip() != '']
         self.register_buffer('symmetrize_src_labels',
                              torch.tensor(_src, dtype=torch.long), persistent=False)
+
+        # Frame-native equivariance flip augmentation (training only). For a
+        # frame-averaging backbone, presenting batch['flip']=True yields the
+        # mirrored-input representation FOR FREE (the lateral half negates &
+        # channel-swaps: eq(flip) = -P(eq); the bilateral half is unchanged), so
+        # we don't touch the raw signal. Pairs it with the left<->right label
+        # remap (--flip_label_map, default 1,0,2,3). Per-step (batch-level) coin
+        # flip, since the frame-avg forward's ``flip`` is a single batch scalar.
+        # Needs NO pretrained split (unlike --lateral_flip_aug); no-op on a
+        # non-frame checkpoint.
+        self.frame_flip_aug = getattr(param, 'frame_flip_aug', False)
+        self.frame_flip_prob = float(getattr(param, 'frame_flip_prob', 0.5))
+        # Frame-native test-time augmentation (eval only): symmetrize the
+        # prediction over the reflection group by averaging the canonical and
+        # flipped forward passes, with the flipped logits' columns remapped
+        # left<->right. See _forward_frame_flip_tta.
+        self.frame_flip_tta = getattr(param, 'frame_flip_tta', False)
+        if self.frame_flip_aug or self.frame_flip_tta:
+            _lut = [int(t) for t in
+                    str(getattr(param, 'flip_label_map', '1,0,2,3')).split(',')
+                    if t.strip() != '']
+            if len(_lut) != param.num_of_classes:
+                raise ValueError(
+                    f"flip_label_map has {len(_lut)} entries but "
+                    f"num_of_classes={param.num_of_classes}")
+            self.register_buffer('frame_flip_label_lut',
+                                 torch.tensor(_lut, dtype=torch.long), persistent=False)
         selected_channels = [
             'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 
             'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6',
@@ -342,6 +369,29 @@ class Model(nn.Module):
         return y
 
     @torch.no_grad()
+    def frame_flip_augment(self, batch, y):
+        """Frame-native equivariance flip augmentation (training only).
+
+        Per training step, with prob ``frame_flip_prob``, present the whole batch
+        in the MIRRORED orientation by setting ``batch['flip']=True`` (the
+        frame-averaging forward turns this into the channel-swapped/sign-negated
+        lateral half = the mirror's representation, no raw-signal edit) and remap
+        the labels left<->right via ``frame_flip_label_lut``. Otherwise pins
+        ``batch['flip']=False`` (canonical). No-op when disabled, in eval mode, or
+        on a non-frame-averaging backbone. Batch-level because the frame-avg
+        forward's ``flip`` is a single scalar."""
+        if not (self.frame_flip_aug and self.training):
+            return y
+        if not getattr(self.backbone, 'frame_averaging', False):
+            return y
+        if bool(torch.rand(()) < self.frame_flip_prob):
+            batch['flip'] = True
+            y = self.frame_flip_label_lut.to(y.device)[y]
+        else:
+            batch['flip'] = False
+        return y
+
+    @torch.no_grad()
     def _forward_tta(self, batch):
         """Test-time flip augmentation: average logits(x) with the label-aligned
         logits(x_flip). x_flip = x_bi + flip(x_lat) (the learned split). The
@@ -360,10 +410,27 @@ class Model(nn.Module):
         lut = self.flip_label_lut.to(logits_f.device)
         return 0.5 * (logits_o + logits_f.index_select(1, lut))
 
+    @torch.no_grad()
+    def _forward_frame_flip_tta(self, batch):
+        """Frame-native test-time augmentation: symmetrize the prediction over
+        the reflection group. Run the forward canonically (flip=False) and
+        mirrored (flip=True, the frame-averaging forward gives the mirror's
+        representation for free), remap the flipped logits' columns left<->right
+        via ``frame_flip_label_lut`` (the mirrored input's class lut[k] is
+        evidence for original class k), and average. No raw-signal edit, no
+        learned split. Shallow copies so each _forward_core pops its own 'x'."""
+        logits_o = self._forward_core({**batch, 'flip': False})
+        logits_f = self._forward_core({**batch, 'flip': True})
+        lut = self.frame_flip_label_lut.to(logits_f.device)
+        return 0.5 * (logits_o + logits_f.index_select(1, lut))
+
     def forward(self, batch):
         # Test-time flip augmentation (eval only): see _forward_tta.
         if self.lateral_flip_tta and self._needs_split and not self.training:
             return self._forward_tta(batch)
+        if (self.frame_flip_tta and not self.training
+                and getattr(self.backbone, 'frame_averaging', False)):
+            return self._forward_frame_flip_tta(batch)
         return self._forward_core(batch)
 
     def _forward_core(self, batch):

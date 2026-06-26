@@ -122,6 +122,7 @@ class Trainer(object):
                 # (single-hand -> both fists). Both may edit x and remap y.
                 y = self.model.flip_augment(batch)
                 y = self.model.symmetrize_augment(batch, y)
+                y = self.model.frame_flip_augment(batch, y)
                 pred = self.model(batch)
                 if self.params.downstream_dataset == 'ISRUC':
                     loss = self.criterion(pred.transpose(1, 2), y)
@@ -166,7 +167,16 @@ class Trainer(object):
                     )
                 )
                 print(cm)
-                wandb.log({"val/acc": acc, "val/kappa": kappa, "val/f1": f1})
+                # Also evaluate the test set each epoch (DIAGNOSTIC ONLY — model
+                # selection below still uses val acc, and the returned/saved test
+                # number is still the best-val model's). Uses the CURRENT model,
+                # so wandb shows the true per-epoch test learning curve.
+                t_acc, t_kappa, t_f1, _ = self.test_eval.get_metrics_for_multiclass(self.model)
+                print("  [test curve] epoch {}: acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
+                    epoch + 1, t_acc, t_kappa, t_f1))
+                wandb.log({"epoch": epoch + 1,
+                           "val/acc": acc, "val/kappa": kappa, "val/f1": f1,
+                           "test/acc": t_acc, "test/kappa": t_kappa, "test/f1": t_f1})
                 if acc > acc_best: # zhouyc
                     print("kappa increasing....saving weights !! ")
                     print("Val Evaluation: acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(

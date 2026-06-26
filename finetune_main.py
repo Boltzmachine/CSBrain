@@ -91,6 +91,22 @@ def main():
                         help='CSV label remap under the flip, index->flipped index. PhysioNet-MI default 1,0,2,3 = left fist<->right fist, both fists/both feet unchanged. Length must equal --num_of_classes')
     parser.add_argument('--flip_split_hidden', type=int, default=64,
                         help='hidden width of the pretrained LateralizationSplit gate (must match the pretraining value)')
+    parser.add_argument('--frame_flip_aug', action='store_true', default=False,
+                        help='frame-native equivariance flip augmentation (training only): '
+                             'with prob --frame_flip_prob present the batch mirrored via '
+                             "batch['flip']=True (frame-averaging forward gives the mirrored "
+                             'representation for free) + left<->right label remap '
+                             '(--flip_label_map). Needs NO pretrained split; no-op on a '
+                             'non-frame-averaging checkpoint.')
+    parser.add_argument('--frame_flip_prob', type=float, default=0.5,
+                        help='per-step probability of presenting the batch flipped under '
+                             '--frame_flip_aug')
+    parser.add_argument('--frame_flip_tta', action='store_true', default=False,
+                        help='frame-native test-time augmentation (eval only): average the '
+                             'canonical and mirrored (batch[flip]=True) forward passes, with '
+                             'the flipped logits remapped left<->right (--flip_label_map). '
+                             'Symmetrizes the prediction over the reflection group. Needs no '
+                             'split; no-op on a non-frame-averaging checkpoint.')
     parser.add_argument('--frame_rep_mode', type=str, default='both',
                         choices=['both', 'inv', 'eq', 'inv_split', 'eq_split'],
                         help="frame-averaging finetune readout: which half of the "

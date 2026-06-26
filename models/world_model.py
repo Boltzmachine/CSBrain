@@ -105,6 +105,133 @@ class LatentPredictor(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Frame predictor (cross-modal objective)
+# ---------------------------------------------------------------------------
+
+class FramePredictor(nn.Module):
+    """Predict ``ŝ_{t+k}^{frame}`` from the current frame's per-patch grid,
+    conditioned on the current EEG embedding.
+
+    The drop-in alternative to :class:`LatentPredictor`: instead of forecasting
+    the next EEG latent from the current EEG latent, it forecasts the next
+    *video frame's* per-patch embedding from the current frame's per-patch
+    embedding **conditioned on the current EEG embedding**. Targets are produced
+    by the *frozen* vision encoder, so — unlike the EEG-latent path — there is
+    no representation collapse and no EMA teacher is needed.
+
+    The EEG conditioning can be a single global vector ``(B, eeg_dim)`` (the
+    encoder's window-level global rep) or the full per-patch token set
+    ``(B, M, eeg_dim)`` (``M = C*N``); ``forward`` accepts either and the caller
+    picks. It is injected two ways: prepended as conditioning token(s) *and*
+    (pooled) added to every frame token as a FiLM-style bias. The direct bias
+    matters because 1 s frames are ~94% static in DINOv2/V-JEPA space, so the
+    predictor is tempted to settle on the trivial identity-copy
+    (``ŝ_{t+1} ≈ s_t``) and let the EEG gradient vanish; a strong, direct EEG
+    path keeps it used from step 1.
+    """
+
+    def __init__(
+        self,
+        frame_dim: int,
+        eeg_dim: int,
+        predictor_d_model: int = 512,
+        n_layers: int = 4,
+        n_heads: int = 8,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        max_horizon: int = 1,
+        max_tokens: int = 1024,
+    ):
+        super().__init__()
+        self.frame_dim = frame_dim
+        self.eeg_dim = eeg_dim
+        self.predictor_d_model = predictor_d_model
+
+        self.in_proj_frame = nn.Linear(frame_dim, predictor_d_model)
+        self.in_proj_eeg = nn.Linear(eeg_dim, predictor_d_model)
+        # FiLM-style direct broadcast of the EEG embedding onto every frame token.
+        self.eeg_to_frame_bias = nn.Linear(eeg_dim, predictor_d_model)
+        # Distinguishes the prepended EEG token from the frame tokens.
+        self.eeg_type_embed = nn.Parameter(torch.zeros(1, 1, predictor_d_model))
+
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, max_tokens, predictor_d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.horizon_embed = nn.Embedding(max_horizon + 1, predictor_d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=predictor_d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=F.gelu,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm_out = nn.LayerNorm(predictor_d_model)
+        self.out_proj = nn.Linear(predictor_d_model, frame_dim)
+
+    def forward(
+        self,
+        s_frame_t: torch.Tensor,   # (B, P, frame_dim)
+        eeg_emb: torch.Tensor,     # (B, eeg_dim) global OR (B, M, eeg_dim) tokens
+        horizon: int = 1,
+        eeg_key_padding_mask: Optional[torch.Tensor] = None,  # (B, M) True=ignore
+    ) -> torch.Tensor:
+        """Return ``ŝ_{t+k}^{frame}`` of shape ``(B, P, frame_dim)``.
+
+        ``eeg_emb`` may be a single global vector ``(B, eeg_dim)`` or a set of
+        per-patch EEG tokens ``(B, M, eeg_dim)``; both are handled.
+        ``eeg_key_padding_mask`` (``True`` == padded/ignore) excludes invalid EEG
+        tokens from BOTH the attention and the FiLM pool; the frame tokens are
+        always kept, so no attention row is ever fully masked (no NaN).
+        """
+        B, P, _ = s_frame_t.shape
+        assert P <= self.pos_embed.size(1), (
+            f"FramePredictor received {P} frame tokens, larger than "
+            f"max_tokens={self.pos_embed.size(1)}")
+
+        # Normalise the EEG conditioning to a token set (global -> 1 token).
+        if eeg_emb.dim() == 2:
+            eeg_emb = eeg_emb.unsqueeze(1)                        # (B, 1, eeg_dim)
+        M = eeg_emb.size(1)
+
+        # FiLM bias from the pooled EEG (mean over conditioning tokens) — the
+        # strong, direct path that keeps the EEG used from step 1. Padded tokens
+        # are excluded from the pool when a mask is given.
+        if eeg_key_padding_mask is not None:
+            keep = (~eeg_key_padding_mask).to(eeg_emb.dtype).unsqueeze(-1)  # (B,M,1)
+            eeg_pool = (eeg_emb * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1.0)
+        else:
+            eeg_pool = eeg_emb.mean(dim=1)                       # (B, eeg_dim)
+        eeg_bias = self.eeg_to_frame_bias(eeg_pool).unsqueeze(1)  # (B, 1, pdm)
+
+        frame = self.in_proj_frame(s_frame_t) + self.pos_embed[:, :P] + eeg_bias
+        eeg_tok = self.in_proj_eeg(eeg_emb) + self.eeg_type_embed  # (B, M, pdm)
+
+        k = torch.tensor(
+            min(horizon, self.horizon_embed.num_embeddings - 1),
+            device=s_frame_t.device, dtype=torch.long)
+        h_emb = self.horizon_embed(k).view(1, 1, -1)
+
+        tokens = torch.cat([eeg_tok + h_emb, frame + h_emb], dim=1)  # (B, M+P, pdm)
+
+        src_key_padding_mask = None
+        if eeg_key_padding_mask is not None:
+            # Frame tokens are never padded; concat a False block for them.
+            frame_kpm = torch.zeros(
+                B, P, dtype=torch.bool, device=tokens.device)
+            src_key_padding_mask = torch.cat(
+                [eeg_key_padding_mask, frame_kpm], dim=1)       # (B, M+P)
+
+        h = self.norm_out(
+            self.encoder(tokens, src_key_padding_mask=src_key_padding_mask))
+        frame_out = h[:, M:]                                    # drop the M EEG tokens
+        return self.out_proj(frame_out)                         # (B, P, frame_dim)
+
+
+# ---------------------------------------------------------------------------
 # Wrapper
 # ---------------------------------------------------------------------------
 
@@ -128,8 +255,25 @@ class WorldModelWrapper(nn.Module):
         ramp_epochs: int = 2,
         target_momentum: float = 0.998,
         flip_pred_weight: float = 1.0,
+        objective: str = 'eeg',
+        frame_eeg_cond: str = 'global',
     ):
         super().__init__()
+        assert objective in ('eeg', 'frame'), (
+            f"objective must be 'eeg' or 'frame', got {objective!r}")
+        assert frame_eeg_cond in ('global', 'tokens'), (
+            f"frame_eeg_cond must be 'global' or 'tokens', got {frame_eeg_cond!r}")
+        # For the frame objective, condition the predictor on either the EEG
+        # window-level global rep (``'global'``) or the full per-patch EEG token
+        # set (``'tokens'``, M = C*N tokens). Ignored for the EEG objective.
+        self.frame_eeg_cond = frame_eeg_cond
+        # ``'eeg'`` (default): predict the next EEG window's latent from the
+        # current EEG latent (the original world-model objective). ``'frame'``:
+        # predict the next video frame's per-patch embedding from the current
+        # frame's per-patch embedding, conditioned on the current EEG embedding.
+        # The choice only swaps the predictor objective; the encoder's masked
+        # reconstruction + image alignment + aux terms are untouched either way.
+        self.objective = objective
         self.encoder = encoder
         # Multiplier on the bilateralization flipped-prediction terms (predict
         # the flipped-future EEG latent from the flipped-current). Only active
@@ -160,7 +304,13 @@ class WorldModelWrapper(nn.Module):
         # across steps, which is what actually anchors the dynamic
         # (mask-recon prevents trivial-constant collapse, but leaves a
         # drift direction in the null-space of reconstruction).
-        if self.predictor is not None and self.max_horizon >= 1:
+        #
+        # Only the EEG-latent objective needs it: the ``'frame'`` objective
+        # regresses against the *frozen* vision encoder, which is already a
+        # fixed target, so no EMA copy is built (and none of its parameters
+        # enter the optimiser).
+        if (self.objective == 'eeg'
+                and self.predictor is not None and self.max_horizon >= 1):
             self.target_encoder = copy.deepcopy(encoder)
             # ``encode()`` does not invoke the DINOv2 image encoder, so
             # drop it from the target to avoid doubling that memory.
@@ -339,6 +489,127 @@ class WorldModelWrapper(nn.Module):
         motion[rows] = m.to(motion.dtype)
         return motion
 
+    @staticmethod
+    def _eeg_token_padding_mask(batch, cb_idx, valid, C, N):
+        """Key-padding mask for the flattened ``(C*N)`` EEG token set.
+
+        Returns ``(Bv, C*N)`` bool with ``True`` == padded/ignore (an invalid
+        channel OR an invalid time patch), restricted to the (cb -> valid) rows,
+        or ``None`` when the batch carries no validity masks (nothing to pad).
+        """
+        vcm = batch.get('valid_channel_mask')
+        vlm = batch.get('valid_length_mask')
+        if vcm is None and vlm is None:
+            return None
+        ref = vcm if vcm is not None else vlm
+        Bv = int(valid.sum().item())
+        if vcm is not None:
+            vcm = vcm[cb_idx][valid][:, :C].bool()             # (Bv, C)
+        else:
+            vcm = torch.ones(Bv, C, dtype=torch.bool, device=ref.device)
+        if vlm is not None:
+            vlm = vlm[cb_idx][valid][:, :N].bool()             # (Bv, N)
+        else:
+            vlm = torch.ones(Bv, N, dtype=torch.bool, device=ref.device)
+        valid_tok = vcm.unsqueeze(2) & vlm.unsqueeze(1)        # (Bv, C, N)
+        return ~valid_tok.reshape(valid_tok.size(0), C * N)    # True == ignore
+
+    def _frame_prediction_step(self, out, info: dict, batch: dict,
+                               cb_idx: torch.Tensor, flip: bool):
+        """Cross-modal frame-prediction objective (``objective='frame'``).
+
+        Predicts the next video frame's per-patch embedding from the current
+        frame's per-patch embedding conditioned on the current EEG embedding
+        (``info['global_rep']``). Both frame grids come from the FROZEN vision
+        encoder, so the target is fixed (no EMA, no collapse risk) and only the
+        EEG embedding + predictor carry gradient.
+
+        ``out``/``info`` are the window-0 reconstruction + loss dict already
+        produced by the shared encoder forward; we only add the prediction
+        terms and return them.
+        """
+        pv_f = batch.get('pixel_values_future')   # (M, W, 3, H, W)
+        has_f = batch.get('has_image_future')     # (M, W) bool
+        if pv_f is None or has_f is None:
+            return out, info
+
+        W = pv_f.size(1)
+        assert W >= self.max_horizon + 1, (
+            f"pixel_values_future has W={W} windows but max_horizon="
+            f"{self.max_horizon} needs at least {self.max_horizon + 1}")
+        k = int(torch.randint(1, self.max_horizon + 1, ()).item())
+
+        # Supervise only rows whose frame exists at BOTH window 0 (current) and
+        # window k (future). ``has_f`` rows are in the same order as ``cb_idx``.
+        valid = has_f[:, 0] & has_f[:, k]                       # (M,)
+        if int(valid.sum().item()) == 0:
+            return out, info
+
+        # Current EEG conditioning for the (cb -> valid) rows. ``global_rep`` is
+        # (B, d_model) and ``patch_tokens`` is (B, C, N, d_model); index by
+        # cb_idx (M rows, same order as pv_f) then by valid.
+        eeg_kpm = None
+        if self.frame_eeg_cond == 'tokens':
+            pt = info['patch_tokens'][cb_idx][valid]           # (Bv, C, N, d_model)
+            eeg_emb = pt.reshape(pt.size(0), -1, pt.size(-1))  # (Bv, C*N, d_model)
+            # Mask padded channels / invalid time so they cannot leak into the
+            # predictor's attention or the FiLM pool.
+            eeg_kpm = self._eeg_token_padding_mask(
+                batch, cb_idx, valid, pt.size(1), pt.size(2))  # (Bv, C*N) or None
+        else:
+            eeg_emb = info['global_rep'][cb_idx][valid]        # (Bv, d_model)
+
+        cur_pv = pv_f[valid][:, 0]                              # (Bv, 3, H, W)
+        fut_pv = pv_f[valid][:, k]
+        if flip:
+            # Frame-averaging flip steps present the EEG mirrored together with
+            # the horizontally-mirrored frame; mirror the frames here too so the
+            # EEG conditioning and the prediction target share one orientation.
+            cur_pv = torch.flip(cur_pv, dims=[-1])
+            fut_pv = torch.flip(fut_pv, dims=[-1])
+
+        # Frozen vision-encoder patch grids. Detached: the encoder has no
+        # trainable parameters, so gradients only flow through ``eeg_emb`` and
+        # the predictor; encoding under no_grad just avoids a useless graph.
+        with torch.no_grad():
+            s_t = self.encoder._image_patch_grid(cur_pv)       # (Bv, s, s, d_img)
+            s_tpk = self.encoder._image_patch_grid(fut_pv)
+        Bv, s, _, d_img = s_t.shape
+        s_t = s_t.reshape(Bv, s * s, d_img)
+        s_tpk = s_tpk.reshape(Bv, s * s, d_img).detach()
+
+        pred = self.predictor(s_t, eeg_emb, horizon=k,
+                              eeg_key_padding_mask=eeg_kpm)    # (Bv, P, d_img)
+        pred_loss = F.l1_loss(pred, s_tpk)
+
+        scale = self._pred_weight_scale()
+        # Reuse ``latent_pred_weight`` as the predictor's loss weight (the
+        # objective is a swap-in, not an addition), ramped the same way.
+        info['frame_pred_loss'] = (self.latent_pred_weight * scale, pred_loss)
+
+        # Diagnostics. The dominant failure is the predictor IGNORING the EEG and
+        # copying the current frame (1 s frames are ~94% static in DINOv2/V-JEPA
+        # space). ``diag_frame_eeg_gap`` must be > 0 (EEG beats zero-EEG) and
+        # ``diag_frame_pred_cos`` should beat ``diag_frame_copy_cos``.
+        with torch.no_grad():
+            pred_zero = self.predictor(s_t, torch.zeros_like(eeg_emb), horizon=k,
+                                       eeg_key_padding_mask=eeg_kpm)
+            info['diag_frame_eeg_gap'] = F.l1_loss(pred_zero, s_tpk) - pred_loss
+            info['diag_frame_copy_l1'] = F.l1_loss(s_t, s_tpk)
+            info['diag_frame_pred_cos'] = F.cosine_similarity(
+                pred, s_tpk, dim=-1).mean()
+            info['diag_frame_copy_cos'] = F.cosine_similarity(
+                s_t, s_tpk, dim=-1).mean()
+            info['diag_frame_s_t_norm'] = s_t.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_frame_pred_norm'] = pred.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_frame_eeg_norm'] = eeg_emb.norm(dim=-1).mean()
+            info['diag_n_frame_pairs'] = torch.tensor(
+                float(valid.sum().item()), device=pred.device)
+            info['diag_frame_horizon'] = torch.tensor(float(k), device=pred.device)
+            info['diag_pred_ramp_scale'] = torch.tensor(scale, device=pred.device)
+
+        return out, info
+
     def training_step(self, batch: dict, mask: Optional[torch.Tensor] = None):
         # 1. Primary forward on window t — produces the existing
         #    reconstruction output + alignment/recon loss terms. Runs on
@@ -392,6 +663,14 @@ class WorldModelWrapper(nn.Module):
 
         if cb_idx.numel() == 0:
             return out, info
+
+        # ``wm_objective='frame'`` swaps the EEG-latent predictor for the
+        # video-frame predictor: predict the next frame's per-patch embedding
+        # from the current frame's per-patch embedding conditioned on the
+        # current EEG embedding. Everything above (window-0 encoder forward,
+        # masked recon, alignment, aux terms) is shared and unchanged.
+        if self.objective == 'frame':
+            return self._frame_prediction_step(out, info, batch, cb_idx, flip)
 
         ts_future = batch['timeseries_future']  # (M, W, C, N, d)
         W = ts_future.size(1)

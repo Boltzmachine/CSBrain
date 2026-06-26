@@ -122,7 +122,9 @@ python pretrain_main.py \
     --aux_power_bands "8,13;13,30" \
     --aux_phase_weight 1.0 \
     --aux_envelope_weight 0.005 \
-    --run_name wm-noequi-v2-flipnorecon-hand \
-    --aux_hand_pred \
-    --aux_hand_weight 0.1 \
-    --egobrain_hand_labels_dir data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200 \
+    --wm_objective frame \
+    --wm_frame_eeg_cond tokens \
+    --run_name wm-frame-tokens-noequiv
+    # --aux_hand_pred \
+    # --aux_hand_weight 0.1 \
+    # --egobrain_hand_labels_dir data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200 \

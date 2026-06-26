@@ -211,6 +211,17 @@ def main():
     parser.add_argument('--predictor_n_heads', type=int, default=8)
     parser.add_argument('--predictor_dim_feedforward', type=int, default=1024)
     parser.add_argument('--max_horizon', type=int, default=1, help='maximum prediction horizon k (in windows)')
+    parser.add_argument('--wm_objective', type=str, default='eeg', choices=['eeg', 'frame'],
+                        help="WorldModel predictor objective. 'eeg' (default): predict the next EEG "
+                             "window's latent from the current EEG latent (original behavior). "
+                             "'frame': predict the next video frame's per-patch embedding from the "
+                             "current frame's per-patch embedding conditioned on the current EEG "
+                             "embedding (target = frozen vision encoder; needs CineBrain/EgoBrain "
+                             "frames and max_horizon>=1). Reuses --latent_pred_weight as the loss weight.")
+    parser.add_argument('--wm_frame_eeg_cond', type=str, default='global', choices=['global', 'tokens'],
+                        help="For --wm_objective frame: which EEG representation conditions the frame "
+                             "predictor. 'global' (default): the window-level global rep (one vector). "
+                             "'tokens': all EEG per-patch tokens (C*N tokens). Ignored for the eeg objective.")
     parser.add_argument('--latent_pred_weight', type=float, default=1.0)
     parser.add_argument('--cls_pred_weight', type=float, default=0.1)
     parser.add_argument('--pred_ramp_epochs', type=int, default=2, help='linearly ramp latent-prediction weight 0→1 over this many epochs')

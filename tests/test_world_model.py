@@ -22,7 +22,7 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from models.alignment import CSBrainAlign
-from models.world_model import LatentPredictor, WorldModelWrapper
+from models.world_model import LatentPredictor, FramePredictor, WorldModelWrapper
 
 
 def _tiny_encoder(in_dim=40, n_ch=8, n_patches=2):
@@ -49,6 +49,198 @@ class TestLatentPredictor(unittest.TestCase):
         pred, cls = p(s, horizon=2)
         self.assertEqual(pred.shape, (B, C, N, D))
         self.assertEqual(cls.shape, (B, D))
+
+
+class TestFramePredictor(unittest.TestCase):
+    def test_shapes(self):
+        B, P, frame_dim, eeg_dim = 2, 16, 32, 40
+        p = FramePredictor(frame_dim=frame_dim, eeg_dim=eeg_dim,
+                           predictor_d_model=64, n_layers=2, n_heads=4,
+                           dim_feedforward=128, max_horizon=4)
+        s = torch.randn(B, P, frame_dim)
+        eeg = torch.randn(B, eeg_dim)
+        pred = p(s, eeg, horizon=2)
+        self.assertEqual(pred.shape, (B, P, frame_dim))
+
+    def test_shapes_token_conditioning(self):
+        """The predictor also accepts the full EEG token set (B, M, eeg_dim)."""
+        B, P, frame_dim, eeg_dim, M = 2, 16, 32, 40, 7
+        p = FramePredictor(frame_dim=frame_dim, eeg_dim=eeg_dim,
+                           predictor_d_model=64, n_layers=2, n_heads=4,
+                           dim_feedforward=128, max_horizon=4)
+        s = torch.randn(B, P, frame_dim)
+        eeg = torch.randn(B, M, eeg_dim)
+        pred = p(s, eeg, horizon=2)
+        self.assertEqual(pred.shape, (B, P, frame_dim))
+
+    def test_eeg_conditioning_changes_output(self):
+        """Zeroing the EEG embedding must change the prediction — otherwise the
+        predictor ignores the conditioning and the objective is vacuous."""
+        B, P, frame_dim, eeg_dim = 2, 16, 32, 40
+        p = FramePredictor(frame_dim=frame_dim, eeg_dim=eeg_dim,
+                           predictor_d_model=64, n_layers=2, n_heads=4,
+                           dim_feedforward=128, max_horizon=4)
+        s = torch.randn(B, P, frame_dim)
+        eeg = torch.randn(B, eeg_dim)
+        a = p(s, eeg, horizon=1)
+        b = p(s, torch.zeros_like(eeg), horizon=1)
+        self.assertGreater((a - b).abs().mean().item(), 1e-6)
+
+    def test_padding_mask_invariance(self):
+        """Masked EEG tokens must not influence the frame prediction at all —
+        neither through attention nor through the FiLM pool."""
+        B, P, frame_dim, eeg_dim, M = 2, 8, 16, 12, 5
+        p = FramePredictor(frame_dim=frame_dim, eeg_dim=eeg_dim,
+                           predictor_d_model=64, n_layers=2, n_heads=4,
+                           dim_feedforward=128, max_horizon=4)
+        p.eval()  # deterministic (no dropout)
+        s = torch.randn(B, P, frame_dim)
+        eeg = torch.randn(B, M, eeg_dim)
+        kpm = torch.zeros(B, M, dtype=torch.bool)
+        kpm[:, 3:] = True  # mark the last two EEG tokens as padding
+
+        with torch.no_grad():
+            out1 = p(s, eeg, horizon=1, eeg_key_padding_mask=kpm)
+            eeg2 = eeg.clone()
+            eeg2[:, 3:] = torch.randn(B, M - 3, eeg_dim)  # perturb only masked
+            out2 = p(s, eeg2, horizon=1, eeg_key_padding_mask=kpm)
+        self.assertTrue(torch.allclose(out1, out2, atol=1e-5),
+                        "masked EEG tokens changed the prediction")
+
+
+class TestWorldModelFrameObjective(unittest.TestCase):
+    """``objective='frame'`` swaps the EEG-latent predictor for the video-frame
+    predictor. The frozen vision encoder is monkeypatched so the test never runs
+    the heavy DINOv2 forward; we only validate the wrapper plumbing + backward.
+    """
+
+    @staticmethod
+    def _patch_grid(enc, s_grid=4):
+        d_img = enc.image_feature_dim
+        return lambda pv: torch.randn(pv.shape[0], s_grid, s_grid, d_img)
+
+    def _run(self, batch, enc, max_horizon=2, frame_eeg_cond='global'):
+        pred = FramePredictor(frame_dim=enc.image_feature_dim, eeg_dim=enc.d_model,
+                              predictor_d_model=64, n_layers=2, n_heads=4,
+                              dim_feedforward=128, max_horizon=4)
+        wrapper = WorldModelWrapper(encoder=enc, predictor=pred,
+                                    latent_pred_weight=1.0, max_horizon=max_horizon,
+                                    ramp_epochs=0, objective='frame',
+                                    frame_eeg_cond=frame_eeg_cond)
+        wrapper.train()
+        # No EMA target encoder for the frame objective (frozen vision target).
+        self.assertIsNone(wrapper.target_encoder)
+        enc._image_patch_grid = self._patch_grid(enc)
+        return wrapper.training_step(batch, mask=batch.pop('_mask'))
+
+    @staticmethod
+    def _pure_batch(n_ch, n_patches, in_dim, B=3, W=3, pad_last_ch=False):
+        ts = torch.randn(B, W, n_ch, n_patches, in_dim)
+        pv = torch.zeros(B, W, 3, 224, 224)
+        # Future stack has frames at every window; the encoder's own image path
+        # is disabled (has_image=False) so only the frame predictor uses frames.
+        has_future = torch.ones(B, W, dtype=torch.bool)
+        from datasets.cinebrain_dataset import _BIOSEMI64_COORDS
+        coords = torch.from_numpy(
+            _BIOSEMI64_COORDS[:n_ch]).unsqueeze(0).expand(B, -1, -1).contiguous()
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+        vcm = torch.ones(B, n_ch, dtype=torch.bool)
+        if pad_last_ch:
+            # Mark the last channel as padding so the predictor's EEG-token
+            # padding mask path is exercised end-to-end (tokens conditioning).
+            vcm[:, -1] = False
+            mask[:, -1, :] = 0  # don't score recon on the padded channel
+        return {
+            'timeseries': ts[:, 0] / 100.0,
+            'timeseries_future': ts,
+            'pixel_values_future': pv,
+            'has_image_future': has_future,
+            'ch_coords': coords,
+            'valid_channel_mask': vcm,
+            'valid_length_mask': torch.ones(B, n_patches, dtype=torch.bool),
+            'image_encoder_inputs': {'pixel_values': pv[:, 0]},
+            'has_image': torch.zeros(B, dtype=torch.bool),
+            'source': ['egobrain'] * B,
+            '_mask': mask,
+        }
+
+    def _check_pure(self, enc, batch, frame_eeg_cond):
+        mask = batch['_mask']
+        out, info = self._run(batch, enc, frame_eeg_cond=frame_eeg_cond)
+        self.assertEqual(out.shape, batch['timeseries'].shape)
+        # Frame objective emits frame_pred_loss; the EEG-latent terms are gone.
+        self.assertIn('frame_pred_loss', info)
+        self.assertNotIn('latent_pred_loss', info)
+        coef, val = info['frame_pred_loss']
+        self.assertTrue(torch.isfinite(val).item())
+        self.assertIn('diag_frame_eeg_gap', info)
+
+        loss_terms = [v[0] * v[1] for k, v in info.items()
+                      if isinstance(v, tuple) and 'loss' in k]
+        mask_loss = (out[mask == 1] - batch['timeseries'][mask == 1]).pow(2).mean()
+        (mask_loss + sum(loss_terms)).backward()
+        # Gradient must reach the EEG backbone through the EEG conditioning.
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in enc.patch_embedding.parameters())
+        self.assertTrue(has_grad, "encoder.patch_embedding received no gradient")
+
+    def test_pure_mode_global_cond(self):
+        in_dim, n_ch, n_patches = 40, 8, 2
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+        batch = self._pure_batch(n_ch, n_patches, in_dim)
+        self._check_pure(enc, batch, frame_eeg_cond='global')
+
+    def test_pure_mode_tokens_cond(self):
+        in_dim, n_ch, n_patches = 40, 8, 2
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+        # Include a padded channel so the EEG-token key-padding mask is built.
+        batch = self._pure_batch(n_ch, n_patches, in_dim, pad_last_ch=True)
+        self._check_pure(enc, batch, frame_eeg_cond='tokens')
+
+    def test_mix_mode_cb_idx_alignment(self):
+        """Mix mode: future stacks carry only the M<B frame rows; the frame
+        objective must map them back via cb_idx and filter by per-row validity.
+        """
+        in_dim, n_ch, n_patches = 40, 8, 2
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+
+        B, M, W = 5, 2, 3
+        cb_idx = torch.tensor([1, 3], dtype=torch.long)
+        from datasets.cinebrain_dataset import _BIOSEMI64_COORDS
+        coords = torch.from_numpy(
+            _BIOSEMI64_COORDS[:n_ch]).unsqueeze(0).expand(B, -1, -1).contiguous()
+
+        # Row 0 valid at both windows; row 1 missing the future frame -> dropped.
+        has_future = torch.ones(M, W, dtype=torch.bool)
+        has_future[1, 2] = False
+
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+        batch = {
+            'timeseries': torch.randn(B, n_ch, n_patches, in_dim) / 100.0,
+            'ch_coords': coords,
+            'valid_channel_mask': torch.ones(B, n_ch, dtype=torch.bool),
+            'valid_length_mask': torch.ones(B, n_patches, dtype=torch.bool),
+            'image_encoder_inputs': {'pixel_values': torch.zeros(B, 3, 224, 224)},
+            'has_image': torch.zeros(B, dtype=torch.bool),
+            'cinebrain_idx': cb_idx,
+            'timeseries_future': torch.randn(M, W, n_ch, n_patches, in_dim),
+            'pixel_values_future': torch.zeros(M, W, 3, 224, 224),
+            'has_image_future': has_future,
+            'source': ['alljoined', 'egobrain', 'alljoined', 'egobrain', 'alljoined'],
+            '_mask': mask,
+        }
+
+        out, info = self._run(batch, enc, max_horizon=2)
+        self.assertIn('frame_pred_loss', info)
+        coef, val = info['frame_pred_loss']
+        self.assertTrue(torch.isfinite(val).item())
+        loss_terms = [v[0] * v[1] for k, v in info.items()
+                      if isinstance(v, tuple) and 'loss' in k]
+        mask_loss = (out[mask == 1] - batch['timeseries'][mask == 1]).pow(2).mean()
+        (mask_loss + sum(loss_terms)).backward()
 
 
 class TestWorldModelWrapper(unittest.TestCase):

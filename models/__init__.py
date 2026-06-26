@@ -156,7 +156,7 @@ def get_model(params, brain_regions, sorted_indices):
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
-        from .world_model import LatentPredictor, WorldModelWrapper
+        from .world_model import LatentPredictor, FramePredictor, WorldModelWrapper
         _mbp = getattr(params, 'mamba_band_periods', None)
         if isinstance(_mbp, str) and _mbp:
             _mbp = eval(_mbp)
@@ -213,10 +213,28 @@ def get_model(params, brain_regions, sorted_indices):
             **_spectral_band_kwargs(params),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
+        wm_objective = getattr(params, 'wm_objective', 'eeg')
         # ``max_horizon == 0`` short-circuits the world-model components:
         # the wrapper reduces to plain CSBrainAlign (masked recon + image
         # alignment) so no predictor parameters enter the optimiser.
-        if max_horizon > 0:
+        if max_horizon <= 0:
+            predictor = None
+        elif wm_objective == 'frame':
+            # Cross-modal objective: predict the next frame's per-patch
+            # embedding from the current frame's per-patch embedding conditioned
+            # on the current EEG embedding. ``frame_dim`` is the frozen vision
+            # encoder's hidden size; ``eeg_dim`` is the EEG global rep width.
+            predictor = FramePredictor(
+                frame_dim=encoder.image_feature_dim,
+                eeg_dim=params.d_model,
+                predictor_d_model=getattr(params, 'predictor_d_model', 512),
+                n_layers=getattr(params, 'predictor_n_layers', 4),
+                n_heads=getattr(params, 'predictor_n_heads', 8),
+                dim_feedforward=getattr(params, 'predictor_dim_feedforward', 1024),
+                dropout=getattr(params, 'dropout', 0.1),
+                max_horizon=max(max_horizon, 1),
+            )
+        else:
             predictor = LatentPredictor(
                 d_model=params.d_model,
                 predictor_d_model=getattr(params, 'predictor_d_model', 512),
@@ -226,8 +244,6 @@ def get_model(params, brain_regions, sorted_indices):
                 dropout=getattr(params, 'dropout', 0.1),
                 max_horizon=max(max_horizon, 1),
             )
-        else:
-            predictor = None
         model = WorldModelWrapper(
             encoder=encoder,
             predictor=predictor,
@@ -237,6 +253,8 @@ def get_model(params, brain_regions, sorted_indices):
             ramp_epochs=getattr(params, 'pred_ramp_epochs', 2),
             target_momentum=getattr(params, 'target_momentum', 0.998),
             flip_pred_weight=getattr(params, 'flip_pred_weight', 1.0),
+            objective=wm_objective,
+            frame_eeg_cond=getattr(params, 'wm_frame_eeg_cond', 'global'),
         )
         return model
     elif params.model == 'ActionWorldModel':

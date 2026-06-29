@@ -107,6 +107,13 @@ def main():
                              'the flipped logits remapped left<->right (--flip_label_map). '
                              'Symmetrizes the prediction over the reflection group. Needs no '
                              'split; no-op on a non-frame-averaging checkpoint.')
+    parser.add_argument('--temporal_jitter', type=int, default=0,
+                        help='temporal-jitter augmentation (training only): randomly '
+                             'shift the cropped seg_len window by ±N raw SAMPLES '
+                             '(timepoints) per example before patchifying, clamped to '
+                             'the trial bounds (at seg0 this is a forward 0..+N shift). '
+                             'Eval uses the nominal crop. 0 = off. Only active with '
+                             '--use_initial_segment_only.')
     parser.add_argument('--bilateral_head', action='store_true', default=False,
                         help='PhysioNet-MI only: replace the 4-way softmax with a '
                              'two-bit sigmoid head [left_hand_active, '

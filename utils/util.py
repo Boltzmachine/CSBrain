@@ -303,19 +303,28 @@ def hand_regression_loss(pred, target, valid, flip=False):
     column 1 = right hand (D is typically 2). ``valid`` is a PER-COLUMN mask:
     an undetected hand has a NaN intensity (already replaced by 0 in ``target``)
     AND ``valid=False`` for that column, so the loss never sees the NaN and never
-    penalises a hand we did not observe. ``flip=True`` marks a frame-averaging
-    flip step (the scene is horizontally mirrored, so left<->right swap): we swap
-    columns 0,1 of BOTH target and valid so the rep that saw the mirrored scene is
-    scored against the mirrored labels.
+    penalises a hand we did not observe. ``flip`` marks frame-averaging flip
+    (the scene is horizontally mirrored, so left<->right swap): we swap columns
+    0,1 of BOTH target and valid so the rep that saw the mirrored scene is scored
+    against the mirrored labels. ``flip`` may be a scalar bool (whole-batch swap,
+    the legacy / finetune 2x-concat path) or a per-sample ``(B,)`` bool tensor
+    (per-sample flip): then only the rows whose scene was mirrored are swapped.
 
     Returns ``(loss, mae)`` — scalar tensors; both are 0 when no column is valid
     (so steps with no EgoBrain rows contribute nothing).
     """
-    if flip and target.size(-1) >= 2:
-        idx = list(range(target.size(-1)))
-        idx[0], idx[1] = 1, 0
-        target = target[:, idx]
-        valid = valid[:, idx]
+    per_sample = torch.is_tensor(flip) and flip.numel() > 1
+    any_flip = bool(flip.any()) if per_sample else bool(flip)
+    if any_flip and target.size(-1) >= 2:
+        sw = list(range(target.size(-1)))
+        sw[0], sw[1] = 1, 0
+        if per_sample:
+            fm = flip.view(-1, 1).to(torch.bool)                # (B, 1)
+            target = torch.where(fm, target[:, sw], target)
+            valid = torch.where(fm, valid[:, sw], valid)
+        else:
+            target = target[:, sw]
+            valid = valid[:, sw]
     valid = valid.to(pred.dtype)
     err = F.smooth_l1_loss(pred, target, reduction='none')      # (B, D)
     denom = valid.sum().clamp(min=1.0)

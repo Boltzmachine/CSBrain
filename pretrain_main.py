@@ -252,6 +252,50 @@ def main():
                              'overshoot below it. See project_me_mi_pretrain_manipulation.')
     parser.add_argument('--egobrain_delta_whiten_cutoff_hz', type=float, default=8.0,
                         help='upper edge (Hz) of the ME->MI delta-whitening ramp.')
+    parser.add_argument('--use_cached_embeddings', action='store_true', default=False,
+                        help='Load PRE-COMPUTED frozen-vision-encoder embeddings of the EgoBrain '
+                             'frames (cls/cls_flip + grid/grid_flip) from the cache_embeddings_<enc>_w.. '
+                             'dir built by datasets.egobrain_extract_embeddings, instead of running '
+                             'the encoder on the fly. Eliminates the dominant per-step GPU cost; '
+                             'numerically equivalent to the live path (both frame orientations are '
+                             'cached exactly). The cache slug must match the run window/stride/erp/'
+                             'n_windows/sz and --vision_encoder (DINOv2-style only for now). '
+                             'Default off = current behavior.')
+    parser.add_argument('--egobrain_emb_cache_dir', type=str, default=None,
+                        help='override the embedding-cache dir; default derives the '
+                             'cache_embeddings_<enc>_w<ws>s<ss>_e<erp>_nw<nw>_sz<sz> slug.')
+    parser.add_argument('--egobrain_use_frame_grid', action='store_true', default=False,
+                        help='Use the CONTINUOUS, time-keyed frame grid (datasets.'
+                             'egobrain_extract_frames_grid) instead of the clip-keyed '
+                             'frame cache. EEG windows are sampled at any --egobrain_'
+                             'frame_grid_s-snapped offset across the whole recording '
+                             '(no 4 s clip boundary; recovers the discarded tail + adds '
+                             'temporal variety) and paired with the nearest grid frame. '
+                             'Cache is agnostic to window/stride/erp/n_windows. '
+                             'Incompatible with --use_cached_embeddings. Default off = '
+                             'current clip-keyed behavior (reproduces prior results).')
+    parser.add_argument('--egobrain_frame_grid_dir', type=str, default=None,
+                        help='override the grid frame-cache dir; default derives the '
+                             'cache_frames_grid_<enc>_g<grid_s>_sz<sz> slug.')
+    parser.add_argument('--egobrain_frame_grid_s', type=float, default=0.2,
+                        help='time-grid spacing in seconds for --egobrain_use_frame_grid '
+                             '(default 0.2 = the EEG patch size; window centres snap to it).')
+    parser.add_argument('--egobrain_no_temporal_jitter', action='store_true', default=False,
+                        help='with --egobrain_use_frame_grid, disable random anchor '
+                             'jitter (use the deterministic clip-aligned offset). Off by '
+                             'default = random offset augmentation each epoch.')
+    parser.add_argument('--egobrain_use_grid_embeddings', action='store_true', default=False,
+                        help='with --egobrain_use_frame_grid, read PRE-COMPUTED frozen '
+                             'DINOv2 embeddings (cls/grid + flips) from the time-keyed '
+                             'cache_embeddings_grid_<enc>_g<g>_sz<sz> dir (built by '
+                             'datasets.egobrain_extract_embeddings_grid) at each window '
+                             'slot, so the encoder is skipped — encoder-skip speedup AND '
+                             'continuous-offset variety. Only effective in the map-style '
+                             '`egobrain` loader (the mix/iterable path runs the encoder '
+                             'live regardless). Default off.')
+    parser.add_argument('--egobrain_emb_grid_dir', type=str, default=None,
+                        help='override the time-keyed embedding-grid cache dir; default '
+                             'derives the cache_embeddings_grid_<enc>_g<g>_sz<sz> slug.')
 
     # --- ActionWorldModel (EEG=action, frozen V-JEPA 2=world) ---
     parser.add_argument('--eeg_ckpt', type=str, default=None,
@@ -550,6 +594,14 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             hand_labels_dir=params.egobrain_hand_labels_dir,
+            use_embeddings=params.use_cached_embeddings,
+            emb_cache_dir=params.egobrain_emb_cache_dir,
+            use_frame_grid=params.egobrain_use_frame_grid,
+            frame_grid_dir=params.egobrain_frame_grid_dir,
+            frame_grid_s=params.egobrain_frame_grid_s,
+            temporal_jitter=not params.egobrain_no_temporal_jitter,
+            use_grid_embeddings=params.egobrain_use_grid_embeddings,
+            emb_grid_dir=params.egobrain_emb_grid_dir,
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
@@ -622,6 +674,14 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             hand_labels_dir=params.egobrain_hand_labels_dir,
+            use_embeddings=params.use_cached_embeddings,
+            emb_cache_dir=params.egobrain_emb_cache_dir,
+            use_frame_grid=params.egobrain_use_frame_grid,
+            frame_grid_dir=params.egobrain_frame_grid_dir,
+            frame_grid_s=params.egobrain_frame_grid_s,
+            temporal_jitter=not params.egobrain_no_temporal_jitter,
+            use_grid_embeddings=params.egobrain_use_grid_embeddings,
+            emb_grid_dir=params.egobrain_emb_grid_dir,
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
@@ -675,12 +735,20 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             hand_labels_dir=params.egobrain_hand_labels_dir,
+            use_embeddings=params.use_cached_embeddings,
+            emb_cache_dir=params.egobrain_emb_cache_dir,
+            use_frame_grid=params.egobrain_use_frame_grid,
+            frame_grid_dir=params.egobrain_frame_grid_dir,
+            frame_grid_s=params.egobrain_frame_grid_s,
+            temporal_jitter=not params.egobrain_no_temporal_jitter,
+            use_grid_embeddings=params.egobrain_use_grid_embeddings,
+            emb_grid_dir=params.egobrain_emb_grid_dir,
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
         )
         print('EgoBrain clips:', len(pretrained_dataset))
-        num_workers = 8 if os.environ.get('DEBUG', '0') == '0' else 0
+        num_workers = 10 if os.environ.get('DEBUG', '0') == '0' else 0
         n_samples_per_epoch = 1109545
         sampler = torch.utils.data.RandomSampler(
             pretrained_dataset,

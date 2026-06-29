@@ -158,9 +158,128 @@ class TestFrameAveragingForward(unittest.TestCase):
         self.assertIn('contrastive_loss_0', info)
 
     def test_nonflip_step_defers_recon_to_trainer(self):
+        # Under per-sample flip the encoder ALWAYS skips the external recon and
+        # hands the trainer the (B,) flip mask. A non-flip step emits an all-False
+        # mask (so the trainer scores raw-space recon on every row) and a zero
+        # frame_recon (no flipped rows to self-supervise in feature space).
         out, info = self.enc({**self.batch, 'flip': False}, mask=self.mask)
-        self.assertNotIn('skip_external_recon', info)
-        self.assertNotIn('frame_recon_loss', info)
+        self.assertTrue(info.get('skip_external_recon', False))
+        self.assertIn('flip_row', info)
+        self.assertFalse(bool(info['flip_row'].any()))
+        self.assertIn('frame_recon_loss', info)
+        self.assertEqual(float(info['frame_recon_loss'][1]), 0.0)
+
+    def test_per_sample_flip_matches_row_wise_scalar(self):
+        # The per-row torch.where MUST equal running each row through its own
+        # scalar flip: the backbone is LayerNorm-only (no cross-row coupling), so
+        # row i of a mixed-flip forward equals the all-flip forward at row i when
+        # flip[i] is True, else the all-non-flip forward at row i.
+        enc = _make_encoder(alignment_weight=0.0)
+        enc.eval()                                    # deterministic (no dropout)
+        B = self.B
+        # Drop the image path so we compare the pure per-row recon/encode tensors.
+        batch = {**self.batch, 'has_image': torch.zeros(B, dtype=torch.bool)}
+        mix = torch.tensor([True, False, True, False])
+        with torch.no_grad():
+            out_t, info_t = enc(
+                {**batch, 'flip': torch.ones(B, dtype=torch.bool)}, mask=self.mask)
+            out_f, info_f = enc(
+                {**batch, 'flip': torch.zeros(B, dtype=torch.bool)}, mask=self.mask)
+            out_m, info_m = enc({**batch, 'flip': mix}, mask=self.mask)
+        ref_out = torch.where(mix.view(B, 1, 1, 1), out_t, out_f)
+        self.assertTrue(torch.allclose(out_m, ref_out, atol=1e-5))
+        ref_g = torch.where(mix.view(B, 1),
+                            info_t['global_rep'], info_f['global_rep'])
+        self.assertTrue(torch.allclose(info_m['global_rep'], ref_g, atol=1e-5))
+        ref_p = torch.where(mix.view(B, 1, 1, 1),
+                            info_t['patch_tokens'], info_f['patch_tokens'])
+        self.assertTrue(torch.allclose(info_m['patch_tokens'], ref_p, atol=1e-5))
+        # The encoder emits the per-sample flip mask for the trainer's recon split.
+        self.assertTrue(torch.equal(info_m['flip_row'].cpu(), mix))
+
+    def test_recon_gradient_scale_is_whole_batch(self):
+        # Loss-scale fidelity: a flipped row's recon gradient must be normalized
+        # by the FULL-batch masked count, so it does NOT depend on how many OTHER
+        # rows are flipped — exactly the whole-batch-flip design's scale. A
+        # subset-mean would make a mixed step's flip-row gradient ~1/p_flip too
+        # large (here 2x: 4 flipped vs 2 flipped), silently up-weighting recon.
+        enc = _make_encoder(alignment_weight=0.0)
+        enc.frame_avg_recon_weight = 1.0
+        enc.eval()                                    # deterministic (no dropout)
+        B = self.B
+        base = {**self.batch, 'has_image': torch.zeros(B, dtype=torch.bool)}
+
+        def row0_recon_grad(flip):
+            enc.zero_grad(set_to_none=True)
+            x = base['timeseries'].clone().requires_grad_(True)
+            _, info = enc({**base, 'timeseries': x, 'flip': flip}, mask=self.mask)
+            coef, val = info['frame_recon_loss']
+            (coef * val).backward()                   # the optimized contribution
+            return x.grad[0].clone()                  # row 0 is flipped in both
+
+        g_all = row0_recon_grad(torch.ones(B, dtype=torch.bool))
+        g_mix = row0_recon_grad(torch.tensor([True, False, True, False]))
+        self.assertTrue(torch.allclose(g_all, g_mix, atol=1e-6),
+                        'flipped-row recon gradient must not depend on the batch '
+                        'flip composition (full-batch normalization)')
+
+    def test_split_halves_vs_interleaved_byte_identical(self):
+        # Decomposition under a TRUE batch split, with the cross-row InfoNCE
+        # losses (image-contrastive + hard-neg) DISABLED. Those couple every row
+        # to every other (shared negative pool), so running two halves separately
+        # would change their negatives — that is the ONLY reason the recon below
+        # decomposes and they do not. With them off the encoder is a pure
+        # per-sample function, so:
+        #   - the FLIPPED samples run as their own all-flip half reproduce, byte
+        #     for byte, the flipped rows' feature-recon of an INTERLEAVED
+        #     [T,F,T,F] batch (same masked patches, same order, same /count);
+        #   - the NON-FLIPPED samples run as their own half reproduce the raw
+        #     recon of the interleaved batch's non-flipped rows;
+        #   - the total recon and every per-sample input gradient match exactly.
+        # (We compare the UNWEIGHTED recon values; the deliberate batch-size
+        # normalization lives in the loss weight and is tested separately.)
+        enc = _make_encoder(alignment_weight=0.0)    # image-contrastive off
+        enc.flip_align_weight = 0.0                   # hard-neg InfoNCE off
+        enc.frame_avg_recon_weight = 1.0
+        enc.eval()                                    # deterministic (no dropout)
+        torch.manual_seed(1)
+        C, N = len(NAMES), self.N
+        coords = torch.randn(4, C, 3).abs() + 0.1
+        ts = torch.randn(4, C, N, 40) / 100.0
+        mask = torch.zeros(4, C, N, dtype=torch.long); mask[:, :, 0] = 1
+
+        def run(rows, flip):
+            idx = torch.tensor(rows)
+            x = ts[idx].clone().detach().requires_grad_(True)
+            m = mask[idx]
+            batch = {'timeseries': x, 'ch_coords': coords[idx],
+                     'ch_names': [list(NAMES) for _ in rows],
+                     'has_image': torch.zeros(len(rows), dtype=torch.bool),
+                     'source': ['egobrain'] * len(rows)}
+            out, info = enc({**batch, 'flip': flip}, mask=m)
+            recon = info['frame_recon_loss'][1]                  # feature, flip rows
+            nf = (~info['flip_row'].bool()).view(len(rows), 1, 1)
+            eff = (m == 1) & nf
+            raw = ((out[eff] - x[eff]) ** 2).mean() if eff.any() else out.sum() * 0.0
+            (recon + raw).backward()
+            return recon.detach(), raw.detach(), x.grad.detach().clone()
+
+        r_f, raw_f, g_f = run([0, 1, 2, 3], torch.tensor([True, False, True, False]))
+        r1, raw1, g1 = run([0, 2], torch.tensor([True, True]))    # flipped half
+        r2, raw2, g2 = run([1, 3], torch.tensor([False, False]))  # non-flipped half
+
+        # Each orientation's recon value: interleaved == its homogeneous half.
+        self.assertTrue(torch.equal(r_f, r1))        # flip-rows feature recon
+        self.assertTrue(torch.equal(raw_f, raw2))    # non-flip-rows raw recon
+        self.assertEqual(float(r2), 0.0)             # no flip rows in half 2
+        self.assertEqual(float(raw1), 0.0)           # no non-flip rows in half 1
+        # Total recon decomposes additively, byte for byte.
+        self.assertTrue(torch.equal(r_f + raw_f, (r1 + raw1) + (r2 + raw2)))
+        # Per-sample input gradients match their homogeneous half, byte for byte.
+        self.assertTrue(torch.equal(g_f[0], g1[0]))  # flipped sample 0
+        self.assertTrue(torch.equal(g_f[2], g1[1]))  # flipped sample 2
+        self.assertTrue(torch.equal(g_f[1], g2[0]))  # non-flipped sample 1
+        self.assertTrue(torch.equal(g_f[3], g2[1]))  # non-flipped sample 3
 
     def test_hard_negative_alignment_present_both_orientations(self):
         # The same-sample hard-negative (present vs opposite global rep ->
@@ -197,7 +316,7 @@ class TestFrameAveragingForward(unittest.TestCase):
         self.assertIn('frame_recon_loss', info)            # one consistent key
         self.assertNotIn('diag_frame_recon', info)         # no separate diag key
         coef, val = info['frame_recon_loss']
-        self.assertEqual(coef, 0.0)                        # -> trainer won't add it
+        self.assertEqual(float(coef), 0.0)                 # -> trainer won't add it
         self.assertTrue(torch.isfinite(val).item())
 
     def test_flip_recon_trains_split(self):
@@ -271,8 +390,13 @@ class TestFrameAveragingWorldModel(unittest.TestCase):
         mask[:, :, 0] = 1
         _, info = wrapper.training_step(batch, mask=mask)
         self.assertIn('latent_pred_loss', info)
-        self.assertNotIn('skip_external_recon', info)
-        self.assertNotIn('frame_recon_loss', info)
+        # Per-sample flip: the encoder always skips external recon and emits an
+        # all-False flip mask (trainer scores raw recon on every row); the
+        # feature-space frame_recon is zero with no flipped rows.
+        self.assertTrue(info.get('skip_external_recon', False))
+        self.assertIn('flip_row', info)
+        self.assertFalse(bool(info['flip_row'].any()))
+        self.assertEqual(float(info['frame_recon_loss'][1]), 0.0)
 
 
 if __name__ == '__main__':

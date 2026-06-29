@@ -458,6 +458,14 @@ class WorldModelWrapper(nn.Module):
                 out['image_encoder_inputs'] = batch['image_encoder_inputs']
             if 'has_image' in batch:
                 out['has_image'] = batch['has_image']
+            # Window-0 cached vision-encoder embeddings (egobrain_extract_
+            # embeddings): forwarded so the frame-averaging encoder uses them
+            # for image alignment + the flip-align descriptor instead of the
+            # frozen-encoder forward. Full batch B, aligned with timeseries.
+            for k in ('frame_cls', 'frame_cls_flip', 'frame_grid',
+                      'frame_grid_flip'):
+                if k in batch:
+                    out[k] = batch[k]
         else:
             pv_f = batch.get('pixel_values_future')
             has_f = batch.get('has_image_future')
@@ -515,7 +523,8 @@ class WorldModelWrapper(nn.Module):
         return ~valid_tok.reshape(valid_tok.size(0), C * N)    # True == ignore
 
     def _frame_prediction_step(self, out, info: dict, batch: dict,
-                               cb_idx: torch.Tensor, flip: bool):
+                               cb_idx: torch.Tensor,
+                               flip: Optional[torch.Tensor] = None):
         """Cross-modal frame-prediction objective (``objective='frame'``).
 
         Predicts the next video frame's per-patch embedding from the current
@@ -559,24 +568,50 @@ class WorldModelWrapper(nn.Module):
         else:
             eeg_emb = info['global_rep'][cb_idx][valid]        # (Bv, d_model)
 
-        cur_pv = pv_f[valid][:, 0]                              # (Bv, 3, H, W)
-        fut_pv = pv_f[valid][:, k]
-        if flip:
-            # Frame-averaging flip steps present the EEG mirrored together with
-            # the horizontally-mirrored frame; mirror the frames here too so the
-            # EEG conditioning and the prediction target share one orientation.
-            cur_pv = torch.flip(cur_pv, dims=[-1])
-            fut_pv = torch.flip(fut_pv, dims=[-1])
+        if 'frame_grid_future' in batch:
+            # Cached path: select the per-row presented patch grid straight from
+            # the cache (the mirrored-frame grid iff that row is flipped) —
+            # NEVER torch.flip of the grid (feature-space flip is wrong). Row
+            # order matches pixel_values_future, so flip[valid] lines up.
+            assert 'frame_grid_flip_future' in batch, (
+                "frame_grid_future present but frame_grid_flip_future missing "
+                "— both orientations are required for exact flip semantics")
+            gfut = batch['frame_grid_future']                  # (M, W, P, d_img)
+            gffut = batch['frame_grid_flip_future']
+            assert gfut.size(0) == pv_f.size(0) and gfut.size(1) == W, (
+                f"frame_grid_future {tuple(gfut.shape)} must match "
+                f"pixel_values_future rows/windows ({pv_f.size(0)}, {W})")
+            g_cur, gf_cur = gfut[valid][:, 0], gffut[valid][:, 0]   # (Bv, P, d)
+            g_fut, gf_fut = gfut[valid][:, k], gffut[valid][:, k]
+            if flip is not None and flip.any():
+                fv = flip[valid].view(-1, 1, 1)                 # (Bv,1,1) bool
+                s_t = torch.where(fv, gf_cur, g_cur)
+                s_tpk = torch.where(fv, gf_fut, g_fut)
+            else:
+                s_t, s_tpk = g_cur, g_fut
+            s_t = s_t.contiguous()
+            s_tpk = s_tpk.contiguous().detach()
+        else:
+            cur_pv = pv_f[valid][:, 0]                          # (Bv, 3, H, W)
+            fut_pv = pv_f[valid][:, k]
+            if flip is not None and flip.any():
+                # Per-sample frame-averaging flip: mirror each row's frame iff
+                # that row's EEG was presented mirrored, so the EEG conditioning
+                # and the prediction target share one orientation per row.
+                # ``flip`` is (M,) in cb-row order; ``valid`` subsets to Bv.
+                fv = flip[valid].view(-1, 1, 1, 1)              # (Bv,1,1,1) bool
+                cur_pv = torch.where(fv, torch.flip(cur_pv, dims=[-1]), cur_pv)
+                fut_pv = torch.where(fv, torch.flip(fut_pv, dims=[-1]), fut_pv)
 
-        # Frozen vision-encoder patch grids. Detached: the encoder has no
-        # trainable parameters, so gradients only flow through ``eeg_emb`` and
-        # the predictor; encoding under no_grad just avoids a useless graph.
-        with torch.no_grad():
-            s_t = self.encoder._image_patch_grid(cur_pv)       # (Bv, s, s, d_img)
-            s_tpk = self.encoder._image_patch_grid(fut_pv)
-        Bv, s, _, d_img = s_t.shape
-        s_t = s_t.reshape(Bv, s * s, d_img)
-        s_tpk = s_tpk.reshape(Bv, s * s, d_img).detach()
+            # Frozen vision-encoder patch grids. Detached: the encoder has no
+            # trainable parameters, so gradients only flow through ``eeg_emb``
+            # and the predictor; no_grad just avoids a useless graph.
+            with torch.no_grad():
+                s_t = self.encoder._image_patch_grid(cur_pv)   # (Bv, s, s, d_img)
+                s_tpk = self.encoder._image_patch_grid(fut_pv)
+            Bv, s, _, d_img = s_t.shape
+            s_t = s_t.reshape(Bv, s * s, d_img)
+            s_tpk = s_tpk.reshape(Bv, s * s, d_img).detach()
 
         pred = self.predictor(s_t, eeg_emb, horizon=k,
                               eeg_key_padding_mask=eeg_kpm)    # (Bv, P, d_img)
@@ -616,16 +651,24 @@ class WorldModelWrapper(nn.Module):
         #    the full mixed batch (CineBrain + Alljoined) so masked recon
         #    and image alignment train on every sample.
         encoder_batch = self._build_alignment_batch(batch, window_idx=0)
-        # Equivariant frame-averaging frontend (plans/eeg-wm.md): sample ONE
-        # ``flip`` for the whole step and share it across the current and future
-        # window encodes so the presentation (z vs P(z), original vs mirrored
-        # frame) is consistent. Eval is canonical (no flip).
+        # Equivariant frame-averaging frontend (plans/eeg-wm.md): sample a
+        # PER-SAMPLE ``flip`` mask (B,) — each row independently presents z or
+        # P(z) (and downstream the original vs mirrored frame). Deciding flip
+        # per row instead of one scalar for the whole step keeps a coin flip from
+        # swinging the entire batch into one orientation, which stabilises
+        # training. The SAME row's mask is shared across its current and future
+        # windows below so the presentation stays consistent per row. Eval is
+        # canonical (all-False mask, no flip).
         frame_avg = getattr(self.encoder, 'frame_averaging', False)
-        flip = False
+        flip = None
         if frame_avg:
-            flip = (bool(torch.rand(()) < getattr(
-                        self.encoder, 'frame_avg_flip_prob', 0.5))
-                    if self.training else False)
+            Bsz = encoder_batch['timeseries'].size(0)
+            dev = encoder_batch['timeseries'].device
+            if self.training:
+                p = getattr(self.encoder, 'frame_avg_flip_prob', 0.5)
+                flip = torch.rand(Bsz, device=dev) < p          # (B,) bool
+            else:
+                flip = torch.zeros(Bsz, dtype=torch.bool, device=dev)
             encoder_batch['flip'] = flip
         # Supply a per-sample motion score (t->t+1 frame diff) so the encoder's
         # flip-alignment can down-weight static frames (whose horizontal flip is
@@ -670,7 +713,12 @@ class WorldModelWrapper(nn.Module):
         # current EEG embedding. Everything above (window-0 encoder forward,
         # masked recon, alignment, aux terms) is shared and unchanged.
         if self.objective == 'frame':
-            return self._frame_prediction_step(out, info, batch, cb_idx, flip)
+            # ``flip`` is a (B,) per-sample mask over the full batch; restrict it
+            # to the cb rows (the frame stack's row order) so each frame is
+            # mirrored iff its own EEG row was presented mirrored.
+            flip_cb = flip.index_select(0, cb_idx) if flip is not None else None
+            return self._frame_prediction_step(
+                out, info, batch, cb_idx, flip_cb)
 
         ts_future = batch['timeseries_future']  # (M, W, C, N, d)
         W = ts_future.size(1)
@@ -686,11 +734,12 @@ class WorldModelWrapper(nn.Module):
         future_batch = self._build_future_subbatch(
             batch, cb_idx, window_idx=k)
         if frame_avg:
-            # Present the future window with the SAME flip so the regression
-            # target is the flipped-future EEG latent when this is a flip step
-            # (predict flipped future from flipped current — the bilateral
-            # control signal that makes the lateral decomposition non-trivial).
-            future_batch['flip'] = flip
+            # Present the future window with each row's SAME per-sample flip so
+            # the regression target is the (per-row) flipped-future EEG latent on
+            # that row's flip — predict flipped future from flipped current, the
+            # bilateral control signal that makes the lateral decomposition
+            # non-trivial. ``flip`` is (B,); the future sub-batch is the cb rows.
+            future_batch['flip'] = flip.index_select(0, cb_idx)
         s_tpk_cls, s_tpk_patch = self._encode_future(future_batch)
         s_tpk_patch = s_tpk_patch.detach()
         s_tpk_cls = s_tpk_cls.detach()

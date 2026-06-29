@@ -268,13 +268,75 @@ class Trainer(object):
                             loss = freq_loss + sum(loss_dict.values())
                             logs["freq_mask_loss"] = freq_loss.data.cpu().numpy()
                         elif isinstance(out, tuple) and info.get('skip_external_recon', False):
-                            # Frame-averaging flip step: there is no ground-truth
-                            # flipped timeseries, so the model self-supervises the
-                            # reconstruction internally (frame_recon_loss in info).
-                            # Skip the external MSE(y, x) / aux-band terms here.
-                            # (frame_recon_loss is already in loss_dict + logs via
-                            # the info loop above, since its key contains 'loss'.)
+                            # Frame-averaging step under PER-SAMPLE flip. Flipped
+                            # rows present P(z) (no ground-truth flipped raw
+                            # timeseries), so they self-supervise reconstruction
+                            # internally (frame_recon_loss, already summed into
+                            # loss_dict via the info loop above). Non-flipped rows
+                            # DO have raw ground truth, so they still get the
+                            # external raw-space MSE / band-split / aux-band here —
+                            # restricted to those rows via the (B,) flip mask the
+                            # encoder emitted in info['flip_row']. With all rows
+                            # flipped this degrades to the old flip=True step
+                            # (external skipped); with none flipped, to the old
+                            # flip=False step (external on every row).
                             loss = sum(loss_dict.values())
+                            flip_row = info.get('flip_row')        # (B,) bool or None
+                            if flip_row is not None:
+                                nf = (~flip_row.bool()).view(
+                                    mask.size(0), *([1] * (mask.dim() - 1)))
+                                eff = (mask == 1) & nf             # non-flip masked tokens
+                            else:
+                                eff = (mask == 1)
+                            if eff.any():
+                                # Each external term is a mean over the NON-FLIP
+                                # masked patches; scale it by that subset's share
+                                # of ALL masked patches so a non-flip row's gradient
+                                # is normalized by the full-batch masked count — the
+                                # whole-batch-flip scale — not by the smaller subset
+                                # (~1/(1-p_flip) too large). ==1.0 exactly when no
+                                # row is flipped, so normal pretraining is byte
+                                # unchanged. (env exact; the amplitude-weighted
+                                # phase term is faithful in expectation.)
+                                ratio_nf = (eff.sum().float()
+                                            / (mask == 1).sum().clamp(min=1).float())
+                                masked_x = x[eff]
+                                masked_y = y[eff]
+                                if getattr(self.params, 'recon_band_split', False):
+                                    # Phase-sensitive only below the cutoff; induced
+                                    # (mu/beta/gamma) bands scored on power alone.
+                                    mask_loss = band_split_recon_loss(
+                                        masked_y, masked_x,
+                                        fs=float(getattr(self.params, 'fs', 200)),
+                                        phase_cutoff_hz=self.params.recon_phase_cutoff_hz,
+                                        power_weight=getattr(
+                                            self.params, 'recon_power_weight', 1.0),
+                                    )
+                                else:
+                                    mask_loss = self.criterion(masked_y, masked_x)
+                                loss = loss + mask_loss * ratio_nf
+                                logs["mask_loss"] = mask_loss.data.cpu().numpy()
+
+                                # Aux band targets on the SAME non-flip rows: zero
+                                # the mask on flip rows so they don't contribute.
+                                if getattr(self.params, 'aux_band_pred', False):
+                                    aux_mask = mask
+                                    if flip_row is not None:
+                                        aux_mask = mask * nf.to(mask.dtype)
+                                    phase_loss, env_loss = band_phase_envelope_loss(
+                                        y, x, aux_mask,
+                                        fs=float(getattr(self.params, 'fs', 200)),
+                                        delta_band=_parse_band(
+                                            getattr(self.params, 'aux_delta_band', '0.5,4')),
+                                        power_bands=_parse_bands(
+                                            getattr(self.params, 'aux_power_bands', '8,13;13,30')),
+                                    )
+                                    logs["aux_phase_loss"] = phase_loss.data.cpu().numpy()
+                                    logs["aux_env_loss"] = env_loss.data.cpu().numpy()
+                                    if self.params.aux_phase_weight != 0:
+                                        loss = loss + self.params.aux_phase_weight * phase_loss * ratio_nf
+                                    if self.params.aux_envelope_weight != 0:
+                                        loss = loss + self.params.aux_envelope_weight * env_loss * ratio_nf
                         else:
                             masked_x = x[mask == 1]
                             masked_y = y[mask == 1]

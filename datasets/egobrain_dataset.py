@@ -58,6 +58,21 @@ def _get_h5_frame_handle(path: str):
 _H5_HAND_HANDLES: dict = {}
 
 
+# Per-worker cache of opened HDF5 embedding-cache file handles (datasets/
+# egobrain_extract_embeddings.py output: cls/cls_flip/grid/grid_flip).
+_H5_EMB_HANDLES: dict = {}
+
+
+def _get_h5_emb_handle(path: str):
+    """Return (and cache) an open h5py File for the per-subject embedding cache."""
+    h = _H5_EMB_HANDLES.get(path)
+    if h is None:
+        import h5py
+        h = h5py.File(path, 'r')
+        _H5_EMB_HANDLES[path] = h
+    return h
+
+
 def _get_h5_hand_handle(path: str):
     """Return (and cache) an open h5py File for the per-subject hand-label cache
     (datasets/egobrain_hand_labels.py output: arrays (n_clips, n_windows))."""
@@ -183,7 +198,16 @@ class EgoBrainDataset(Dataset):
         clip_s: float = 4.0,
         max_channels: Optional[int] = None,
         frames_cache_dir: Optional[str] = None,
+        emb_cache_dir: Optional[str] = None,
+        use_embeddings: bool = False,
         hand_labels_dir: Optional[str] = None,
+        frame_grid_dir: Optional[str] = None,
+        use_frame_grid: bool = False,
+        frame_grid_s: float = 0.2,
+        temporal_jitter: bool = True,
+        jitter_seed: Optional[int] = None,
+        use_grid_embeddings: bool = False,
+        emb_grid_dir: Optional[str] = None,
         ea_matrices: Optional[dict] = None,
         delta_whiten_g0: float = 1.0,
         delta_whiten_cutoff_hz: float = 8.0,
@@ -240,6 +264,116 @@ class EgoBrainDataset(Dataset):
         self.use_frames_cache = (load_frames and
                                  os.path.isdir(frames_cache_dir))
 
+        # The clip-keyed embedding cache and the time-keyed frame grid index
+        # frames differently (clip,window vs absolute-time slot); they cannot
+        # be combined. Check before either block so the error is unambiguous.
+        if use_frame_grid and use_embeddings:
+            raise ValueError(
+                "[EgoBrain] use_frame_grid is incompatible with "
+                "use_embeddings: the embedding cache is keyed by (clip, "
+                "window); the grid path samples arbitrary offsets. Pick one.")
+
+        # Optional per-subject HDF5 vision-encoder EMBEDDING cache
+        # (datasets/egobrain_extract_embeddings.py): pre-computed cls/cls_flip
+        # (B,d) + grid/grid_flip (B,P,d) for the frozen DINOv2 encoder, so the
+        # model skips the on-the-fly forward. Opt-in via use_embeddings; the dir
+        # slug encodes the same cache-invalidating knobs as the frame cache.
+        if emb_cache_dir is None:
+            enc_slug = vision_encoder.replace('/', '_')
+            emb_cache_dir = os.path.join(
+                data_dir,
+                f'cache_embeddings_{enc_slug}'
+                f'_w{window_s}s{stride_s}'
+                f'_e{erp_latency_s}_nw{n_windows}'
+                f'_sz{self.frame_size}')
+        self.emb_cache_dir = emb_cache_dir
+        self.use_emb_cache = (use_embeddings and load_frames
+                              and os.path.isdir(emb_cache_dir))
+        if use_embeddings and load_frames and not self.use_emb_cache:
+            raise FileNotFoundError(
+                f"[EgoBrain] --use_cached_embeddings set but embedding cache "
+                f"not found at '{emb_cache_dir}'.\n"
+                f"  Build it once with:\n"
+                f"    conda run -n cbramod python -m datasets.egobrain_extract_embeddings \\\n"
+                f"      --data_dir {data_dir} --subjects all \\\n"
+                f"      --vision_encoder {vision_encoder} \\\n"
+                f"      --window_s {window_s} --stride_s {stride_s} "
+                f"--erp_latency_s {erp_latency_s} --n_windows {n_windows}\n"
+                f"  (window/stride/erp/n_windows must match this run, or the "
+                f"cache dir name won't match.)")
+
+        # ------------------------------------------------------------------
+        # Continuous, time-keyed frame grid (datasets/
+        # egobrain_extract_frames_grid.py): the knob-agnostic successor to the
+        # clip-keyed frame cache. When enabled, __getitem__ samples an EEG
+        # window at an arbitrary frame_grid_s-snapped offset across the WHOLE
+        # continuous recording (no 4 s clip boundary) and looks up the aligned
+        # frame by ABSOLUTE EEG-clock time (slot = round((window_centre + erp)
+        # / frame_grid_s)). erp/window/stride are applied here at lookup, not
+        # baked into the cache. Off by default -> the existing clip-keyed path
+        # below is used verbatim (so prior results reproduce bit-for-bit).
+        self.use_frame_grid = bool(use_frame_grid)
+        self.frame_grid_s = float(frame_grid_s)
+        self.grid_samples = int(round(frame_grid_s * fs_out))
+        self.erp_samples = int(round(erp_latency_s * fs_out))
+        self.temporal_jitter = bool(temporal_jitter)
+        self.jitter_seed = jitter_seed
+        self._anchor_rng = None
+        self.frame_grid_dir = frame_grid_dir
+        # Optional time-keyed DINOv2 embedding cache (datasets/
+        # egobrain_extract_embeddings_grid.py): the grid counterpart of the
+        # clip-keyed embedding cache. When on, __getitem__ reads cls/grid (+flip)
+        # at the slot for each window instead of pixels, so the model skips the
+        # live encoder — encoder-skip speedup AND continuous-offset variety.
+        self.use_grid_embeddings = bool(use_grid_embeddings)
+        self.emb_grid_dir = emb_grid_dir
+        if self.use_grid_embeddings and not self.use_frame_grid:
+            raise ValueError(
+                "[EgoBrain] use_grid_embeddings requires use_frame_grid=True "
+                "(it is the time-keyed embedding cache for the grid path).")
+        if self.use_frame_grid:
+            if self.frame_grid_dir is None:
+                enc_slug = vision_encoder.replace('/', '_')
+                self.frame_grid_dir = os.path.join(
+                    data_dir,
+                    f'cache_frames_grid_{enc_slug}'
+                    f'_g{frame_grid_s}_sz{self.frame_size}')
+            if self.use_grid_embeddings:
+                # Reading embeddings; the uint8 frame grid is not needed at
+                # train time (it was only the extractor's input).
+                if self.emb_grid_dir is None:
+                    enc_slug = vision_encoder.replace('/', '_')
+                    self.emb_grid_dir = os.path.join(
+                        data_dir,
+                        f'cache_embeddings_grid_{enc_slug}'
+                        f'_g{frame_grid_s}_sz{self.frame_size}')
+                if load_frames and not os.path.isdir(self.emb_grid_dir):
+                    raise FileNotFoundError(
+                        f"[EgoBrain] use_grid_embeddings set but grid embedding "
+                        f"cache not found at '{self.emb_grid_dir}'.\n"
+                        f"  Build it once (after the frame grid) with:\n"
+                        f"    conda run -n cbramod python -m "
+                        f"datasets.egobrain_extract_embeddings_grid \\\n"
+                        f"      --data_dir {data_dir} --subjects all \\\n"
+                        f"      --vision_encoder {vision_encoder} "
+                        f"--grid_s {frame_grid_s}\n"
+                        f"  (only vision_encoder/frame_size/grid_s affect the "
+                        f"dir name.)")
+            elif load_frames and not os.path.isdir(self.frame_grid_dir):
+                raise FileNotFoundError(
+                    f"[EgoBrain] use_frame_grid set but grid frame cache not "
+                    f"found at '{self.frame_grid_dir}'.\n"
+                    f"  Build it once with:\n"
+                    f"    conda run -n cbramod python -m "
+                    f"datasets.egobrain_extract_frames_grid \\\n"
+                    f"      --data_dir {data_dir} --subjects all \\\n"
+                    f"      --vision_encoder {vision_encoder} "
+                    f"--grid_s {frame_grid_s}\n"
+                    f"  (only vision_encoder/frame_size/grid_s affect the dir "
+                    f"name; window/stride/erp/n_windows do NOT.)")
+            # The time-keyed grid supersedes the clip-keyed frame cache.
+            self.use_frames_cache = False
+
         # Optional per-subject HDF5 hand-movement-annotation cache
         # (datasets/egobrain_hand_labels.py): per-window continuous
         # left/right intensities surfaced as 'hand_targets'/'hand_valid' for the
@@ -250,7 +384,7 @@ class EgoBrainDataset(Dataset):
         self.hand_labels_dir = hand_labels_dir
         self.use_hand_labels = (hand_labels_dir is not None
                                 and os.path.isdir(hand_labels_dir))
-        if load_frames and not self.use_frames_cache:
+        if load_frames and not self.use_frames_cache and not self.use_frame_grid:
             # Live-decoding 4-5 GB GoPro MP4s on the fly is slow AND
             # memory-heavy — it OOM-kills DataLoader workers at scale. The
             # cache is mandatory; fail fast instead of silently falling back.
@@ -276,7 +410,10 @@ class EgoBrainDataset(Dataset):
         # clip. ``__getitem__`` zero-pads any tail that runs past the end.
         max_n_windows = 1 + max(
             0, (self.clip_samples - self.window_samples) // self.stride_samples)
-        if n_windows > max_n_windows:
+        if n_windows > max_n_windows and not self.use_frame_grid:
+            # In grid mode windows are sliced from the CONTINUOUS recording
+            # (clips stitched), so the per-clip limit doesn't apply; the true
+            # bound is the subject length, enforced in _sample_base_slot.
             raise ValueError(
                 f"clip_s={clip_s}s @ fs_out={fs_out} (window={window_s}s, "
                 f"stride={stride_s}s) only supports n_windows<={max_n_windows} "
@@ -323,6 +460,30 @@ class EgoBrainDataset(Dataset):
             raise RuntimeError(
                 f"EgoBrainDataset({self.cache_dir}) contains zero clips")
 
+        # Surface a PARTIAL embedding cache loudly. A video subject whose
+        # per-subject embedding HDF5 is missing still reports has_image=True
+        # from the frame cache, so __getitem__ yields no frame_* tensors and
+        # collate zero-fills that (still-valid) image row — training then sees
+        # all-zero CLS/grid "positives". We don't change that behaviour here,
+        # but warn so a half-built cache isn't mistaken for a complete one.
+        if self.use_emb_cache:
+            missing_emb = [
+                s for s in self.subjects
+                if self._subject_meta[s].get('video') is not None
+                and not os.path.exists(
+                    os.path.join(self.emb_cache_dir, f'{s}.h5'))]
+            if missing_emb:
+                import warnings
+                warnings.warn(
+                    f"[EgoBrain] use_embeddings is on but the embedding cache "
+                    f"'{self.emb_cache_dir}' is MISSING {len(missing_emb)} "
+                    f"video subject(s): {','.join(missing_emb)}. Their image "
+                    f"rows keep has_image=True (from the frame cache) yet carry "
+                    f"no cached embeddings, so collate zero-fills them and the "
+                    f"alignment/frame objectives train on bogus all-zero "
+                    f"targets. Re-run datasets.egobrain_extract_embeddings for "
+                    f"those subjects before training.", stacklevel=2)
+
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
@@ -331,22 +492,24 @@ class EgoBrainDataset(Dataset):
     def _clip_path(self, sub: str, c: int) -> str:
         return os.path.join(self.cache_dir, sub, f'{c}.npy')
 
-    def _load_clip(self, sub: str, c: int) -> np.ndarray:
-        """(C_kept, fs_out*clip_s) float32 µV — already filtered/notched.
+    def _select_and_whiten(self, arr: np.ndarray, sub: str) -> np.ndarray:
+        """Channel-select (keep_mask) -> optional EA whitening -> optional
+        delta-whitening. Shared verbatim by the clip-keyed (``_load_clip``)
+        and the continuous grid (``_load_continuous_raw``) paths so both apply
+        the identical transform in the identical order.
 
         When ``self.ea_matrices`` is set, applies the subject's Euclidean
         Alignment whitening matrix after channel selection. Falls back to
         the raw signal if no matrix is registered for this subject (e.g.
         the EA sidecar was built before this subject was downloaded).
         """
-        arr = np.load(self._clip_path(sub, c))
         keep = self._subject_meta[sub]['keep_mask']
         if keep.shape[0] != arr.shape[0]:
             # The keep_mask was built from the cached ch_names list, so any
             # mismatch is a stale cache; rebuild it.
             raise RuntimeError(
-                f"cached clip {self._clip_path(sub, c)} has C={arr.shape[0]} "
-                f"but clips.json lists {keep.shape[0]} channels; rebuild cache")
+                f"cached EEG for {sub} has C={arr.shape[0]} but clips.json "
+                f"lists {keep.shape[0]} channels; rebuild cache")
         arr = arr[keep]
         if self.ea_matrices is not None and sub in self.ea_matrices:
             from datasets.euclidean_alignment import apply_ea
@@ -357,6 +520,74 @@ class EgoBrainDataset(Dataset):
                 arr, self.fs_out, self.delta_whiten_g0,
                 self.delta_whiten_cutoff_hz)
         return arr
+
+    def _load_clip(self, sub: str, c: int) -> np.ndarray:
+        """(C_kept, fs_out*clip_s) float32 µV — already filtered/notched."""
+        return self._select_and_whiten(np.load(self._clip_path(sub, c)), sub)
+
+    # ------------------------------------------------------------------
+    # Continuous (grid-mode) helpers
+    # ------------------------------------------------------------------
+
+    def _get_anchor_rng(self):
+        """Lazily build a per-worker RNG for temporal-jitter anchor sampling.
+
+        Seeded from the DataLoader worker seed (which PyTorch re-rolls per
+        epoch) so each epoch sees fresh offsets; ``jitter_seed`` overrides for
+        reproducible runs/tests.
+        """
+        if self._anchor_rng is None:
+            if self.jitter_seed is not None:
+                seed = int(self.jitter_seed)
+                wi = torch.utils.data.get_worker_info()
+                if wi is not None:
+                    seed += 100003 * int(wi.id)
+            else:
+                wi = torch.utils.data.get_worker_info()
+                seed = int(wi.seed) if wi is not None else os.getpid()
+            self._anchor_rng = np.random.default_rng(seed)
+        return self._anchor_rng
+
+    def _sample_base_slot(self, sub: str, c: int) -> int:
+        """Base frame slot ``k`` for window 0. The FRAME is the discrete side
+        (pre-stored on the 0.2 s grid) so we pin it to slot ``k`` and slide the
+        CONTINUOUS EEG to match: window-0 START = ``k*grid_samples - erp_samples``
+        so the frame at slot ``k`` sits exactly at ``start + erp``. Then every
+        window's frame slot is an exact integer for ANY erp (no rounding) — see
+        ``_getitem_grid``. ``temporal_jitter`` picks ``k`` uniformly over the
+        valid range; otherwise the deterministic ``k`` puts window-0's start at
+        ~clip ``c`` (reproducible eval)."""
+        n_clips = self._subject_meta[sub]['n_clips']
+        total = n_clips * self.clip_samples
+        span = (self.n_windows - 1) * self.stride_samples + self.window_samples
+        grid = self.grid_samples
+        erp = self.erp_samples
+        # eeg_start_0 = k*grid - erp must lie in [0, total - span]
+        k_min = (erp + grid - 1) // grid                 # ceil(erp/grid)
+        k_max = (total - span + erp) // grid             # floor
+        if k_max < k_min:
+            k_max = k_min
+        if self.temporal_jitter:
+            return int(self._get_anchor_rng().integers(k_min, k_max + 1))
+        k = int(round((c * self.clip_samples + erp) / grid))
+        return min(max(k, k_min), k_max)
+
+    def _load_continuous_raw(self, sub: str, start: int, length: int
+                             ) -> np.ndarray:
+        """Raw (C_all, length) µV segment of the continuous recording, stitched
+        across the per-clip ``.npy`` files (a window can straddle a former 4 s
+        boundary). Zero-pads if the request runs past the last clip."""
+        cs = self.clip_samples
+        n_clips = self._subject_meta[sub]['n_clips']
+        first = start // cs
+        last = min((start + length - 1) // cs, n_clips - 1)
+        pieces = [np.load(self._clip_path(sub, cl)) for cl in range(first, last + 1)]
+        full = np.concatenate(pieces, axis=1)            # (C_all, k*cs)
+        local = start - first * cs
+        seg = full[:, local:local + length]
+        if seg.shape[1] < length:
+            seg = np.pad(seg, ((0, 0), (0, length - seg.shape[1])))
+        return np.ascontiguousarray(seg)
 
     def _video_chapters(self, sub: str) -> list[dict]:
         """Return the per-subject ordered chapter list (with abs paths +
@@ -426,6 +657,8 @@ class EgoBrainDataset(Dataset):
         return None
 
     def __getitem__(self, idx: int) -> dict:
+        if self.use_frame_grid:
+            return self._getitem_grid(idx)
         sub, c = self._items[idx]
         ts = self._load_clip(sub, c)                          # (C, T)
         C = ts.shape[0]
@@ -512,6 +745,30 @@ class EgoBrainDataset(Dataset):
                         print(f'[egobrain] batch frame load failed for '
                               f'{ch_path} @ {t_videos}: {_e}')
 
+        # Pre-computed vision-encoder embeddings (datasets/
+        # egobrain_extract_embeddings.py): when enabled, surface cls/cls_flip
+        # (W,d) + grid/grid_flip (W,P,d) so the model skips the frozen-encoder
+        # forward. has_image is taken from the EMBEDDING cache so the alignment
+        # masks match exactly what was embedded. pixel_values are still returned
+        # below (harmless; the model prefers the cached tensors when present).
+        frame_emb = None
+        if self.use_emb_cache:
+            emb_path = os.path.join(self.emb_cache_dir, f'{sub}.h5')
+            if os.path.exists(emb_path):
+                he = _get_h5_emb_handle(emb_path)
+                frame_emb = {
+                    'frame_cls': torch.from_numpy(
+                        np.asarray(he['cls'][c], dtype=np.float32)),        # (W,d)
+                    'frame_cls_flip': torch.from_numpy(
+                        np.asarray(he['cls_flip'][c], dtype=np.float32)),
+                    'frame_grid': torch.from_numpy(
+                        np.asarray(he['grid'][c], dtype=np.float32)),       # (W,P,d)
+                    'frame_grid_flip': torch.from_numpy(
+                        np.asarray(he['grid_flip'][c], dtype=np.float32)),
+                }
+                has_image = torch.from_numpy(
+                    np.asarray(he['has_image'][c])).bool()
+
         # Auxiliary continuous hand-movement targets (W, 2) = [left, right]
         # intensity, with a per-column valid mask (undetected hand -> NaN -> 0 +
         # invalid, so the regression loss skips it). Zeros + all-invalid when no
@@ -522,7 +779,7 @@ class EgoBrainDataset(Dataset):
             hand_targets = torch.zeros(self.n_windows, 2, dtype=torch.float32)
             hand_valid = torch.zeros(self.n_windows, 2, dtype=torch.bool)
 
-        return {
+        out = {
             'timeseries': timeseries,
             'ch_coords': ch_coords,
             'ch_names': ch_names,
@@ -535,6 +792,9 @@ class EgoBrainDataset(Dataset):
             'subject': sub,
             'local_clip_idx': c,
         }
+        if frame_emb is not None:
+            out.update(frame_emb)
+        return out
 
     def _load_hand_labels(self, sub, c):
         """Per-window continuous hand targets + per-column valid mask for clip
@@ -560,6 +820,129 @@ class EgoBrainDataset(Dataset):
         elif nw > W:
             tgt, val = tgt[:W], val[:W]
         return torch.from_numpy(tgt).float(), torch.from_numpy(val).bool()
+
+    def _getitem_grid(self, idx: int) -> dict:
+        """Continuous / 0.2 s grid path (use_frame_grid=True).
+
+        Pins the (discrete, pre-stored) FRAME to its 0.2 s slot and slides the
+        (continuous) EEG window to match: window-0 START = ``k*grid_samples -
+        erp_samples`` so its frame sits exactly at ``start + erp`` (slot ``k``),
+        making every window's frame slot an exact integer for ANY erp. The
+        window is anchored on its START point. Returns the SAME dict schema as
+        ``__getitem__``. Hand labels are clip-keyed and not supported here
+        (returned as zeros / all-invalid)."""
+        sub, c = self._items[idx]
+        k = self._sample_base_slot(sub, c)
+        eeg_start = k * self.grid_samples - self.erp_samples   # window-0 START
+        span_total = ((self.n_windows - 1) * self.stride_samples
+                      + self.window_samples)
+        seg = self._select_and_whiten(
+            self._load_continuous_raw(sub, eeg_start, span_total), sub)  # (C, T)
+        C = seg.shape[0]
+
+        windows = [seg[:, i * self.stride_samples:
+                       i * self.stride_samples + self.window_samples]
+                   for i in range(self.n_windows)]
+        windows_np = np.stack(windows, axis=0)                # (W, C, T)
+        timeseries = torch.from_numpy(
+            windows_np.reshape(self.n_windows, C,
+                               self.n_patches_per_window, self.in_dim)
+            .astype(np.float32))                              # (W, C, N, d)
+
+        ch_coords = self._subject_meta[sub]['ch_coords']
+        ch_names = list(self._subject_meta[sub]['ch_names'])
+
+        # Frame slot for window i = (window-i START + erp) / grid
+        # = (k*grid + i*stride) / grid = k + i*stride/grid. Exact integer for
+        # any erp when stride is a multiple of the grid (round() only guards a
+        # non-multiple stride). START-anchored, not centre-anchored.
+        frame_slots = [
+            int(round((k * self.grid_samples + i * self.stride_samples)
+                      / self.grid_samples))
+            for i in range(self.n_windows)]
+
+        pixel_values = torch.zeros(
+            self.n_windows, 3, self.frame_size, self.frame_size,
+            dtype=torch.float32)
+        has_image = torch.zeros(self.n_windows, dtype=torch.bool)
+        frame_emb = None
+        if self.load_frames and self.use_grid_embeddings:
+            # Cached DINOv2 embeddings: read cls/grid (+flip) per slot and let
+            # the model skip the live encoder. pixel_values stay zero (the model
+            # prefers the cached tensors); has_image comes from the emb cache.
+            frame_emb = self._read_grid_embeddings(sub, frame_slots, has_image)
+        elif self.load_frames and self.use_frame_grid:
+            # Frames from the time-keyed frame grid (live encode downstream).
+            gpath = os.path.join(self.frame_grid_dir, f'{sub}.h5')
+            if os.path.exists(gpath):
+                h = _get_h5_frame_handle(gpath)
+                frames_ds = h['frames']
+                has_ds = h['has_image']
+                n_slots = frames_ds.shape[0]
+                mean, std = _get_normalize_params(self.vision_encoder)
+                for i, slot in enumerate(frame_slots):
+                    if 0 <= slot < n_slots and bool(has_ds[slot]):
+                        fr = np.ascontiguousarray(frames_ds[slot])   # (H,W,3)
+                        x = (torch.from_numpy(fr).float().div_(255.0)
+                             .permute(2, 0, 1).unsqueeze(0))          # (1,3,H,W)
+                        pixel_values[i] = ((x - mean) / std)[0]
+                        has_image[i] = True
+
+        # Hand labels are (clip, window)-keyed; not aligned to arbitrary
+        # offsets, so the grid path leaves them off (the aux loss masks them).
+        hand_targets = torch.zeros(self.n_windows, 2, dtype=torch.float32)
+        hand_valid = torch.zeros(self.n_windows, 2, dtype=torch.bool)
+
+        out = {
+            'timeseries': timeseries,
+            'ch_coords': ch_coords,
+            'ch_names': ch_names,
+            'pixel_values': pixel_values,
+            'has_image': has_image,
+            'hand_targets': hand_targets,
+            'hand_valid': hand_valid,
+            'source': 'egobrain',
+            'session_id': sub,
+            'subject': sub,
+            'local_clip_idx': c,
+            'anchor_sample': int(eeg_start),     # window-0 START sample
+            'base_slot': int(k),                 # window-0 frame slot
+        }
+        if frame_emb is not None:
+            out.update(frame_emb)
+        return out
+
+    def _read_grid_embeddings(self, sub, frame_slots, has_image):
+        """Read cls/grid (+flip) from the time-keyed embedding cache at the given
+        per-window slots, updating ``has_image`` in place. The cache interleaves
+        orientations on axis 1 (``cls`` (n_slots,2,d), ``grid`` (n_slots,2,P,d);
+        [:,0]=orig, [:,1]=h-flip), so each slot's BOTH orientations come in ONE
+        chunk read — 1 grid seek/window instead of 2. Returns the frame_* dict
+        (or None when the subject has no cache — e.g. no-video — leaving
+        has_image False)."""
+        epath = os.path.join(self.emb_grid_dir, f'{sub}.h5')
+        if not os.path.exists(epath):
+            return None
+        he = _get_h5_emb_handle(epath)
+        cls_ds, grid_ds, has_ds = he['cls'], he['grid'], he['has_image']
+        n_slots, _, d = cls_ds.shape            # (n_slots, 2, d)
+        P = grid_ds.shape[2]                     # (n_slots, 2, P, d)
+        W = self.n_windows
+        f_cls = torch.zeros(W, d, dtype=torch.float32)
+        f_clsf = torch.zeros(W, d, dtype=torch.float32)
+        f_grid = torch.zeros(W, P, d, dtype=torch.float32)
+        f_gridf = torch.zeros(W, P, d, dtype=torch.float32)
+        for i, slot in enumerate(frame_slots):
+            if 0 <= slot < n_slots and bool(has_ds[slot]):
+                cpair = np.asarray(cls_ds[slot], np.float32)    # (2, d)  1 read
+                gpair = np.asarray(grid_ds[slot], np.float32)   # (2,P,d) 1 read
+                f_cls[i] = torch.from_numpy(cpair[0])
+                f_clsf[i] = torch.from_numpy(cpair[1])
+                f_grid[i] = torch.from_numpy(gpair[0])
+                f_gridf[i] = torch.from_numpy(gpair[1])
+                has_image[i] = True
+        return {'frame_cls': f_cls, 'frame_cls_flip': f_clsf,
+                'frame_grid': f_grid, 'frame_grid_flip': f_gridf}
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +973,7 @@ def collate_egobrain(batch):
     has_image_all = torch.stack([b['has_image'] for b in batch], dim=0)
     valid_length_mask = torch.ones(B, N, dtype=torch.bool)
 
-    return {
+    out = {
         'timeseries': ts_all[:, 0],
         'ch_coords': ch_coords,
         'ch_names': [b['ch_names'] for b in batch],
@@ -612,6 +995,35 @@ def collate_egobrain(batch):
         'session_id': [b.get('session_id', 'unknown') for b in batch],
     }
 
+    # Cached vision-encoder embeddings (when EgoBrainDataset.use_emb_cache): the
+    # model reads these instead of running the frozen encoder. Window-0 tensors
+    # (B,...) feed the image alignment + flip-align descriptor; the future stacks
+    # (B,W,...) feed the world-model frame objective. Row order is the batch
+    # order, identical to pixel_values_future, so the per-row flip mask lines up.
+    #
+    # Emit whenever ANY item carries them, zero-filling items that don't — those
+    # are the no-video subjects (P0025-P0040) whose has_image is all-False, so
+    # the alignment / flip-align / frame-objective masks drop their (zero) rows
+    # anyway. Requiring EVERY item to carry them would instead disable the cache
+    # for any batch that happens to include a no-video row (almost all of them).
+    emb_items = [b for b in batch if 'frame_grid' in b]
+    if emb_items:
+        ref = emb_items[0]
+        Wn, P, d_img = ref['frame_grid'].shape
+        zc = torch.zeros(Wn, d_img)
+        zg = torch.zeros(Wn, P, d_img)
+        cls = [b.get('frame_cls', zc) for b in batch]
+        cls_f = [b.get('frame_cls_flip', zc) for b in batch]
+        grid = [b.get('frame_grid', zg) for b in batch]
+        grid_f = [b.get('frame_grid_flip', zg) for b in batch]
+        out['frame_cls'] = torch.stack([t[0] for t in cls])              # (B,d)
+        out['frame_cls_flip'] = torch.stack([t[0] for t in cls_f])
+        out['frame_grid'] = torch.stack([t[0] for t in grid])           # (B,P,d)
+        out['frame_grid_flip'] = torch.stack([t[0] for t in grid_f])
+        out['frame_grid_future'] = torch.stack(grid)                    # (B,W,P,d)
+        out['frame_grid_flip_future'] = torch.stack(grid_f)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Iterable wrapper for mix-mode training (same contract as
@@ -626,6 +1038,20 @@ class EgoBrainIterableWrapper(IterableDataset):
         self.dataset = dataset
         self.seed = seed
         self.has_future = dataset.n_windows > 1
+        # The iterable (mix-mode) path yields only pixels/futures — it never
+        # forwards the cached frame_cls/frame_grid tensors — so a dataset built
+        # with use_embeddings runs the frozen encoder LIVE here, silently
+        # negating the cache. Warn rather than fail (pixels still train fine).
+        if (getattr(dataset, 'use_emb_cache', False)
+                or getattr(dataset, 'use_grid_embeddings', False)):
+            import warnings
+            warnings.warn(
+                "[EgoBrain] cached embeddings (clip-keyed or grid) are NOT used "
+                "by the iterable / mix-mode path (EgoBrainIterableWrapper yields "
+                "pixels only); the frozen vision encoder will run live, so the "
+                "embedding cache has no speed effect here. Cached embeddings "
+                "only apply to the map-style `egobrain` loader "
+                "(collate_egobrain).", stacklevel=2)
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()

@@ -1587,12 +1587,19 @@ class CSBrainAlign(nn.Module):
         branch_global, branch_embs = _split(branch_x)
         return global_rep, patch_tokens, branch_embs, branch_global
 
-    def _image_contrastive(self, pred_flatten, batch, has_image, i_branch=0):
+    def _image_contrastive(self, pred_flatten, batch, has_image, i_branch=0,
+                           image_hidden_states=None):
         """Symmetric InfoNCE between predicted features and DINOv2 image
-        embeddings. Returns a dict of loss/accuracy entries."""
-        image_encoder_inputs = {k: v[has_image]
-                                for k, v in batch['image_encoder_inputs'].items()}
-        image_hidden_states = self.get_image_hidden_states(**image_encoder_inputs)
+        embeddings. Returns a dict of loss/accuracy entries.
+
+        ``image_hidden_states`` (cached path): a precomputed (B_img, L, d_img)
+        tensor already subset to the ``has_image`` rows. When given the frozen
+        encoder is skipped — the caller builds it from cached CLS tokens.
+        """
+        if image_hidden_states is None:
+            image_encoder_inputs = {k: v[has_image]
+                                    for k, v in batch['image_encoder_inputs'].items()}
+            image_hidden_states = self.get_image_hidden_states(**image_encoder_inputs)
         image_hidden_states_branch = image_hidden_states[:, i_branch]
         image_flatten = image_hidden_states_branch.reshape(
             -1, image_hidden_states_branch.size(-1))
@@ -1650,15 +1657,24 @@ class CSBrainAlign(nn.Module):
         return loss, acc
 
     @torch.no_grad()
-    def _image_patch_grid(self, pixel_values):
+    def _image_patch_grid(self, pixel_values=None, grid=None):
         """Frozen vision-encoder patch tokens reshaped to (B, s, s, d_img).
 
         Dispatches on ``encoder_kind``: V-JEPA 2 -> un-pooled tubelet grid via
         :meth:`vjepa2_grid_tokens`; DINOv2-style ViTs -> ``last_hidden_state``
         with the CLS (and any register) tokens dropped. The width axis (last
         spatial dim) is the horizontal/left-right axis.
+
+        ``grid`` (cached-embeddings path): a precomputed patch grid, either
+        (B, P, d) flat or already (B, s, s, d). When given the frozen encoder is
+        skipped entirely — this is exactly ``last_hidden_state[:, 1+n_reg:]`` as
+        written by ``datasets/egobrain_extract_embeddings.py``.
         """
-        if self.encoder_kind == 'vjepa2':
+        if grid is not None:
+            if grid.dim() == 4:
+                return grid                                      # already (B,s,s,d)
+            tok = grid                                           # (B, P, d_img)
+        elif self.encoder_kind == 'vjepa2':
             tok = self.vjepa2_grid_tokens(pixel_values)          # (B, P, d_img)
         else:
             was_training = self.pretrained_image_encoder.training
@@ -1679,7 +1695,7 @@ class CSBrainAlign(nn.Module):
             f"column-band flip descriptor")
         return tok.reshape(B, s, s, d)
 
-    def _image_lateral_descriptor(self, pixel_values):
+    def _image_lateral_descriptor(self, pixel_values=None, grid=None):
         """Centered column-band spatial descriptor — the flip-sensitive image
         target for the bilateralization prior. Returns (B, n_bands * d_img).
 
@@ -1687,15 +1703,20 @@ class CSBrainAlign(nn.Module):
         bands, mean-pools each, and (for n_bands>=2) removes the cross-band
         mean so the flip-invariant common component is gone, leaving the
         spatial left-right structure that a horizontal flip actually changes.
+
+        ``grid`` (cached path): a precomputed patch grid (see
+        :meth:`_image_patch_grid`). For a mirrored frame pass the cached
+        ``grid_flip`` here — NEVER ``torch.flip`` of the un-flipped grid, which
+        is sign-inverted in this descriptor.
         """
-        grid = self._image_patch_grid(pixel_values)              # (B, s, s, d)
-        B, s, _, d = grid.shape
+        grid_t = self._image_patch_grid(pixel_values=pixel_values, grid=grid)  # (B,s,s,d)
+        B, s, _, d = grid_t.shape
         nb = self.flip_n_col_bands
         assert s % nb == 0, (
             f"flip_n_col_bands={nb} must divide the patch-grid width {s}")
         w = s // nb
         bands = torch.stack(
-            [grid[:, :, k * w:(k + 1) * w, :].mean(dim=(1, 2)) for k in range(nb)],
+            [grid_t[:, :, k * w:(k + 1) * w, :].mean(dim=(1, 2)) for k in range(nb)],
             dim=1)                                               # (B, nb, d)
         if nb >= 2:
             bands = bands - bands.mean(dim=1, keepdim=True)
@@ -1920,16 +1941,25 @@ class CSBrainAlign(nn.Module):
         vlm = batch.get('valid_length_mask')
         B, C, N, in_dim = x.shape
 
-        # Decide the presentation. The world-model wrapper sets a shared ``flip``
-        # so the current and future windows are presented consistently; a bare
-        # encoder samples per forward in train and is canonical (no flip) in eval
-        # so the equivariance test is deterministic.
+        # Decide the presentation PER SAMPLE: ``flip`` is a (B,) bool mask, each
+        # row independently presenting z or P(z) (and downstream the original vs
+        # mirrored frame). The world-model wrapper passes a (B,) mask so a row's
+        # current and future windows stay consistent; a bare encoder samples
+        # per-row in train and is canonical (all-False) in eval so the
+        # equivariance test is deterministic. A scalar bool / size-1 tensor is
+        # accepted and BROADCAST to all rows — this keeps the finetune
+        # 2x-concat path and the unit tests (which pass flip=True/False) working.
         if 'flip' in batch:
-            flip = bool(batch['flip'])
+            f = batch['flip']
+            f = f if torch.is_tensor(f) else torch.as_tensor(f)
+            flip = f.to(device=x.device).reshape(-1)
+            if flip.numel() == 1:
+                flip = flip.expand(B)
+            flip = flip.bool()
         elif self.training:
-            flip = bool(torch.rand(()) < self.frame_avg_flip_prob)
+            flip = torch.rand(B, device=x.device) < self.frame_avg_flip_prob
         else:
-            flip = False
+            flip = torch.zeros(B, dtype=torch.bool, device=x.device)
 
         # 1-2. Frontend + feature-space split + P operator.
         z = self.patch_embedding(x, mask)                       # (B, C, N, d)
@@ -1952,13 +1982,17 @@ class CSBrainAlign(nn.Module):
         Pa = self._swap_channels(a, perm, channel_offset=off)
         Pb = self._swap_channels(b, perm, channel_offset=off)
         inv = 0.5 * (a + b)                                     # P-invariant
-        # P-anti-equivariant. Presenting P(z) swaps (a,b) -> the lateral half
-        # negates: eq(P z) = (b - P a)/2 = -P( (a - P b)/2 ).
-        eq = 0.5 * (b - Pa) if flip else 0.5 * (a - Pb)
+        # P-anti-equivariant, selected PER ROW. Presenting P(z) swaps (a,b) ->
+        # the lateral half negates: eq(P z) = (b - P a)/2 = -P( (a - P b)/2 ).
+        # The backbone is LayerNorm-only with within-sample attention (no
+        # cross-batch coupling), so this per-row torch.where is identical to
+        # running each row through the old scalar path at its own flip[i].
+        fr = flip.view(B, 1, 1, 1)                              # (B,1,1,1) bool
+        eq = torch.where(fr, 0.5 * (b - Pa), 0.5 * (a - Pb))
         # The OPPOSITE orientation's lateral half (free: just the other combo).
         # Its global token is the present one with the lateral half negated, so
         # it serves as the same-sample hard negative for image alignment.
-        eq_opp = 0.5 * (a - Pb) if flip else 0.5 * (b - Pa)
+        eq_opp = torch.where(fr, 0.5 * (a - Pb), 0.5 * (b - Pa))
         half = inv.size(-1) // 2
         # h = [bi_half ; lat_half] is the BACKBONE OUTPUT (the readout) at L-3.
         h = torch.cat([inv[..., :half], eq[..., half:]], dim=-1)   # (B, C+1, N+1, d)
@@ -2024,13 +2058,31 @@ class CSBrainAlign(nn.Module):
                 and has_image is not None and has_image.any()):
             semantic_emb = self.semantic_readout(global_rep[has_image])
             pred_flatten = self.contrastive_proj(semantic_emb)
-            align_batch = batch
-            if flip:
-                pv = batch['image_encoder_inputs']['pixel_values']
-                pv = torch.flip(pv, dims=[-1])                  # mirror horizontally
-                align_batch = {**batch, 'image_encoder_inputs': {
-                    **batch['image_encoder_inputs'], 'pixel_values': pv}}
-            info.update(self._image_contrastive(pred_flatten, align_batch, has_image))
+            if 'frame_cls' in batch:
+                # Cached path: present-orientation CLS per row (the mirrored-
+                # frame CLS iff that row is flipped), then subset to has_image.
+                # Shape (B_img, 1, d_img) matches get_image_hidden_states'
+                # n_levels=1 output that _image_contrastive indexes at [:, 0].
+                fr = flip.view(-1, 1)
+                presented_cls = torch.where(
+                    fr, batch['frame_cls_flip'], batch['frame_cls'])     # (B, d)
+                img_hs = presented_cls[has_image].unsqueeze(1)           # (B_img,1,d)
+                info.update(self._image_contrastive(
+                    pred_flatten, batch, has_image, image_hidden_states=img_hs))
+            else:
+                align_batch = batch
+                if flip.any():
+                    # Mirror each row's frame iff that row is presented flipped,
+                    # so every row's contrastive positive matches its presented
+                    # orientation. _image_contrastive re-subsets pixel_values by
+                    # has_image in row order, so mirror the full (B,...) here.
+                    pv = batch['image_encoder_inputs']['pixel_values']
+                    fpv = flip.view((-1,) + (1,) * (pv.dim() - 1))  # (B,1,...,1) bool
+                    pv = torch.where(fpv, torch.flip(pv, dims=[-1]), pv)
+                    align_batch = {**batch, 'image_encoder_inputs': {
+                        **batch['image_encoder_inputs'], 'pixel_values': pv}}
+                info.update(
+                    self._image_contrastive(pred_flatten, align_batch, has_image))
 
         # Same-sample HARD-NEGATIVE alignment on the global rep (restored from the
         # legacy _flip_alignment). The presented and opposite-orientation global
@@ -2044,11 +2096,24 @@ class CSBrainAlign(nn.Module):
         if (self.flip_align_weight > 0 and 'image_encoder_inputs' in batch
                 and has_image is not None and has_image.any()):
             idx = has_image.nonzero(as_tuple=True)[0]
-            pv = batch['image_encoder_inputs']['pixel_values'].index_select(0, idx)
-            desc_orig = self._image_lateral_descriptor(pv)
-            desc_mirror = self._image_lateral_descriptor(torch.flip(pv, dims=[-1]))
-            present_desc, opposite_desc = (
-                (desc_mirror, desc_orig) if flip else (desc_orig, desc_mirror))
+            if 'frame_grid' in batch:
+                # Cached path: original + MIRRORED-frame patch grids from the
+                # cache (never torch.flip of the grid — the column-band
+                # descriptor of a feature-space flip is sign-inverted).
+                desc_orig = self._image_lateral_descriptor(
+                    grid=batch['frame_grid'].index_select(0, idx))
+                desc_mirror = self._image_lateral_descriptor(
+                    grid=batch['frame_grid_flip'].index_select(0, idx))
+            else:
+                pv = batch['image_encoder_inputs']['pixel_values'].index_select(0, idx)
+                desc_orig = self._image_lateral_descriptor(pv)
+                desc_mirror = self._image_lateral_descriptor(torch.flip(pv, dims=[-1]))
+            # Per-row present/opposite: each has_image row's presented descriptor
+            # is the mirrored one iff that row is flipped. ``idx`` is the
+            # has_image row order, so flip[idx] aligns with desc_*.
+            fr_d = flip.index_select(0, idx).view(-1, 1)        # (M,1) bool
+            present_desc = torch.where(fr_d, desc_mirror, desc_orig)
+            opposite_desc = torch.where(fr_d, desc_orig, desc_mirror)
             pred_present = self.frame_flip_align_proj(global_rep.index_select(0, idx))
             pred_opp = self.frame_flip_align_proj(opp_global.index_select(0, idx))
             # Optional per-sample motion weighting (static frames flip ~vacuously).
@@ -2076,32 +2141,49 @@ class CSBrainAlign(nn.Module):
             if weight is not None:
                 info['diag_flip_motion_weight'] = weight.mean().detach()
 
-        # Reconstruction loss on flip steps. ALWAYS skip the trainer's external
-        # masked MSE(out, x): ``out`` reconstructs the PRESENTED (flipped) signal,
-        # so comparing it to the original ``x`` is wrong. The frontend-space
-        # self-consistency (no ground-truth flipped timeseries exists) — f(out)
-        # should match the presented CLEAN latent P(z_clean) on masked patches —
-        # is ALWAYS computed and emitted under the SINGLE key ``frame_recon_loss``
-        # (one consistent log key). The trainer logs every loss key but only ADDS
-        # it to the optimised loss when its weight != 0 — so weight 0 disables the
-        # CONTRIBUTION while keeping the metric logged (and here we also skip the
-        # backward graph via set_grad_enabled, so 0 weight costs nothing).
-        if flip:
-            info['skip_external_recon'] = True
-            want_grad = self.frame_avg_recon_weight > 0
-            with torch.set_grad_enabled(want_grad):
-                z_recon = self.patch_embedding(out, None)       # f(reconstruction)
-                with torch.no_grad():
-                    z_clean = self.patch_embedding(x, None)
-                    zlat_clean, _ = self.frame_split(z_clean, coord_pe, vcm)
-                    Pz_clean = (z_clean - zlat_clean
-                                + self._swap_channels(zlat_clean, perm, 0))
-                if mask is not None and (mask == 1).any():
-                    m = (mask == 1)
-                    recon = F.mse_loss(z_recon[m], Pz_clean[m])
-                else:
-                    recon = F.mse_loss(z_recon, Pz_clean)
-            info['frame_recon_loss'] = (self.frame_avg_recon_weight, recon)
+        # Reconstruction, split by orientation under PER-SAMPLE flip. ``out``
+        # reconstructs each row in its presented orientation: a flipped row
+        # presents P(z) — which has no ground-truth flipped raw timeseries — so
+        # it is self-supervised in frontend space here (f(out) should match the
+        # presented CLEAN latent P(z_clean) on masked patches). A non-flipped row
+        # presents the original x and KEEPS the trainer's raw-space MSE(out, x).
+        # So we ALWAYS skip the external recon for the whole batch and hand the
+        # trainer the (B,) flip mask so it scores the raw MSE on NON-flip rows
+        # only. ``frame_recon_loss`` is emitted under one consistent key and
+        # restricted to flip rows; the trainer adds it only when its weight != 0.
+        info['skip_external_recon'] = True
+        info['flip_row'] = flip                                 # (B,) bool
+        want_grad = self.frame_avg_recon_weight > 0
+        with torch.set_grad_enabled(want_grad):
+            z_recon = self.patch_embedding(out, None)           # f(reconstruction)
+            with torch.no_grad():
+                z_clean = self.patch_embedding(x, None)
+                zlat_clean, _ = self.frame_split(z_clean, coord_pe, vcm)
+                Pz_clean = (z_clean - zlat_clean
+                            + self._swap_channels(zlat_clean, perm, 0))
+            # Score only the FLIP rows' patches (non-flip rows get raw recon in
+            # the trainer). ``mask`` is (B,C,N); AND it with the (B,) flip mask.
+            if mask is not None:
+                masked = (mask == 1)
+                sel = masked & flip.view(B, 1, 1)               # (B,C,N) bool
+                total = masked.sum().clamp(min=1).float()       # ALL masked patches
+            else:
+                sel = flip.view(B, 1, 1).expand(B, C, N)
+                total = torch.tensor(float(max(B * C * N, 1)), device=z_recon.device)
+            # ``recon`` is the per-element error MAGNITUDE (a mean — comparable
+            # across runs / to the whole-batch design). The flip-row FRACTION is
+            # folded into the loss WEIGHT so a flip row's gradient is normalized
+            # by the FULL-batch masked count, exactly the old whole-batch scale —
+            # NOT by the flip subset (~1/p_flip too large, which would silently
+            # up-weight recon vs the prediction/alignment losses). frac_flip +
+            # (the trainer's non-flip share) == 1, so the two recon terms together
+            # reproduce one whole-batch mean.
+            if sel.any():
+                recon = F.mse_loss(z_recon[sel], Pz_clean[sel])
+            else:
+                recon = z_recon.sum() * 0.0                     # no flip rows this step
+            frac_flip = sel.sum().float() / total               # flip share of masked
+        info['frame_recon_loss'] = (self.frame_avg_recon_weight * frac_flip, recon)
 
         # Diagnostics.
         with torch.no_grad():
@@ -2111,13 +2193,14 @@ class CSBrainAlign(nn.Module):
             else:
                 lat_frac = gate.mean()
             info['diag_frame_lat_gate_mean'] = lat_frac.detach()
-            info['diag_frame_flip'] = torch.tensor(float(flip), device=x.device)
+            info['diag_frame_flip'] = flip.float().mean()       # fraction flipped
             info['diag_frame_lat_half_norm'] = (
                 eq[..., half:].norm(dim=-1).mean().detach())
             info['diag_frame_bi_half_norm'] = (
                 inv[..., :half].norm(dim=-1).mean().detach())
 
-        # Auxiliary hand-movement regression (flip step -> swap L/R targets).
+        # Auxiliary hand-movement regression (per-row flip -> swap L/R targets
+        # only on the mirrored rows). ``flip`` is the full (B,) mask.
         info.update(self._hand_pred_losses(global_rep, batch, flip=flip))
         return out, info
 

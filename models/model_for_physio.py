@@ -504,7 +504,34 @@ class Model(nn.Module):
 
             if n_starts <= 1:
                 # The input already matches seg_len; nothing to crop or ensemble.
-                x = x[:, :, seg_start:seg_start + seg_len, :].contiguous()
+                # Temporal-jitter augmentation (training only): shift the crop
+                # window by a random ±temporal_jitter SAMPLES per example, then
+                # re-patchify. Operates on the flattened raw time axis (seg_len *
+                # patch_size samples). The shift is clamped to the trial bounds,
+                # so at seg0 (window starts at sample 0, no pre-trial data) it is
+                # effectively a forward 0..+jit shift; a segment with room on both
+                # sides gets the full ±jit. Eval uses the nominal (unjittered)
+                # crop, so the canonical window matches pretraining. jit=0 -> the
+                # plain crop below.
+                jit = int(getattr(self.param, 'temporal_jitter', 0) or 0)
+                if self.training and jit > 0:
+                    flat_len = seq_len * patch_size
+                    seg_samples = seg_len * patch_size
+                    base = seg_start * patch_size
+                    lo = max(0, base - jit)
+                    hi = min(flat_len - seg_samples, base + jit)
+                    x_flat = x.view(bz, ch_num, flat_len)
+                    if hi > lo:
+                        start = torch.randint(lo, hi + 1, (bz,), device=x.device)
+                    else:
+                        start = torch.full((bz,), lo, dtype=torch.long, device=x.device)
+                    offs = torch.arange(seg_samples, device=x.device)
+                    gidx = (start.view(bz, 1, 1) + offs.view(1, 1, seg_samples)) \
+                        .expand(bz, ch_num, seg_samples)
+                    x = torch.gather(x_flat, 2, gidx) \
+                        .view(bz, ch_num, seg_len, patch_size).contiguous()
+                else:
+                    x = x[:, :, seg_start:seg_start + seg_len, :].contiguous()
                 batch['timeseries'] = x
                 feats = self.backbone(batch)
                 if not isinstance(feats, tuple):

@@ -72,6 +72,17 @@
 # egobrain window knobs above, or the (clip,window) keys misalign. On
 # frame-averaging flip steps the left/right targets swap (mirrored scene). Watch
 # hand_pred_loss / diag_hand_mae / diag_hand_valid_frac in wandb. Off without the flag.
+#
+# --use_cached_embeddings: load PRE-COMPUTED frozen DINOv2 embeddings of the
+# EgoBrain frames (cls/cls_flip + patch grid/grid_flip, both orientations) from
+# data/EgoBrain/cache_embeddings_<enc>_w1.0s1.0_e0.5_nw2_sz224/ instead of
+# running the encoder on the fly — removes the dominant per-step GPU cost and is
+# numerically equivalent (both flip orientations are cached exactly; a feature-
+# space flip is NOT, so the mirrored frames are stored). Build the cache once
+# (needs the frame cache first) on an H100 via sh/extract_embeddings.sh, with
+# the SAME window/stride/erp/n_windows/sz slug and --vision_encoder as this run.
+# To enable: add a trailing `\` to the --run_name line and uncomment the flag in
+# the optional block below. DINOv2-style encoders only for now.
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
@@ -80,18 +91,14 @@ python pretrain_main.py \
     --mix_alljoined_weight 1.0 \
     --mix_cinebrain_weight 1.0 \
     --mix_egobrain_weight 1.0 \
-    --cinebrain_root data/CineBrain \
-    --cinebrain_subjects sub-0001,sub-0002,sub-0003,sub-0004,sub-0005,sub-0006 \
-    --cinebrain_n_windows 1 \
-    --cinebrain_window_s 1.0 \
-    --cinebrain_stride_s 1.0 \
-    --cinebrain_erp_latency_s 0.5 \
     --egobrain_root data/EgoBrain \
+    --egobrain_use_frame_grid \
+    --egobrain_use_grid_embeddings \
     --egobrain_subjects all \
     --egobrain_window_s 1.0 \
     --egobrain_stride_s 1.0 \
     --egobrain_clip_s 4.0 \
-    --egobrain_erp_latency_s 0.5 \
+    --egobrain_erp_latency_s -0.15 \
     --egobrain_max_channels 32 \
     --in_dim 40 \
     --out_dim 40 \
@@ -104,6 +111,11 @@ python pretrain_main.py \
     --mask_ratio 0.5 \
     --clip_value 0.8 \
     --alignment_weight 0.1 \
+    --frame_averaging \
+    --frame_avg_flip_prob 0.5 \
+    --frame_avg_recon_weight 0.0 \
+    --flip_align_weight 0.1 \
+    --flip_n_col_bands 2 \
     --latent_pred_weight 1.0 \
     --cls_pred_weight 0.1 \
     --max_horizon 1 \
@@ -119,7 +131,7 @@ python pretrain_main.py \
     --aux_envelope_weight 0.005 \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
-    --run_name wm-frame-tokens-noequiv
+    --run_name wm-cache-snap-erp-150
     # --aux_hand_pred \
     # --aux_hand_weight 0.1 \
     # --egobrain_hand_labels_dir data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200 \

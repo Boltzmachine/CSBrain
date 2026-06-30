@@ -71,11 +71,35 @@ def emb_grid_cache_dir(data_dir: str, vision_encoder: str, grid_s: float,
         f'cache_embeddings_grid_{enc_slug}_g{grid_s}_sz{frame_size}')
 
 
+@torch.no_grad()
+def encode_grid_vjepa2(model, pixel_values) -> dict:
+    """Frozen V-JEPA 2 spatial patch grid for a single frame, both orientations.
+
+    V-JEPA 2 is a video model: we replicate the frame T=2 so the temporal patch
+    count collapses to 1, leaving a purely spatial grid ``last_hidden_state``
+    (B, P, d) — exactly what ``CSBrainAlign.vjepa2_grid_tokens`` returns, so the
+    cache == the train-time grid. There is NO cls: V-JEPA 2's alignment rep is a
+    TRAINABLE attention pool over this grid, recomputed each step at train time
+    (see CSBrainAlign._vjepa2_patch_tokens), so it is not cacheable.
+    """
+    def _one(pv):
+        vid = pv.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()  # (B,2,3,H,W)
+        out = model(pixel_values_videos=vid)
+        return out.last_hidden_state.float().cpu()                    # (B, P, d)
+    grid = _one(pixel_values)
+    grid_flip = _one(torch.flip(pixel_values, dims=[-1]))
+    P = grid.size(1)
+    s = int(round(P ** 0.5))
+    assert s * s == P, f"V-JEPA 2 patch grid not square (P={P})"
+    return {'grid': grid, 'grid_flip': grid_flip, 'patch_grid_s': s}
+
+
 def _extract_subject(sub: str, frames_path: str, out_path: str, model,
                      mean: torch.Tensor, std: torch.Tensor, device: str,
                      batch_size: int, cfg: dict, n_register_tokens: int) -> dict:
-    """Encode one subject's grid frames (n_slots,H,W,3) into the four embedding
-    slices (n_slots,...) and write the per-subject HDF5 atomically."""
+    """Encode one subject's grid frames (n_slots,H,W,3) into the per-slot
+    embedding grid (+cls for DINOv2-style; grid-only for V-JEPA 2) and write the
+    per-subject HDF5 atomically."""
     if not os.path.exists(frames_path):
         return {'subject': sub, 'status': 'no_frames'}
 
@@ -100,11 +124,14 @@ def _extract_subject(sub: str, frames_path: str, out_path: str, model,
 
     np_dtype = np.dtype(cfg['dtype'])
     d_img = int(model.config.hidden_size)
-    # Orientations interleaved along axis 1 ([:, 0] = orig, [:, 1] = h-flip) so
-    # a single per-slot chunk read returns BOTH orientations -> halves the
-    # (expensive) grid seeks per training item, with zero read amplification
-    # (both orientations are always used together by the model).
-    cls_buf = np.zeros((n_slots, 2, d_img), dtype=np_dtype)
+    # V-JEPA 2 has no frozen cls (its alignment rep is a trainable pool over the
+    # grid) -> cache the grid ONLY. DINOv2-style -> cls + grid. Orientations are
+    # interleaved on axis 1 ([:, 0] = orig, [:, 1] = h-flip) so a single per-slot
+    # chunk read returns BOTH orientations -> halves the (expensive) grid seeks
+    # per training item, zero amplification (both orientations always used).
+    kind = cfg.get('kind', 'image')
+    has_cls = (kind != 'vjepa2')
+    cls_buf = np.zeros((n_slots, 2, d_img), dtype=np_dtype) if has_cls else None
     grid_full = None                                    # -> (n_slots, 2, P, d)
     patch_s = None
 
@@ -113,17 +140,21 @@ def _extract_subject(sub: str, frames_path: str, out_path: str, model,
         x = torch.from_numpy(np.ascontiguousarray(chunk)).to(device)
         x = x.float().div_(255.0).permute(0, 3, 1, 2)
         x = (x - mean) / std
-        emb = encode_frame_embeddings(
-            model, x, n_register_tokens=n_register_tokens)
+        if kind == 'vjepa2':
+            emb = encode_grid_vjepa2(model, x)
+        else:
+            emb = encode_frame_embeddings(
+                model, x, n_register_tokens=n_register_tokens)
         if grid_full is None:
             P = emb['grid'].size(1)
             patch_s = emb['patch_grid_s']
             grid_full = np.zeros((n_slots, 2, P, d_img), dtype=np_dtype)
         sl = slice(start, start + chunk.shape[0])
-        cls_buf[sl, 0] = emb['cls'].numpy().astype(np_dtype)
-        cls_buf[sl, 1] = emb['cls_flip'].numpy().astype(np_dtype)
         grid_full[sl, 0] = emb['grid'].numpy().astype(np_dtype)
         grid_full[sl, 1] = emb['grid_flip'].numpy().astype(np_dtype)
+        if has_cls:
+            cls_buf[sl, 0] = emb['cls'].numpy().astype(np_dtype)
+            cls_buf[sl, 1] = emb['cls_flip'].numpy().astype(np_dtype)
 
     P = grid_full.shape[2]
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -136,13 +167,17 @@ def _extract_subject(sub: str, frames_path: str, out_path: str, model,
         dt = cfg['dtype']
         # Per-slot chunks over the interleaved arrays: one chunk = one slot's
         # BOTH orientations, so train-time reads fetch a window's cls/grid in a
-        # single seek each.
-        h.create_dataset('cls', data=cls_buf, dtype=dt, chunks=(1, 2, d_img), **ckw)
+        # single seek each. V-JEPA 2 -> grid only (no cls dataset).
         h.create_dataset('grid', data=grid_full, dtype=dt,
                          chunks=(1, 2, P, d_img), **ckw)
+        if has_cls:
+            h.create_dataset('cls', data=cls_buf, dtype=dt,
+                             chunks=(1, 2, d_img), **ckw)
         h.create_dataset('has_image', data=has_image, dtype='bool')
         h.attrs['subject'] = sub
         h.attrs['vision_encoder'] = cfg['vision_encoder']
+        h.attrs['encoder_kind'] = kind
+        h.attrs['has_cls'] = bool(has_cls)
         h.attrs['frame_size'] = int(cfg['frame_size'])
         h.attrs['grid_s'] = float(cfg['grid_s'])
         h.attrs['patch_grid_s'] = int(patch_s)
@@ -192,10 +227,7 @@ def main():
     p.add_argument('--overwrite', action='store_true')
     args = p.parse_args()
 
-    if _encoder_kind(args.vision_encoder) == 'vjepa2':
-        raise SystemExit(
-            "egobrain_extract_embeddings_grid supports DINOv2-style encoders "
-            "only (V-JEPA 2's pooled alignment rep uses a trainable query).")
+    kind = _encoder_kind(args.vision_encoder)   # 'vjepa2' -> grid-only cache
 
     frame_size = (args.frame_size if args.frame_size is not None
                   else _frame_size_for(args.vision_encoder))
@@ -231,7 +263,7 @@ def main():
     mean, std = mean.to(device), std.to(device)
 
     cfg = dict(vision_encoder=args.vision_encoder, frame_size=frame_size,
-               grid_s=args.grid_s, dtype=args.dtype,
+               grid_s=args.grid_s, dtype=args.dtype, kind=kind,
                compression=args.compression, overwrite=args.overwrite)
 
     results = []

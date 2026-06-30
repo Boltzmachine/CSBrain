@@ -103,27 +103,32 @@ def _make_grid_frame_cache(root, sub, grid_s=0.2, n_slots=80):
     return d
 
 
-def _make_grid_emb_cache(root, sub, grid_s=0.2, n_slots=80, d=16, P=4):
+def _make_grid_emb_cache(root, sub, grid_s=0.2, n_slots=80, d=16, P=4,
+                         with_cls=True):
     """Time-keyed embedding cache, INTERLEAVED layout (format_version 2):
-    cls (n_slots,2,d) + grid (n_slots,2,P,d), axis 1 = [orig, h-flip]. Slot k
+    grid (n_slots,2,P,d) (+ cls (n_slots,2,d) for DINOv2-style; OMITTED for
+    V-JEPA 2 grid-only when ``with_cls=False``), axis 1 = [orig, h-flip]. Slot k
     filled with value k (orig) / k+1000 (flip) so the fetched slot+orientation
     is recoverable from the returned tensor."""
     from datasets.egobrain_extract_embeddings_grid import emb_grid_cache_dir
     dr = emb_grid_cache_dir(root, ENC, grid_s, SZ)
     os.makedirs(dr, exist_ok=True)
-    cls = np.zeros((n_slots, 2, d), np.float16)
     grid = np.zeros((n_slots, 2, P, d), np.float16)
     for k in range(n_slots):
-        cls[k, 0] = k;       cls[k, 1] = k + 1000       # [orig, flip]
-        grid[k, 0] = k;      grid[k, 1] = k + 1000
+        grid[k, 0] = k;      grid[k, 1] = k + 1000      # [orig, flip]
     with h5py.File(os.path.join(dr, f'{sub}.h5'), 'w') as h:
-        h.create_dataset('cls', data=cls)
         h.create_dataset('grid', data=grid)
+        if with_cls:
+            cls = np.zeros((n_slots, 2, d), np.float16)
+            for k in range(n_slots):
+                cls[k, 0] = k;   cls[k, 1] = k + 1000
+            h.create_dataset('cls', data=cls)
         h.create_dataset('has_image', data=np.ones((n_slots,), bool))
         h.attrs['grid_s'] = grid_s
         h.attrs['d_img'] = d
         h.attrs['n_patches'] = P
         h.attrs['orient_axis'] = 1
+        h.attrs['has_cls'] = bool(with_cls)
     return dr
 
 
@@ -331,6 +336,34 @@ def test_grid_embeddings_collate_emits_future_stacks():
         assert batch['frame_grid'].shape == (2, 4, 16)      # (B, P, d) window-0
         assert batch['frame_grid_future'].shape == (2, 2, 4, 16)  # (B, W, P, d)
         assert batch['frame_grid_flip_future'].shape == (2, 2, 4, 16)
+
+
+def test_grid_embeddings_vjepa_grid_only():
+    # V-JEPA 2 cache has NO cls -> dataset surfaces frame_grid only; collate
+    # omits frame_cls (the alignment pool is computed in the model from grid).
+    with tempfile.TemporaryDirectory() as root:
+        _make_eeg_cache(root, 'P0001')
+        _make_grid_frame_cache(root, 'P0001')
+        _make_grid_emb_cache(root, 'P0001', with_cls=False)        # grid-only
+        ds = EgoBrainDataset(
+            data_dir=root, subjects=['P0001'], in_dim=40, n_windows=2,
+            window_s=1.0, stride_s=1.0, clip_s=CLIP_S, fs_out=FS, erp_latency_s=0.5,
+            vision_encoder=ENC, frame_size=SZ, use_frame_grid=True,
+            use_grid_embeddings=True, frame_grid_s=0.2, max_channels=32,
+            temporal_jitter=True, jitter_seed=0)
+        s = ds[0]
+        k = s['base_slot']
+        step = ds.stride_samples // ds.grid_samples
+        assert 'frame_grid' in s and 'frame_grid_flip' in s
+        assert 'frame_cls' not in s and 'frame_cls_flip' not in s   # grid-only
+        assert s['frame_grid'].shape == (2, 4, 16)
+        for i in range(2):
+            slot = k + i * step
+            assert round(float(s['frame_grid'][i].mean())) == slot
+            assert round(float(s['frame_grid_flip'][i].mean())) == slot + 1000
+        b = collate_egobrain([ds[0], ds[1]])
+        assert b['frame_grid_future'].shape == (2, 2, 4, 16)
+        assert 'frame_cls' not in b and 'frame_cls_flip' not in b   # collate omits cls
 
 
 def test_grid_embeddings_require_frame_grid():

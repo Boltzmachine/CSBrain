@@ -296,6 +296,43 @@ def main():
     parser.add_argument('--egobrain_emb_grid_dir', type=str, default=None,
                         help='override the time-keyed embedding-grid cache dir; default '
                              'derives the cache_embeddings_grid_<enc>_g<g>_sz<sz> slug.')
+    parser.add_argument('--egobrain_motion_resample', action='store_true', default=False,
+                        help='with --egobrain_use_frame_grid, bias the random anchor draw '
+                             'toward visually DYNAMIC moments instead of uniform-in-time. '
+                             'EgoBrain video is mostly static, so uniform sampling wastes '
+                             '~half the budget on frozen frames where next-frame prediction '
+                             'is trivial; this draws the anchor k ∝ clip(motion(k),0,p_cap)^'
+                             'alpha (mixed with a uniform floor), where motion(k) is the '
+                             'frame-to-frame distance across the prediction step from the '
+                             'time-keyed embedding cache. Only WITHIN-subject position is '
+                             'reweighted (cross-subject balance unchanged). Per-subject '
+                             'motion scores are cached under the embedding cache '
+                             '_motioncache/ (built lazily or via '
+                             'scripts.build_egobrain_motion_cache). Default off.')
+    parser.add_argument('--egobrain_motion_resample_alpha', type=float, default=1.0,
+                        help='exponent on motion in the anchor weight (0=uniform, 1=linear, '
+                             '2=aggressive). See outputs/eval_tables.md for the budget '
+                             'concentration each alpha induces.')
+    parser.add_argument('--egobrain_motion_resample_space', type=str, default='patch',
+                        choices=['patch', 'pixel', 'cls'],
+                        help="representation the motion is measured in: 'patch' (DINOv2 grid "
+                             'tokens = the world-model target, V-JEPA-portable; default), '
+                             "'pixel' (raw frames; cheaper but inflates screen/lighting), or "
+                             "'cls' (DINOv2 global; not V-JEPA-portable).")
+    parser.add_argument('--egobrain_motion_resample_metric', type=str, default='cos',
+                        choices=['cos', 'l1'],
+                        help="distance metric for motion: 'cos' (1-cosine, clean static/"
+                             "dynamic separation; default) or 'l1' (the loss metric). Both "
+                             'rank anchors near-identically (Spearman ~0.999).')
+    parser.add_argument('--egobrain_motion_resample_cap_pct', type=float, default=99.0,
+                        help='winsorise motion at this per-subject percentile before the '
+                             'exponent so a few extreme jumps do not swamp the budget.')
+    parser.add_argument('--egobrain_motion_resample_floor_mix', type=float, default=0.1,
+                        help='fraction of a uniform distribution mixed into the motion '
+                             'weights so static regions keep a guaranteed coverage floor.')
+    parser.add_argument('--egobrain_motion_emb_dir', type=str, default=None,
+                        help='override the embedding cache dir the motion scores are read '
+                             'from; default reuses the grid embedding cache slug.')
 
     # --- ActionWorldModel (EEG=action, frozen V-JEPA 2=world) ---
     parser.add_argument('--eeg_ckpt', type=str, default=None,
@@ -605,6 +642,13 @@ def main():
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
+            motion_resample=params.egobrain_motion_resample,
+            motion_resample_alpha=params.egobrain_motion_resample_alpha,
+            motion_resample_space=params.egobrain_motion_resample_space,
+            motion_resample_metric=params.egobrain_motion_resample_metric,
+            motion_resample_cap_pct=params.egobrain_motion_resample_cap_pct,
+            motion_resample_floor_mix=params.egobrain_motion_resample_floor_mix,
+            motion_emb_dir=params.egobrain_motion_emb_dir,
         )
         print('EgoBrain clips:', len(egobrain_inner))
         egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
@@ -685,6 +729,13 @@ def main():
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
+            motion_resample=params.egobrain_motion_resample,
+            motion_resample_alpha=params.egobrain_motion_resample_alpha,
+            motion_resample_space=params.egobrain_motion_resample_space,
+            motion_resample_metric=params.egobrain_motion_resample_metric,
+            motion_resample_cap_pct=params.egobrain_motion_resample_cap_pct,
+            motion_resample_floor_mix=params.egobrain_motion_resample_floor_mix,
+            motion_emb_dir=params.egobrain_motion_emb_dir,
         )
         print('EgoBrain clips:', len(egobrain_inner))
         egobrain_iter = EgoBrainIterableWrapper(egobrain_inner)
@@ -746,6 +797,13 @@ def main():
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
+            motion_resample=params.egobrain_motion_resample,
+            motion_resample_alpha=params.egobrain_motion_resample_alpha,
+            motion_resample_space=params.egobrain_motion_resample_space,
+            motion_resample_metric=params.egobrain_motion_resample_metric,
+            motion_resample_cap_pct=params.egobrain_motion_resample_cap_pct,
+            motion_resample_floor_mix=params.egobrain_motion_resample_floor_mix,
+            motion_emb_dir=params.egobrain_motion_emb_dir,
         )
         print('EgoBrain clips:', len(pretrained_dataset))
         num_workers = 10 if os.environ.get('DEBUG', '0') == '0' else 0

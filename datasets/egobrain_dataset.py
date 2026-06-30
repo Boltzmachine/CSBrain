@@ -211,6 +211,13 @@ class EgoBrainDataset(Dataset):
         ea_matrices: Optional[dict] = None,
         delta_whiten_g0: float = 1.0,
         delta_whiten_cutoff_hz: float = 8.0,
+        motion_resample: bool = False,
+        motion_resample_alpha: float = 1.0,
+        motion_resample_space: str = 'patch',
+        motion_resample_metric: str = 'cos',
+        motion_resample_cap_pct: float = 99.0,
+        motion_resample_floor_mix: float = 0.1,
+        motion_emb_dir: Optional[str] = None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -484,6 +491,29 @@ class EgoBrainDataset(Dataset):
                     f"targets. Re-run datasets.egobrain_extract_embeddings for "
                     f"those subjects before training.", stacklevel=2)
 
+        # ------------------------------------------------------------------
+        # Motion-weighted anchor resampling (grid mode only). EgoBrain's video
+        # is mostly static, so the uniform anchor draw in ``_sample_base_slot``
+        # spends ~half the budget on frozen frames where the world-model's
+        # next-frame prediction is trivial. When enabled, the anchor ``k`` is
+        # drawn ∝ ``clip(motion(k), 0, p_cap)^alpha`` (mixed with a uniform
+        # floor), biasing toward visually dynamic moments — genuine hand/object
+        # manipulation; see datasets/egobrain_motion.py + the distribution study
+        # in outputs/eval_tables.md. Only WITHIN-subject position is reweighted
+        # (cross-subject balance is unchanged). Off by default so prior runs
+        # reproduce bit-for-bit. The per-subject sampling CDF is precomputed once
+        # here (main process) so the DataLoader-worker forks inherit it.
+        self.motion_resample = bool(motion_resample)
+        self.motion_resample_alpha = float(motion_resample_alpha)
+        self.motion_resample_space = motion_resample_space
+        self.motion_resample_metric = motion_resample_metric
+        self.motion_resample_cap_pct = float(motion_resample_cap_pct)
+        self.motion_resample_floor_mix = float(motion_resample_floor_mix)
+        self.motion_emb_dir = motion_emb_dir
+        self._anchor_cdf: dict[str, Optional[tuple]] = {}
+        if self.motion_resample:
+            self._init_motion_resample()
+
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
@@ -548,29 +578,117 @@ class EgoBrainDataset(Dataset):
             self._anchor_rng = np.random.default_rng(seed)
         return self._anchor_rng
 
+    def _anchor_k_bounds(self, sub: str) -> tuple[int, int]:
+        """Inclusive valid range ``[k_min, k_max]`` of the window-0 frame slot
+        for ``sub``: ``eeg_start_0 = k*grid - erp`` must lie in ``[0, total -
+        span]``. Shared by ``_sample_base_slot`` and the resample precompute so
+        both index the anchor axis identically."""
+        n_clips = self._subject_meta[sub]['n_clips']
+        total = n_clips * self.clip_samples
+        span = (self.n_windows - 1) * self.stride_samples + self.window_samples
+        grid = self.grid_samples
+        erp = self.erp_samples
+        k_min = (erp + grid - 1) // grid                 # ceil(erp/grid)
+        k_max = (total - span + erp) // grid             # floor
+        if k_max < k_min:
+            k_max = k_min
+        return k_min, k_max
+
     def _sample_base_slot(self, sub: str, c: int) -> int:
         """Base frame slot ``k`` for window 0. The FRAME is the discrete side
         (pre-stored on the 0.2 s grid) so we pin it to slot ``k`` and slide the
         CONTINUOUS EEG to match: window-0 START = ``k*grid_samples - erp_samples``
         so the frame at slot ``k`` sits exactly at ``start + erp``. Then every
         window's frame slot is an exact integer for ANY erp (no rounding) — see
-        ``_getitem_grid``. ``temporal_jitter`` picks ``k`` uniformly over the
-        valid range; otherwise the deterministic ``k`` puts window-0's start at
-        ~clip ``c`` (reproducible eval)."""
-        n_clips = self._subject_meta[sub]['n_clips']
-        total = n_clips * self.clip_samples
-        span = (self.n_windows - 1) * self.stride_samples + self.window_samples
-        grid = self.grid_samples
-        erp = self.erp_samples
-        # eeg_start_0 = k*grid - erp must lie in [0, total - span]
-        k_min = (erp + grid - 1) // grid                 # ceil(erp/grid)
-        k_max = (total - span + erp) // grid             # floor
-        if k_max < k_min:
-            k_max = k_min
+        ``_getitem_grid``. ``temporal_jitter`` picks ``k`` over the valid range —
+        uniformly, or (when ``motion_resample`` is on and this subject has a
+        sampling CDF) biased toward visually dynamic anchors; otherwise the
+        deterministic ``k`` puts window-0's start at ~clip ``c`` (reproducible
+        eval — never reweighted)."""
+        k_min, k_max = self._anchor_k_bounds(sub)
         if self.temporal_jitter:
+            if self.motion_resample:
+                ent = self._anchor_cdf.get(sub)
+                if ent is not None:
+                    k0, cdf = ent
+                    u = float(self._get_anchor_rng().random())
+                    off = int(np.searchsorted(cdf, u, side='right'))
+                    return k0 + min(off, cdf.shape[0] - 1)
             return int(self._get_anchor_rng().integers(k_min, k_max + 1))
-        k = int(round((c * self.clip_samples + erp) / grid))
+        k = int(round((c * self.clip_samples + self.erp_samples)
+                      / self.grid_samples))
         return min(max(k, k_min), k_max)
+
+    def _init_motion_resample(self) -> None:
+        """Precompute the per-subject motion-weighted anchor sampling CDF (main
+        process; worker forks inherit it). Each subject's CDF spans its
+        ``[k_min, k_max]`` and draws ``k`` ∝ ``clip(anchor_motion, 0, p_cap)^
+        alpha`` mixed with ``floor_mix`` uniform. Subjects without a usable
+        motion cache (no video, or all-static) map to ``None`` -> uniform
+        fallback in ``_sample_base_slot``."""
+        if not self.use_frame_grid:
+            raise ValueError(
+                "[EgoBrain] motion_resample requires use_frame_grid=True (it "
+                "reweights the continuous grid anchor draw).")
+        from datasets.egobrain_motion import (
+            load_or_compute_motion, anchor_motion, build_anchor_weights,
+            build_anchor_cdf)
+        space = self.motion_resample_space
+        # The motion (cls/patch) source is the time-keyed embedding cache; pixel
+        # motion reads the frame grid. Resolve the embedding dir even when the
+        # run itself feeds raw frames (use_frame_grid without grid embeddings).
+        emb_dir = (self.motion_emb_dir or self.emb_grid_dir)
+        if emb_dir is None:
+            enc_slug = self.vision_encoder.replace('/', '_')
+            emb_dir = os.path.join(
+                self.data_dir,
+                f'cache_embeddings_grid_{enc_slug}'
+                f'_g{self.frame_grid_s}_sz{self.frame_size}')
+        if space in ('patch', 'cls') and not os.path.isdir(emb_dir):
+            raise FileNotFoundError(
+                f"[EgoBrain] motion_resample space='{space}' needs the time-keyed "
+                f"embedding cache at '{emb_dir}' (build it with "
+                f"datasets.egobrain_extract_embeddings_grid), or pass "
+                f"motion_emb_dir, or use space='pixel'.")
+        if self.stride_samples % self.grid_samples != 0:
+            import warnings
+            warnings.warn(
+                f"[EgoBrain] motion_resample: stride_samples={self.stride_samples}"
+                f" is not a multiple of grid_samples={self.grid_samples}; the "
+                f"per-window frame step is rounded for the motion lookup.",
+                stacklevel=2)
+        step = int(round(self.stride_samples / self.grid_samples))
+        frames_dir = self.frame_grid_dir
+        n_weighted = 0
+        ess_fracs = []
+        for sub in self.subjects:
+            mot = load_or_compute_motion(
+                emb_dir, sub, step, self.motion_resample_metric, space,
+                frames_grid_dir=frames_dir)
+            if mot is None:
+                self._anchor_cdf[sub] = None
+                continue
+            am = anchor_motion(mot, self.n_windows, step)
+            w = build_anchor_weights(am, self.motion_resample_alpha,
+                                     self.motion_resample_cap_pct)
+            k_min, k_max = self._anchor_k_bounds(sub)
+            k_max = min(k_max, w.shape[0] - 1)           # never index past motion
+            cdf = build_anchor_cdf(w, k_min, k_max, self.motion_resample_floor_mix)
+            if cdf is None:
+                self._anchor_cdf[sub] = None
+            else:
+                self._anchor_cdf[sub] = (k_min, cdf)
+                n_weighted += 1
+                # effective sample size fraction = how concentrated the draw is
+                p = np.diff(np.concatenate([[0.0], cdf]))
+                ess_fracs.append(1.0 / (np.sum(p * p) * p.shape[0] + 1e-12))
+        ess = float(np.mean(ess_fracs)) if ess_fracs else float('nan')
+        print(f"[EgoBrain] motion_resample ON: space={space} "
+              f"metric={self.motion_resample_metric} alpha="
+              f"{self.motion_resample_alpha} cap_p{self.motion_resample_cap_pct} "
+              f"floor_mix={self.motion_resample_floor_mix} step={step} | "
+              f"{n_weighted}/{len(self.subjects)} subjects weighted "
+              f"(mean effective-sample-size fraction {ess:.2f})")
 
     def _load_continuous_raw(self, sub: str, start: int, length: int
                              ) -> np.ndarray:
@@ -913,36 +1031,46 @@ class EgoBrainDataset(Dataset):
         return out
 
     def _read_grid_embeddings(self, sub, frame_slots, has_image):
-        """Read cls/grid (+flip) from the time-keyed embedding cache at the given
-        per-window slots, updating ``has_image`` in place. The cache interleaves
-        orientations on axis 1 (``cls`` (n_slots,2,d), ``grid`` (n_slots,2,P,d);
-        [:,0]=orig, [:,1]=h-flip), so each slot's BOTH orientations come in ONE
-        chunk read — 1 grid seek/window instead of 2. Returns the frame_* dict
-        (or None when the subject has no cache — e.g. no-video — leaving
-        has_image False)."""
+        """Read grid (+ cls for DINOv2-style; grid-ONLY for V-JEPA 2) from the
+        time-keyed embedding cache at the given per-window slots, updating
+        ``has_image`` in place. Orientations are interleaved on axis 1
+        (``grid`` (n_slots,2,P,d), ``cls`` (n_slots,2,d) when present; [:,0]=orig,
+        [:,1]=h-flip), so each slot's BOTH orientations come in ONE chunk read.
+
+        V-JEPA 2 caches have NO ``cls`` (its alignment rep is a trainable pool
+        over the grid, computed in the model), so only ``frame_grid``/
+        ``frame_grid_flip`` are returned. Returns None when the subject has no
+        cache (e.g. no-video), leaving has_image False."""
         epath = os.path.join(self.emb_grid_dir, f'{sub}.h5')
         if not os.path.exists(epath):
             return None
         he = _get_h5_emb_handle(epath)
-        cls_ds, grid_ds, has_ds = he['cls'], he['grid'], he['has_image']
-        n_slots, _, d = cls_ds.shape            # (n_slots, 2, d)
-        P = grid_ds.shape[2]                     # (n_slots, 2, P, d)
+        grid_ds, has_ds = he['grid'], he['has_image']
+        has_cls = 'cls' in he                       # DINOv2 yes; V-JEPA 2 no
+        cls_ds = he['cls'] if has_cls else None
+        n_slots, _, P, d = grid_ds.shape             # (n_slots, 2, P, d)
         W = self.n_windows
-        f_cls = torch.zeros(W, d, dtype=torch.float32)
-        f_clsf = torch.zeros(W, d, dtype=torch.float32)
         f_grid = torch.zeros(W, P, d, dtype=torch.float32)
         f_gridf = torch.zeros(W, P, d, dtype=torch.float32)
+        if has_cls:
+            d_cls = cls_ds.shape[2]
+            f_cls = torch.zeros(W, d_cls, dtype=torch.float32)
+            f_clsf = torch.zeros(W, d_cls, dtype=torch.float32)
         for i, slot in enumerate(frame_slots):
             if 0 <= slot < n_slots and bool(has_ds[slot]):
-                cpair = np.asarray(cls_ds[slot], np.float32)    # (2, d)  1 read
                 gpair = np.asarray(grid_ds[slot], np.float32)   # (2,P,d) 1 read
-                f_cls[i] = torch.from_numpy(cpair[0])
-                f_clsf[i] = torch.from_numpy(cpair[1])
                 f_grid[i] = torch.from_numpy(gpair[0])
                 f_gridf[i] = torch.from_numpy(gpair[1])
+                if has_cls:
+                    cpair = np.asarray(cls_ds[slot], np.float32)  # (2,d) 1 read
+                    f_cls[i] = torch.from_numpy(cpair[0])
+                    f_clsf[i] = torch.from_numpy(cpair[1])
                 has_image[i] = True
-        return {'frame_cls': f_cls, 'frame_cls_flip': f_clsf,
-                'frame_grid': f_grid, 'frame_grid_flip': f_gridf}
+        out = {'frame_grid': f_grid, 'frame_grid_flip': f_gridf}
+        if has_cls:
+            out['frame_cls'] = f_cls
+            out['frame_cls_flip'] = f_clsf
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1010,18 +1138,24 @@ def collate_egobrain(batch):
     if emb_items:
         ref = emb_items[0]
         Wn, P, d_img = ref['frame_grid'].shape
-        zc = torch.zeros(Wn, d_img)
         zg = torch.zeros(Wn, P, d_img)
-        cls = [b.get('frame_cls', zc) for b in batch]
-        cls_f = [b.get('frame_cls_flip', zc) for b in batch]
         grid = [b.get('frame_grid', zg) for b in batch]
         grid_f = [b.get('frame_grid_flip', zg) for b in batch]
-        out['frame_cls'] = torch.stack([t[0] for t in cls])              # (B,d)
-        out['frame_cls_flip'] = torch.stack([t[0] for t in cls_f])
         out['frame_grid'] = torch.stack([t[0] for t in grid])           # (B,P,d)
         out['frame_grid_flip'] = torch.stack([t[0] for t in grid_f])
         out['frame_grid_future'] = torch.stack(grid)                    # (B,W,P,d)
         out['frame_grid_flip_future'] = torch.stack(grid_f)
+        # cls only for DINOv2-style caches. V-JEPA 2 is grid-only (its alignment
+        # rep is a trainable pool over the grid, recomputed in the model), so
+        # no item carries frame_cls -> omit it entirely.
+        cls_items = [b for b in emb_items if 'frame_cls' in b]
+        if cls_items:
+            d_cls = cls_items[0]['frame_cls'].shape[-1]
+            zc = torch.zeros(Wn, d_cls)
+            cls = [b.get('frame_cls', zc) for b in batch]
+            cls_f = [b.get('frame_cls_flip', zc) for b in batch]
+            out['frame_cls'] = torch.stack([t[0] for t in cls])          # (B,d)
+            out['frame_cls_flip'] = torch.stack([t[0] for t in cls_f])
     return out
 
 

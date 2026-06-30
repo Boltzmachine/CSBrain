@@ -83,6 +83,24 @@
 # the SAME window/stride/erp/n_windows/sz slug and --vision_encoder as this run.
 # To enable: add a trailing `\` to the --run_name line and uncomment the flag in
 # the optional block below. DINOv2-style encoders only for now.
+#
+# --egobrain_motion_resample (grid mode only): EgoBrain's egocentric video is
+# mostly STATIC (the wearer sits still for long stretches), so the uniform anchor
+# draw spends ~half the budget on frozen frames where the world-model's next-frame
+# prediction is trivial (cos-dist median ~0.03, gini ~0.5; see the distribution
+# study in outputs/eval_tables.md + outputs/motion/). This biases the anchor k
+# toward visually DYNAMIC moments — genuine hand/object manipulation — by drawing
+# k ∝ clip(motion(k),0,p_cap)^alpha mixed with a uniform floor, where motion(k) is
+# the frame-to-frame distance across the prediction step. Only WITHIN-subject
+# position is reweighted; cross-subject balance is unchanged. Knobs:
+#   --egobrain_motion_resample_space  patch (DINOv2 grid tokens = the WM target,
+#       V-JEPA-portable; default) | pixel (raw frames; cheaper, inflates screen/
+#       lighting) | cls (DINOv2 global; not V-JEPA-portable)
+#   --egobrain_motion_resample_metric cos (default) | l1   (rank-identical ~0.999)
+#   --egobrain_motion_resample_alpha  0=uniform, 1=linear (default), 2=aggressive
+#   --egobrain_motion_resample_cap_pct 99   --egobrain_motion_resample_floor_mix 0.1
+# Per-subject motion scores cache lazily under the embedding cache _motioncache/;
+# prebuild all subjects with `python -m scripts.build_egobrain_motion_cache`.
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
@@ -116,12 +134,12 @@ python pretrain_main.py \
     --frame_avg_recon_weight 0.0 \
     --flip_align_weight 0.1 \
     --flip_n_col_bands 2 \
-    --latent_pred_weight 1.0 \
-    --cls_pred_weight 0.1 \
+    --latent_pred_weight 2.0 \
+    --cls_pred_weight 0.2 \
     --max_horizon 1 \
-    --pred_ramp_epochs 2 \
+    --pred_ramp_epochs 0 \
     --predictor_d_model 512 \
-    --predictor_n_layers 4 \
+    --predictor_n_layers 2 \
     --model_dir outputs/ \
     --spectral_mode instantaneous \
     --aux_band_pred \
@@ -131,7 +149,11 @@ python pretrain_main.py \
     --aux_envelope_weight 0.005 \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
-    --run_name wm-cache-snap-erp-150
+    --run_name wm-cache-snap-erp-150-reweight-noramp-strictpred \
+    --egobrain_motion_resample \
+    --egobrain_motion_resample_space patch \
+    --egobrain_motion_resample_metric cos \
+    --egobrain_motion_resample_alpha 1.0
     # --aux_hand_pred \
     # --aux_hand_weight 0.1 \
     # --egobrain_hand_labels_dir data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200 \

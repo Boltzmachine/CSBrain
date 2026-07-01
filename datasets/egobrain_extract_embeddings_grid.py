@@ -79,8 +79,9 @@ def encode_grid_vjepa2(model, pixel_values) -> dict:
     count collapses to 1, leaving a purely spatial grid ``last_hidden_state``
     (B, P, d) — exactly what ``CSBrainAlign.vjepa2_grid_tokens`` returns, so the
     cache == the train-time grid. There is NO cls: V-JEPA 2's alignment rep is a
-    TRAINABLE attention pool over this grid, recomputed each step at train time
-    (see CSBrainAlign._vjepa2_patch_tokens), so it is not cacheable.
+    FIXED column-band mean-pool of this grid (the CLS substitute; see
+    ``CSBrainAlign._vjepa2_align_rep``), so caching the grid is sufficient — the
+    pool is parameter-free and recomputed from the cached grid at train time.
     """
     def _one(pv):
         vid = pv.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()  # (B,2,3,H,W)

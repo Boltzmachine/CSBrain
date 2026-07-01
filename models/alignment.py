@@ -912,15 +912,23 @@ class CSBrainAlign(nn.Module):
             p.requires_grad = False
         self.image_feature_dim = int(self.pretrained_image_encoder.config.hidden_size)
         self.encoder_kind = str(self.pretrained_image_encoder.config.model_type).lower()
+        # Alignment-rep width. V-JEPA 2 has no CLS token; its CLS substitute is
+        # a FIXED column-band mean-pool of the patch grid (see
+        # ``_vjepa2_align_rep``): the grid is split into ``flip_n_col_bands``
+        # equal vertical bands, each mean-pooled, and the bands are kept
+        # SEPARATE (concatenated) -> n_bands * d_img. This reuses the flip
+        # descriptor's column-band pooling, but WITHOUT its cross-band centering
+        # (centering removes the flip-invariant common component, which an
+        # alignment rep must keep — it has to represent the image, not just its
+        # left-right asymmetry). Every EEG-side alignment projection emits this
+        # width so the two InfoNCE spaces match. DINOv2 keeps the native CLS
+        # width (d_img). NB: the old learned attention pool ran under
+        # ``@torch.no_grad()`` so it never actually trained; this fixed pool is
+        # the cacheable, parameter-free replacement.
         if self.encoder_kind == 'vjepa2':
-            # Learned-query attention pool over V-JEPA 2 patch tokens.
-            self.image_pool_query = nn.Parameter(
-                torch.randn(1, 1, self.image_feature_dim) * 0.02)
-            self.image_pool_attn = nn.MultiheadAttention(
-                embed_dim=self.image_feature_dim, num_heads=image_pool_heads,
-                batch_first=True,
-            )
-            self.image_pool_norm = nn.LayerNorm(self.image_feature_dim)
+            self.alignment_feature_dim = int(flip_n_col_bands) * self.image_feature_dim
+        else:
+            self.alignment_feature_dim = self.image_feature_dim
         encoder_layer = CSBrain_TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, area_config=self.area_config, sorted_indices=self.sorted_indices, batch_first=True,
             activation=F.gelu, causal=causal,
@@ -1048,7 +1056,7 @@ class CSBrainAlign(nn.Module):
             self.band_align_proj = nn.ModuleList([
                 nn.Sequential(
                     nn.Linear(d_model, d_model), nn.GELU(),
-                    nn.Linear(d_model, self.image_feature_dim),
+                    nn.Linear(d_model, self.alignment_feature_dim),
                 ) for _ in range(K)
             ])
 
@@ -1074,7 +1082,7 @@ class CSBrainAlign(nn.Module):
         self.contrastive_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, self.image_feature_dim),
+            nn.Linear(d_model, self.alignment_feature_dim),
         )
 
         if self.use_llm_vq:
@@ -1239,7 +1247,7 @@ class CSBrainAlign(nn.Module):
         self.llm_contrastive_proj = nn.Sequential(
             nn.Linear(self.num_language_tokens * llama_dim, d_model),
             nn.GELU(),
-            nn.Linear(d_model, self.image_feature_dim),
+            nn.Linear(d_model, self.alignment_feature_dim),
         )
 
     def compute_zero_lag_sync_loss(self, source_emb):
@@ -1298,43 +1306,52 @@ class CSBrainAlign(nn.Module):
         return torch.stack([hs[i][:, 0] for i in idxs], dim=1)  # (B, L, d_img)
 
     @torch.no_grad()
-    def _vjepa2_patch_tokens(self, pixel_values, n_levels=1):
-        """Run frozen V-JEPA 2 and attention-pool patch tokens at ``n_levels``
-        depths with the shared learned query. Returns (B, n_levels, d_img).
+    def _vjepa2_align_rep(self, pixel_values, n_levels=1):
+        """V-JEPA 2 alignment rep (CLS substitute): a FIXED column-band
+        mean-pool of the patch grid at ``n_levels`` depths. Returns
+        (B, n_levels, n_bands * d_img).
 
-        ``pixel_values``: (B, 3, H, W). V-JEPA 2 expects a video tensor; we
-        replicate the frame T=2 times so the temporal patch count is 1.
+        V-JEPA 2 has no CLS token. Instead of a learned pool (the old one ran
+        under no_grad and never trained), the rep reuses the flip descriptor's
+        column-band pooling but WITHOUT cross-band centering (``center=False``)
+        so it keeps the image content the alignment InfoNCE needs.
+        ``pixel_values``: (B, 3, H, W); the single frame is replicated T=2 so
+        the temporal patch count collapses to 1, leaving a spatial grid.
+        ``n_levels=1`` uses the final grid (the cacheable rep); n_levels>1 pools
+        each selected depth.
         """
-        pv = pixel_values.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()
-        outputs = self.pretrained_image_encoder(
-            pixel_values_videos=pv, output_hidden_states=(n_levels > 1))
-        B = pv.size(0)
-        q = self.image_pool_query.expand(B, -1, -1)
         if n_levels <= 1:
-            sources = [outputs.last_hidden_state]
-        else:
-            hs = outputs.hidden_states
-            sources = [hs[i] for i in self._level_indices(len(hs) - 1, n_levels)]
-        pooled = []
-        for tok in sources:
-            p, _ = self.image_pool_attn(q, tok, tok, need_weights=False)
-            pooled.append(self.image_pool_norm(p.squeeze(1)))  # (B, d_img)
-        return torch.stack(pooled, dim=1)  # (B, L, d_img)
+            return self._colband_pool(
+                pixel_values=pixel_values, center=False).unsqueeze(1)
+        pv = pixel_values.unsqueeze(1).expand(-1, 2, -1, -1, -1).contiguous()
+        was_training = self.pretrained_image_encoder.training
+        self.pretrained_image_encoder.eval()
+        try:
+            outputs = self.pretrained_image_encoder(
+                pixel_values_videos=pv, output_hidden_states=True)
+        finally:
+            if was_training:
+                self.pretrained_image_encoder.train()
+        hs = outputs.hidden_states
+        sources = [hs[i] for i in self._level_indices(len(hs) - 1, n_levels)]
+        reps = [self._colband_pool(grid=t, center=False) for t in sources]
+        return torch.stack(reps, dim=1)  # (B, L, n_bands * d_img)
 
     def get_image_hidden_states(self, n_levels=1, **image_encoder_inputs):
-        """Return (B, n_levels, image_feature_dim) for either encoder.
+        """Return (B, n_levels, alignment_feature_dim) for either encoder.
 
-        Dispatches on ``self.encoder_kind``: V-JEPA 2 (no CLS) -> attention
-        pool over patch tokens with the learned query; DINOv2-style ViTs ->
-        CLS token at the selected depths. ``n_levels=1`` reproduces the
-        original single-level behavior byte-for-byte.
+        Dispatches on ``self.encoder_kind``: V-JEPA 2 (no CLS) -> fixed
+        column-band mean-pool of the patch grid (``alignment_feature_dim =
+        n_bands * d_img``); DINOv2-style ViTs -> CLS token at the selected
+        depths (``alignment_feature_dim = d_img``). ``n_levels=1`` reproduces
+        the original single-level behavior byte-for-byte.
         """
         if self.encoder_kind == 'vjepa2':
             pixel_values = image_encoder_inputs.get('pixel_values')
             assert pixel_values is not None, (
                 "V-JEPA 2 image encoder expects `pixel_values` in image_encoder_inputs"
             )
-            return self._vjepa2_patch_tokens(pixel_values, n_levels=n_levels)
+            return self._vjepa2_align_rep(pixel_values, n_levels=n_levels)
         # DINOv2-style fallback (also covers any future ViT with a CLS token).
         return self._dinov2_cls_token(image_encoder_inputs, n_levels=n_levels)
 
@@ -1348,8 +1365,8 @@ class CSBrainAlign(nn.Module):
         model; we replicate the single frame T=2 times so the temporal patch
         count collapses to 1, leaving a purely *spatial* grid
         ``(B, P, image_feature_dim)`` with ``P = (H/patch)*(W/patch)`` (256 for
-        a 256x256 frame at patch=16). Unlike :meth:`_vjepa2_patch_tokens` this
-        returns the full token grid rather than the attention-pooled vector.
+        a 256x256 frame at patch=16). Unlike :meth:`_vjepa2_align_rep` this
+        returns the full token grid rather than the column-band-pooled rep.
 
         The encoder is frozen at construction; we additionally force ``eval()``
         for the duration of the call so that an enclosing ``.train()`` on the
@@ -1695,19 +1712,25 @@ class CSBrainAlign(nn.Module):
             f"column-band flip descriptor")
         return tok.reshape(B, s, s, d)
 
-    def _image_lateral_descriptor(self, pixel_values=None, grid=None):
-        """Centered column-band spatial descriptor — the flip-sensitive image
-        target for the bilateralization prior. Returns (B, n_bands * d_img).
+    def _colband_pool(self, pixel_values=None, grid=None, center=False):
+        """Column-band mean-pool of the patch grid -> (B, n_bands * d_img).
 
-        Splits the patch grid into ``flip_n_col_bands`` equal vertical (column)
-        bands, mean-pools each, and (for n_bands>=2) removes the cross-band
-        mean so the flip-invariant common component is gone, leaving the
-        spatial left-right structure that a horizontal flip actually changes.
+        Splits the grid into ``flip_n_col_bands`` equal vertical (column) bands,
+        mean-pools each, and keeps the bands SEPARATE (concatenated). The two
+        callers differ only in ``center``:
+
+        * ``center=True`` — additionally removes the cross-band mean (n_bands>=2)
+          so the flip-invariant common component is gone, leaving the spatial
+          left-right structure a horizontal flip changes. This is the
+          flip-SENSITIVE descriptor for the bilateralization prior.
+        * ``center=False`` — keeps each band's absolute content. This is the
+          V-JEPA 2 alignment rep (CLS substitute); the alignment InfoNCE needs
+          the image content, not just its left-right asymmetry.
 
         ``grid`` (cached path): a precomputed patch grid (see
         :meth:`_image_patch_grid`). For a mirrored frame pass the cached
         ``grid_flip`` here — NEVER ``torch.flip`` of the un-flipped grid, which
-        is sign-inverted in this descriptor.
+        is sign-inverted in the centered descriptor.
         """
         grid_t = self._image_patch_grid(pixel_values=pixel_values, grid=grid)  # (B,s,s,d)
         B, s, _, d = grid_t.shape
@@ -1718,9 +1741,17 @@ class CSBrainAlign(nn.Module):
         bands = torch.stack(
             [grid_t[:, :, k * w:(k + 1) * w, :].mean(dim=(1, 2)) for k in range(nb)],
             dim=1)                                               # (B, nb, d)
-        if nb >= 2:
+        if center and nb >= 2:
             bands = bands - bands.mean(dim=1, keepdim=True)
         return bands.reshape(B, nb * d)
+
+    def _image_lateral_descriptor(self, pixel_values=None, grid=None):
+        """Centered column-band spatial descriptor — the flip-sensitive image
+        target for the bilateralization prior. Returns (B, n_bands * d_img).
+        Thin ``center=True`` wrapper over :meth:`_colband_pool`.
+        """
+        return self._colband_pool(
+            pixel_values=pixel_values, grid=grid, center=True)
 
     def build_lateral_flip(self, x, ch_coords, ch_names,
                            valid_channel_mask=None):
@@ -2067,6 +2098,20 @@ class CSBrainAlign(nn.Module):
                 presented_cls = torch.where(
                     fr, batch['frame_cls_flip'], batch['frame_cls'])     # (B, d)
                 img_hs = presented_cls[has_image].unsqueeze(1)           # (B_img,1,d)
+                info.update(self._image_contrastive(
+                    pred_flatten, batch, has_image, image_hidden_states=img_hs))
+            elif 'frame_grid' in batch and self.encoder_kind == 'vjepa2':
+                # V-JEPA 2 cached path (no CLS): build the alignment rep by
+                # column-band pooling the cached patch grid. Present orientation
+                # per row = the separately-encoded MIRRORED-frame grid iff that
+                # row is flipped (never torch.flip of the grid). Shape
+                # (B_img, 1, n_bands*d_img) matches get_image_hidden_states'
+                # n_levels=1 output that _image_contrastive indexes at [:, 0].
+                fr = flip.view(-1, 1, 1)
+                grid_present = torch.where(
+                    fr, batch['frame_grid_flip'], batch['frame_grid'])   # (B,P,d)
+                img_hs = self._colband_pool(
+                    grid=grid_present[has_image], center=False).unsqueeze(1)
                 info.update(self._image_contrastive(
                     pred_flatten, batch, has_image, image_hidden_states=img_hs))
             else:
@@ -2868,18 +2913,35 @@ class PatchEmbedding(nn.Module):
             # time axis back into (patch_num, frames_per_patch).
             L = patch_num * patch_size
             full_sig = mask_x_4d.contiguous().view(bz * ch_num, L)
+            if self.causal:
+                # Causal STFT: left-pad the history by n_fft-1 and DISABLE the
+                # symmetric centering. With center=False on the left-padded
+                # signal, analysis frame j spans original samples
+                # (j*hop - (n_fft-1) .. j*hop] — strictly past+present, so each
+                # patch's spectrum uses only its own and earlier samples.
+                # center=True would center every frame and reach n_fft//2 samples
+                # into the FUTURE, crossing the next patch boundary and breaking
+                # causality (output patch t leaking from input patch t+1).
+                full_sig = F.pad(full_sig, (self.stft_n_fft - 1, 0))
+                center = False
+            else:
+                center = True
             spec = torch.stft(
                 full_sig,
                 n_fft=self.stft_n_fft,
                 hop_length=self.stft_hop,
                 win_length=self.stft_n_fft,
                 window=self.stft_window,
-                center=True,
+                center=center,
                 return_complex=True,
                 normalized=True,
             )
-            # center=True with hop=h gives 1 + L // h frames; drop the trailing
-            # frame so the time axis is exactly L // h = patch_num * (patch_size // h).
+            # Both branches yield >= total_frames frames; keep the first
+            # total_frames so the time axis is exactly L // h =
+            # patch_num * (patch_size // h). center=True gives 1 + L//h and we
+            # drop the trailing frame; the causal branch (left-pad n_fft-1,
+            # center=False) gives exactly 1 + (L-1)//h = total_frames for
+            # h | patch_size (guaranteed by the __init__ divisibility check).
             frames_per_patch = patch_size // self.stft_hop
             total_frames = patch_num * frames_per_patch
             spec = spec.abs()[..., :total_frames]                       # (B*C, F, total_frames)

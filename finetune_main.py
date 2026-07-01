@@ -310,7 +310,7 @@ def main():
     elif params.downstream_dataset == 'TUSL':
         load_dataset = tusl_dataset.get_data_loader(params)
         data_loader = load_dataset
-        model = model_for_tusl.Model(params) # TODO
+        model = model_for_tusl.Model(params)
         t = Trainer(params, data_loader, model)
         results = t.train_for_multiclass()
     elif params.downstream_dataset == 'BCIC-IV-2a':

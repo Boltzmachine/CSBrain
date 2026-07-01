@@ -28,6 +28,7 @@ if _REPO not in sys.path:
 
 from datasets.egobrain_dataset import collate_egobrain
 from datasets.egobrain_extract_embeddings import encode_frame_embeddings
+from datasets.egobrain_extract_embeddings_grid import encode_grid_vjepa2
 from models.alignment import CSBrainAlign
 from models.world_model import FramePredictor, WorldModelWrapper
 
@@ -113,7 +114,8 @@ class TestCachedCollateAndReshape(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Parity tests — real DINOv2.
 # ---------------------------------------------------------------------------
-def _make_encoder(alignment_weight=0.1, n_patches=3, n_layer=3):
+def _make_encoder(alignment_weight=0.1, n_patches=3, n_layer=3,
+                  vision_encoder='facebook/dinov2-base'):
     in_dim = 40
     return CSBrainAlign(
         in_dim=in_dim, out_dim=in_dim, d_model=in_dim,
@@ -121,7 +123,7 @@ def _make_encoder(alignment_weight=0.1, n_patches=3, n_layer=3):
         n_layer=n_layer, nhead=4, TemEmbed_kernel_sizes=[(1,), (3,)],
         brain_regions=None, sorted_indices=[], causal=False,
         alignment_weight=alignment_weight, frame_averaging=True,
-        flip_split_hidden=32)
+        flip_split_hidden=32, vision_encoder=vision_encoder)
 
 
 class TestCachedEmbeddingParity(unittest.TestCase):
@@ -273,6 +275,89 @@ class TestCachedEmbeddingParity(unittest.TestCase):
             self.assertTrue(torch.allclose(lv, cv, atol=1e-4),
                             f'flip_prob={flip_prob}: frame_pred_loss live '
                             f'{lv.item()} vs cached {cv.item()}')
+
+
+# ---------------------------------------------------------------------------
+# Parity tests — real V-JEPA 2 (no CLS; column-band-pool alignment rep).
+# ---------------------------------------------------------------------------
+class TestVJEPA2ColbandAlignParity(unittest.TestCase):
+    """V-JEPA 2 has no CLS: its alignment rep (CLS substitute) is a FIXED
+    column-band mean-pool of the patch grid (``_vjepa2_align_rep``, center=False
+    -> n_bands*d_img). Only the grid is cached. These assert (a) the alignment
+    head width is n_bands*d_img with no trainable pool, and (b) the cached-grid
+    path reproduces the live encoder bit-for-bit for the main contrastive and
+    the flip-align losses.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(0)
+        try:
+            cls.enc = _make_encoder(
+                vision_encoder='facebook/vjepa2-vitl-fpc64-256').eval()
+        except Exception as e:                              # noqa: BLE001
+            raise unittest.SkipTest(
+                f'facebook/vjepa2-vitl-fpc64-256 weights unavailable: {e}')
+        cls.B = 4
+        cls.pv = torch.randn(cls.B, 3, 256, 256)
+        cls.emb = encode_grid_vjepa2(cls.enc.pretrained_image_encoder, cls.pv)
+
+    def test_align_rep_width_and_no_trainable_pool(self):
+        enc = self.enc
+        self.assertEqual(enc.encoder_kind, 'vjepa2')
+        self.assertEqual(enc.alignment_feature_dim,
+                         enc.flip_n_col_bands * enc.image_feature_dim)
+        # Every EEG-side alignment projection emits the colband width.
+        self.assertEqual(enc.contrastive_proj[-1].out_features,
+                         enc.alignment_feature_dim)
+        # The old (untrained, no_grad) attention pool is gone.
+        self.assertFalse(hasattr(enc, 'image_pool_query'))
+        self.assertFalse(hasattr(enc, 'image_pool_attn'))
+
+    def test_align_rep_matches_cached_grid(self):
+        # Live encode -> colband == colband of the separately cached grid.
+        with torch.no_grad():
+            live = self.enc._vjepa2_align_rep(self.pv, n_levels=1)
+            cached = self.enc._colband_pool(
+                grid=self.emb['grid'], center=False).unsqueeze(1)
+        self.assertEqual(tuple(live.shape),
+                         (self.B, 1, self.enc.alignment_feature_dim))
+        self.assertTrue(torch.allclose(live, cached, atol=1e-4),
+                        f'align-rep mismatch: {(live - cached).abs().max().item()}')
+
+    def _align_batch(self, flip):
+        NAMES_ = list(NAMES)
+        return {
+            'timeseries': torch.randn(self.B, len(NAMES_), 3, 40) / 100.0,
+            'ch_coords': torch.randn(self.B, len(NAMES_), 3).abs() + 0.1,
+            'ch_names': [NAMES_ for _ in range(self.B)],
+            'image_encoder_inputs': {'pixel_values': self.pv},
+            'has_image': torch.tensor([True, True, False, True]),
+            'source': ['egobrain'] * self.B,
+            'flip': flip,
+        }
+
+    def test_forward_alignment_and_flipalign_parity(self):
+        # Main contrastive (column-band CLS substitute) + flip-align descriptor,
+        # end-to-end through the frame-averaging forward: cached grid == live.
+        mask = torch.zeros(self.B, len(NAMES), 3, dtype=torch.long)
+        mask[:, :, 0] = 1
+        flip = torch.tensor([True, False, True, False])
+        base = self._align_batch(flip)
+        cached = {**base,
+                  'frame_grid': self.emb['grid'],
+                  'frame_grid_flip': self.emb['grid_flip']}
+        with torch.no_grad():
+            torch.manual_seed(1)
+            _, info_live = self.enc(base, mask=mask)
+            torch.manual_seed(1)
+            _, info_cached = self.enc(cached, mask=mask)
+        for key in ('contrastive_loss_0', 'flip_align_loss'):
+            self.assertIn(key, info_live)
+            self.assertIn(key, info_cached)
+            lv, cv = info_live[key][1], info_cached[key][1]
+            self.assertTrue(torch.allclose(lv, cv, atol=1e-4),
+                            f'{key}: live {lv.item()} vs cached {cv.item()}')
 
 
 if __name__ == '__main__':

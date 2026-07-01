@@ -127,6 +127,7 @@ python pretrain_main.py \
     --batch_size 128 \
     --epochs 40 \
     --mask_ratio 0.5 \
+    --mask_weight 1.0 \
     --clip_value 0.8 \
     --alignment_weight 0.1 \
     --frame_averaging \
@@ -149,7 +150,8 @@ python pretrain_main.py \
     --aux_envelope_weight 0.005 \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
-    --run_name wm-cache-snap-erp-150-reweight-noramp-strictpred \
+    --vision_encoder facebook/dinov2-base \
+    --run_name wm-vjepa-nomask \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \

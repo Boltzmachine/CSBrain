@@ -129,6 +129,10 @@ class Trainer(object):
             losses = []
             for batch_idx, x in enumerate(tqdm(self.data_loader, mininterval=10)):
                 self.optimizer.zero_grad()
+                # Coefficient on the masked-reconstruction term (mask_loss /
+                # freq_mask_loss). Default 1.0 = byte-identical to legacy; the
+                # term is the reference scale all other losses are tuned against.
+                mask_w = getattr(self.params, 'mask_weight', 1.0)
                 if True:#self.params.model != 'CSBrain':
                     if isinstance(x, dict):
                         batch = x
@@ -265,7 +269,7 @@ class Trainer(object):
                             mag_diff_sq = (spec_y.abs() - spec_x.abs()).pow(2)
                             bm = band_mask.unsqueeze(1).expand_as(mag_diff_sq)
                             freq_loss = (mag_diff_sq * bm).sum() / bm.sum().clamp(min=1)
-                            loss = freq_loss + sum(loss_dict.values())
+                            loss = freq_loss * mask_w + sum(loss_dict.values())
                             logs["freq_mask_loss"] = freq_loss.data.cpu().numpy()
                         elif isinstance(out, tuple) and info.get('skip_external_recon', False):
                             # Frame-averaging step under PER-SAMPLE flip. Flipped
@@ -314,7 +318,7 @@ class Trainer(object):
                                     )
                                 else:
                                     mask_loss = self.criterion(masked_y, masked_x)
-                                loss = loss + mask_loss * ratio_nf
+                                loss = loss + mask_loss * ratio_nf * mask_w
                                 logs["mask_loss"] = mask_loss.data.cpu().numpy()
 
                                 # Aux band targets on the SAME non-flip rows: zero
@@ -352,7 +356,7 @@ class Trainer(object):
                                 )
                             else:
                                 mask_loss = self.criterion(masked_y, masked_x)
-                            loss = mask_loss + sum(loss_dict.values())
+                            loss = mask_loss * mask_w + sum(loss_dict.values())
                             logs["mask_loss"] = mask_loss.data.cpu().numpy()
 
                             # On top of the plain MSE, predict instantaneous
@@ -411,12 +415,13 @@ class Trainer(object):
                         y = self.model(x, mask=mask)
                         masked_x = x[mask == 1]
                         masked_y = y[mask == 1]
-                        loss = self.criterion(masked_y, masked_x)
+                        mask_loss = self.criterion(masked_y, masked_x)
                     else:
                         y = self.model(x)
-                        loss = self.criterion(y, x)
+                        mask_loss = self.criterion(y, x)
+                    loss = mask_loss * mask_w
                     logs = {
-                        "mask_loss": loss.data.cpu().numpy(),
+                        "mask_loss": mask_loss.data.cpu().numpy(),
                     }
                 # --- Adversarial session-agnostic training ---
                 if self.adversarial_weight > 0 and isinstance(out, tuple):

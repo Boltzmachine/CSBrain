@@ -47,6 +47,8 @@ def main():
     parser.add_argument('--nhead', type=int, default=8, help='nhead')
     parser.add_argument('--need_mask', type=bool, default=True, help='need_mask')
     parser.add_argument('--mask_ratio', type=float, default=0.5, help='mask_ratio')
+    parser.add_argument('--mask_weight', type=float, default=1.0,
+                        help='coefficient on the masked-reconstruction (mask_loss) term in the total pretrain loss. mask_loss is the reference scale all other terms are tuned as a fraction of, so it defaults to 1.0 (byte-identical to legacy). Lower it to down-weight raw recon relative to the world-model / alignment / aux terms; raise it to do the opposite. Applies to the WorldModel patch-recon, frame-averaging non-flip recon, freq-mask recon, and the plain non-WorldModel path.')
     parser.add_argument('--freq_mask_prob', type=float, default=0.0,
                         help='probability of replacing patch-mask reconstruction with masked-frequency-band reconstruction on a given batch (0 = always patch-mask)')
     parser.add_argument('--freq_recon_n_bands', type=int, default=5,

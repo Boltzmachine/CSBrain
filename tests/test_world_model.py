@@ -53,25 +53,26 @@ class TestLatentPredictor(unittest.TestCase):
 
 class TestFramePredictor(unittest.TestCase):
     def test_shapes(self):
-        B, P, frame_dim, eeg_dim = 2, 16, 32, 40
+        B, P, frame_dim, eeg_dim, H = 2, 16, 32, 40, 4
         p = FramePredictor(frame_dim=frame_dim, eeg_dim=eeg_dim,
                            predictor_d_model=64, n_layers=2, n_heads=4,
-                           dim_feedforward=128, max_horizon=4)
+                           dim_feedforward=128, max_horizon=H)
         s = torch.randn(B, P, frame_dim)
         eeg = torch.randn(B, eeg_dim)
-        pred = p(s, eeg, horizon=2)
-        self.assertEqual(pred.shape, (B, P, frame_dim))
+        pred = p(s, eeg)
+        # Dense: one grid per 0.2 s step -> (B, H, P, frame_dim).
+        self.assertEqual(pred.shape, (B, H, P, frame_dim))
 
     def test_shapes_token_conditioning(self):
         """The predictor also accepts the full EEG token set (B, M, eeg_dim)."""
-        B, P, frame_dim, eeg_dim, M = 2, 16, 32, 40, 7
+        B, P, frame_dim, eeg_dim, M, H = 2, 16, 32, 40, 7, 4
         p = FramePredictor(frame_dim=frame_dim, eeg_dim=eeg_dim,
                            predictor_d_model=64, n_layers=2, n_heads=4,
-                           dim_feedforward=128, max_horizon=4)
+                           dim_feedforward=128, max_horizon=H)
         s = torch.randn(B, P, frame_dim)
         eeg = torch.randn(B, M, eeg_dim)
-        pred = p(s, eeg, horizon=2)
-        self.assertEqual(pred.shape, (B, P, frame_dim))
+        pred = p(s, eeg)
+        self.assertEqual(pred.shape, (B, H, P, frame_dim))
 
     def test_eeg_conditioning_changes_output(self):
         """Zeroing the EEG embedding must change the prediction — otherwise the
@@ -82,13 +83,13 @@ class TestFramePredictor(unittest.TestCase):
                            dim_feedforward=128, max_horizon=4)
         s = torch.randn(B, P, frame_dim)
         eeg = torch.randn(B, eeg_dim)
-        a = p(s, eeg, horizon=1)
-        b = p(s, torch.zeros_like(eeg), horizon=1)
+        a = p(s, eeg)
+        b = p(s, torch.zeros_like(eeg))
         self.assertGreater((a - b).abs().mean().item(), 1e-6)
 
     def test_padding_mask_invariance(self):
-        """Masked EEG tokens must not influence the frame prediction at all —
-        neither through attention nor through the FiLM pool."""
+        """Masked EEG tokens must not influence the frame prediction at all
+        (excluded as attention keys)."""
         B, P, frame_dim, eeg_dim, M = 2, 8, 16, 12, 5
         p = FramePredictor(frame_dim=frame_dim, eeg_dim=eeg_dim,
                            predictor_d_model=64, n_layers=2, n_heads=4,
@@ -100,10 +101,10 @@ class TestFramePredictor(unittest.TestCase):
         kpm[:, 3:] = True  # mark the last two EEG tokens as padding
 
         with torch.no_grad():
-            out1 = p(s, eeg, horizon=1, eeg_key_padding_mask=kpm)
+            out1 = p(s, eeg, eeg_key_padding_mask=kpm)
             eeg2 = eeg.clone()
             eeg2[:, 3:] = torch.randn(B, M - 3, eeg_dim)  # perturb only masked
-            out2 = p(s, eeg2, horizon=1, eeg_key_padding_mask=kpm)
+            out2 = p(s, eeg2, eeg_key_padding_mask=kpm)
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5),
                         "masked EEG tokens changed the prediction")
 
@@ -120,9 +121,11 @@ class TestWorldModelFrameObjective(unittest.TestCase):
         return lambda pv: torch.randn(pv.shape[0], s_grid, s_grid, d_img)
 
     def _run(self, batch, enc, max_horizon=2, frame_eeg_cond='global'):
+        # Predictor's dense output width must match the wrapper's max_horizon
+        # (= number of 0.2 s target frames = W - 1).
         pred = FramePredictor(frame_dim=enc.image_feature_dim, eeg_dim=enc.d_model,
                               predictor_d_model=64, n_layers=2, n_heads=4,
-                              dim_feedforward=128, max_horizon=4)
+                              dim_feedforward=128, max_horizon=max_horizon)
         wrapper = WorldModelWrapper(encoder=enc, predictor=pred,
                                     latent_pred_weight=1.0, max_horizon=max_horizon,
                                     ramp_epochs=0, objective='frame',

@@ -105,7 +105,7 @@ python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
     --dataset_dir egobrain \
-    --egobrain_n_windows 2 \
+    --egobrain_n_windows 6 \
     --mix_alljoined_weight 1.0 \
     --mix_cinebrain_weight 1.0 \
     --mix_egobrain_weight 1.0 \
@@ -114,7 +114,7 @@ python pretrain_main.py \
     --egobrain_use_grid_embeddings \
     --egobrain_subjects all \
     --egobrain_window_s 1.0 \
-    --egobrain_stride_s 1.0 \
+    --egobrain_stride_s 0.2 \
     --egobrain_clip_s 4.0 \
     --egobrain_erp_latency_s -0.15 \
     --egobrain_max_channels 32 \
@@ -137,7 +137,7 @@ python pretrain_main.py \
     --flip_n_col_bands 2 \
     --latent_pred_weight 2.0 \
     --cls_pred_weight 0.2 \
-    --max_horizon 1 \
+    --max_horizon 5 \
     --pred_ramp_epochs 0 \
     --predictor_d_model 512 \
     --predictor_n_layers 2 \
@@ -151,7 +151,7 @@ python pretrain_main.py \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
     --vision_encoder facebook/dinov2-base \
-    --run_name wm-vjepa-nomask \
+    --run_name wm-dino-dense \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \

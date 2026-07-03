@@ -1,4 +1,5 @@
 import argparse
+import functools
 import math
 import random
 import numpy as np
@@ -820,7 +821,11 @@ def main():
             batch_size=params.batch_size,
             num_workers=num_workers,
             sampler=sampler,
-            collate_fn=collate_egobrain,
+            collate_fn=functools.partial(
+                collate_egobrain,
+                frame_objective=(getattr(params, 'model', None) == 'WorldModel'
+                                 and getattr(params, 'wm_objective', 'eeg') == 'frame'),
+            ),
             pin_memory=True,
             drop_last=True,
         )

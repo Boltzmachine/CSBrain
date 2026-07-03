@@ -657,18 +657,28 @@ class EgoBrainDataset(Dataset):
                 f" is not a multiple of grid_samples={self.grid_samples}; the "
                 f"per-window frame step is rounded for the motion lookup.",
                 stacklevel=2)
-        step = int(round(self.stride_samples / self.grid_samples))
+        train_step = int(round(self.stride_samples / self.grid_samples))
+        # Weight each anchor by the motion ACROSS its FULL span — the distance
+        # between its first frame (slot k) and its last frame
+        # (slot k + (n_windows-1)*train_step), i.e. the 0.0s -> 1.0s displacement
+        # — instead of aggregating the per-window (0.2s) steps. This REUSES the
+        # coarse, already-cached span-motion array (the 1.0s "d5") rather than
+        # recomputing a fine per-step array ("d1") for every subject. For
+        # n_windows==2 this reduces to the old per-step behaviour identically.
+        motion_step = max(1, (self.n_windows - 1) * train_step)
         frames_dir = self.frame_grid_dir
         n_weighted = 0
         ess_fracs = []
         for sub in self.subjects:
             mot = load_or_compute_motion(
-                emb_dir, sub, step, self.motion_resample_metric, space,
+                emb_dir, sub, motion_step, self.motion_resample_metric, space,
                 frames_grid_dir=frames_dir)
             if mot is None:
                 self._anchor_cdf[sub] = None
                 continue
-            am = anchor_motion(mot, self.n_windows, step)
+            # mot[k] = dist(emb[k], emb[k+motion_step]) is already the whole
+            # anchor-span motion, so it IS the per-anchor score directly.
+            am = np.asarray(mot, dtype=np.float32)
             w = build_anchor_weights(am, self.motion_resample_alpha,
                                      self.motion_resample_cap_pct)
             k_min, k_max = self._anchor_k_bounds(sub)
@@ -686,7 +696,7 @@ class EgoBrainDataset(Dataset):
         print(f"[EgoBrain] motion_resample ON: space={space} "
               f"metric={self.motion_resample_metric} alpha="
               f"{self.motion_resample_alpha} cap_p{self.motion_resample_cap_pct} "
-              f"floor_mix={self.motion_resample_floor_mix} step={step} | "
+              f"floor_mix={self.motion_resample_floor_mix} motion_step={motion_step} | "
               f"{n_weighted}/{len(self.subjects)} subjects weighted "
               f"(mean effective-sample-size fraction {ess:.2f})")
 
@@ -979,32 +989,38 @@ class EgoBrainDataset(Dataset):
                       / self.grid_samples))
             for i in range(self.n_windows)]
 
-        pixel_values = torch.zeros(
-            self.n_windows, 3, self.frame_size, self.frame_size,
-            dtype=torch.float32)
         has_image = torch.zeros(self.n_windows, dtype=torch.bool)
         frame_emb = None
         if self.load_frames and self.use_grid_embeddings:
-            # Cached DINOv2 embeddings: read cls/grid (+flip) per slot and let
-            # the model skip the live encoder. pixel_values stay zero (the model
-            # prefers the cached tensors); has_image comes from the emb cache.
+            # Cached DINOv2 embeddings: read cls/grid (+flip) and let the model
+            # skip the live encoder entirely. Because the frozen encoder is NEVER
+            # run on raw pixels in this mode, a full-res (W,3,frame_size,frame_size)
+            # frame tensor is pure dead weight (~3.6 MB/sample -> ~460 MB/batch of
+            # zeros, pinned + copied H2D, never read). Keep a 1x1 placeholder so
+            # pixel_values_future's window axis + the image_encoder_inputs gate
+            # survive; the model reads frame_grid_future / frame_cls instead.
+            pixel_values = torch.zeros(self.n_windows, 3, 1, 1, dtype=torch.float32)
             frame_emb = self._read_grid_embeddings(sub, frame_slots, has_image)
-        elif self.load_frames and self.use_frame_grid:
-            # Frames from the time-keyed frame grid (live encode downstream).
-            gpath = os.path.join(self.frame_grid_dir, f'{sub}.h5')
-            if os.path.exists(gpath):
-                h = _get_h5_frame_handle(gpath)
-                frames_ds = h['frames']
-                has_ds = h['has_image']
-                n_slots = frames_ds.shape[0]
-                mean, std = _get_normalize_params(self.vision_encoder)
-                for i, slot in enumerate(frame_slots):
-                    if 0 <= slot < n_slots and bool(has_ds[slot]):
-                        fr = np.ascontiguousarray(frames_ds[slot])   # (H,W,3)
-                        x = (torch.from_numpy(fr).float().div_(255.0)
-                             .permute(2, 0, 1).unsqueeze(0))          # (1,3,H,W)
-                        pixel_values[i] = ((x - mean) / std)[0]
-                        has_image[i] = True
+        else:
+            pixel_values = torch.zeros(
+                self.n_windows, 3, self.frame_size, self.frame_size,
+                dtype=torch.float32)
+            if self.load_frames and self.use_frame_grid:
+                # Frames from the time-keyed frame grid (live encode downstream).
+                gpath = os.path.join(self.frame_grid_dir, f'{sub}.h5')
+                if os.path.exists(gpath):
+                    h = _get_h5_frame_handle(gpath)
+                    frames_ds = h['frames']
+                    has_ds = h['has_image']
+                    n_slots = frames_ds.shape[0]
+                    mean, std = _get_normalize_params(self.vision_encoder)
+                    for i, slot in enumerate(frame_slots):
+                        if 0 <= slot < n_slots and bool(has_ds[slot]):
+                            fr = np.ascontiguousarray(frames_ds[slot])   # (H,W,3)
+                            x = (torch.from_numpy(fr).float().div_(255.0)
+                                 .permute(2, 0, 1).unsqueeze(0))          # (1,3,H,W)
+                            pixel_values[i] = ((x - mean) / std)[0]
+                            has_image[i] = True
 
         # Hand labels are (clip, window)-keyed; not aligned to arbitrary
         # offsets, so the grid path leaves them off (the aux loss masks them).
@@ -1056,16 +1072,43 @@ class EgoBrainDataset(Dataset):
             d_cls = cls_ds.shape[2]
             f_cls = torch.zeros(W, d_cls, dtype=torch.float32)
             f_clsf = torch.zeros(W, d_cls, dtype=torch.float32)
-        for i, slot in enumerate(frame_slots):
-            if 0 <= slot < n_slots and bool(has_ds[slot]):
-                gpair = np.asarray(grid_ds[slot], np.float32)   # (2,P,d) 1 read
-                f_grid[i] = torch.from_numpy(gpair[0])
-                f_gridf[i] = torch.from_numpy(gpair[1])
-                if has_cls:
-                    cpair = np.asarray(cls_ds[slot], np.float32)  # (2,d) 1 read
-                    f_cls[i] = torch.from_numpy(cpair[0])
-                    f_clsf[i] = torch.from_numpy(cpair[1])
-                has_image[i] = True
+
+        # cls is only ever read for the ANCHOR window: collate_egobrain keeps
+        # frame_cls[0] and drops slots 1..W-1 (no frame_cls_future), so reading
+        # cls for the other slots is pure waste. Read the anchor cls separately.
+        def _read_cls(slot):
+            if has_cls and 0 <= slot < n_slots and bool(has_ds[slot]):
+                cpair = np.asarray(cls_ds[slot], np.float32)      # (2, d) 1 read
+                f_cls[0] = torch.from_numpy(cpair[0])
+                f_clsf[0] = torch.from_numpy(cpair[1])
+
+        slots = np.asarray(frame_slots, dtype=np.int64)
+        contiguous = (
+            len(frame_slots) >= 1 and slots[0] >= 0 and slots[-1] < n_slots
+            and np.array_equal(slots, np.arange(slots[0], slots[0] + len(slots))))
+        if contiguous:
+            # Dense 0.2 s grid (stride == frame_grid): the W slots are one
+            # contiguous block, so read grid + has as a SINGLE hyperslab each
+            # instead of W point reads (decompress once, no per-read overhead).
+            lo = int(slots[0])
+            has_block = np.asarray(has_ds[lo:lo + W]).astype(bool)   # 1 read
+            grid_block = np.asarray(grid_ds[lo:lo + W], np.float32)  # 1 read (W,2,P,d)
+            for i in range(W):
+                if has_block[i]:
+                    f_grid[i] = torch.from_numpy(grid_block[i, 0])
+                    f_gridf[i] = torch.from_numpy(grid_block[i, 1])
+                    has_image[i] = True
+            _read_cls(lo)
+        else:
+            # Legacy non-contiguous stride (stride != frame_grid): per-slot reads.
+            for i, slot in enumerate(frame_slots):
+                if 0 <= slot < n_slots and bool(has_ds[slot]):
+                    gpair = np.asarray(grid_ds[slot], np.float32)   # (2,P,d) 1 read
+                    f_grid[i] = torch.from_numpy(gpair[0])
+                    f_gridf[i] = torch.from_numpy(gpair[1])
+                    has_image[i] = True
+            _read_cls(int(slots[0]))
+
         out = {'frame_grid': f_grid, 'frame_grid_flip': f_gridf}
         if has_cls:
             out['frame_cls'] = f_cls
@@ -1079,7 +1122,15 @@ class EgoBrainDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-def collate_egobrain(batch):
+def collate_egobrain(batch, frame_objective=False):
+    """Stack EgoBrain samples into a world-model batch.
+
+    ``frame_objective`` (set by the WorldModel ``--wm_objective frame`` run):
+    the predictor conditions only on window 0's EEG and never encodes the future
+    EEG windows, so ``timeseries_future`` is trimmed to window 0 — its presence
+    still triggers ``cinebrain_idx``/``cb_idx`` in the wrapper, but the unused
+    windows 1..W-1 are not stacked or copied to the GPU.
+    """
     B = len(batch)
     # EgoBrain subjects can have slightly different kept-channel counts
     # (e.g. when a subject had a noisy electrode dropped); pad to the
@@ -1107,7 +1158,9 @@ def collate_egobrain(batch):
         'ch_names': [b['ch_names'] for b in batch],
         'valid_channel_mask': valid_channel_mask,
         'valid_length_mask': valid_length_mask,
-        'timeseries_future': ts_all,
+        # Frame objective never encodes the future EEG windows (only window 0),
+        # so keep window 0 alone — its presence still drives cb_idx downstream.
+        'timeseries_future': ts_all[:, :1] if frame_objective else ts_all,
         'pixel_values_future': pixel_values_all,
         'has_image_future': has_image_all,
         'image_encoder_inputs': {

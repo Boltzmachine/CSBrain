@@ -316,16 +316,21 @@ def test_grid_embeddings_surface_frame_tensors_at_right_slots():
             assert key in s, key
         assert s['frame_cls'].shape == (2, 16)       # (W, d)
         assert s['frame_grid'].shape == (2, 4, 16)   # (W, P, d)
-        # exact slots k + i*step (cache fills cls[slot]=slot, grid[slot]=slot)
+        # grid is read for EVERY window; cls only for the ANCHOR (window 0) —
+        # collate keeps frame_cls[0] and drops the rest, so the loader no longer
+        # reads the future-window cls (dead I/O removed).
         for i in range(2):
             slot = k + i * step
             assert bool(s['has_image'][i])
-            assert round(float(s['frame_cls'][i].mean())) == slot
             assert round(float(s['frame_grid'][i].mean())) == slot
-            # flip variants are the +1000 datasets
-            assert round(float(s['frame_cls_flip'][i].mean())) == slot + 1000
-        # pixels are left zero — the model consumes the cached tensors
+            assert round(float(s['frame_grid_flip'][i].mean())) == slot + 1000
+        assert round(float(s['frame_cls'][0].mean())) == k
+        assert round(float(s['frame_cls_flip'][0].mean())) == k + 1000
+        assert torch.count_nonzero(s['frame_cls'][1:]) == 0        # non-anchor cls unread
+        # pixels are a 1x1 placeholder — grid embeddings mean the encoder never
+        # runs on raw frames, so no full-res frame tensor is materialized.
         assert torch.count_nonzero(s['pixel_values']) == 0
+        assert s['pixel_values'].shape[-2:] == (1, 1)
 
 
 def test_grid_embeddings_collate_emits_future_stacks():
@@ -336,6 +341,22 @@ def test_grid_embeddings_collate_emits_future_stacks():
         assert batch['frame_grid'].shape == (2, 4, 16)      # (B, P, d) window-0
         assert batch['frame_grid_future'].shape == (2, 2, 4, 16)  # (B, W, P, d)
         assert batch['frame_grid_flip_future'].shape == (2, 2, 4, 16)
+
+
+def test_grid_frame_objective_trims_future_eeg():
+    # --wm_objective frame never encodes the future EEG windows, so collate
+    # trims timeseries_future to window 0 (presence still drives cb_idx). The
+    # frame TARGET stack (frame_grid_future) is left at its full W windows.
+    with tempfile.TemporaryDirectory() as root:
+        ds = _grid_emb_dataset(root)
+        items = [ds[0], ds[1]]
+        full = collate_egobrain(items)
+        assert full['timeseries_future'].shape[1] == ds.n_windows
+        trimmed = collate_egobrain(items, frame_objective=True)
+        assert trimmed['timeseries_future'].shape[1] == 1
+        assert torch.allclose(
+            trimmed['timeseries_future'][:, 0], full['timeseries_future'][:, 0])
+        assert trimmed['frame_grid_future'].shape[1] == ds.n_windows
 
 
 def test_grid_embeddings_vjepa_grid_only():

@@ -23,6 +23,28 @@ import torch.nn.functional as F
 from utils.util import generate_mask
 
 
+# Dataset-level mean per-patch L1 motion between the window-0 anchor grid and each
+# of the H future frame grids — the PER-HORIZON reference that normalises the
+# per-patch weighting of the dense frame-prediction loss
+# (``WorldModelWrapper._motion_weight``). Entry ``τ-1`` is the mean of
+# ``mean_d |grid[k+τ·train_step] - grid[k]|`` over all anchors/subjects.
+#
+# Why PER-STEP: motion grows monotonically with the horizon (scene drift
+# accumulates), so a single scalar would make the "static" floor threshold
+# (``floor * ref``) too strict at short lags and too loose at long lags. A
+# per-horizon reference makes that threshold lag-appropriate. Why FIXED: the
+# per-batch mean jitters with batch composition + motion_resample, so the
+# static/dynamic boundary would drift during training.
+#
+# Precomputed by scripts/compute_frame_motion_ref.py over ALL 24 EgoBrain subjects
+# (60k anchor×horizon samples) for the facebook/dinov2-base g0.2 sz224 grid cache
+# with stride 0.2s / max_horizon 5 (train_step=1). RECOMPUTE and update this if
+# you change the vision encoder, grid_s, stride_s, or max_horizon — the scale is
+# encoder- and window-config-specific. Index by horizon τ=1..H; a run with H<5
+# uses the first H entries. (scalar mean over all steps ≈ 0.564.) [2026-07-04]
+EGOBRAIN_FRAME_MOTION_REF_PER_STEP = (0.4215, 0.5227, 0.5842, 0.6280, 0.6628)
+
+
 # ---------------------------------------------------------------------------
 # Latent predictor
 # ---------------------------------------------------------------------------
@@ -270,12 +292,35 @@ class WorldModelWrapper(nn.Module):
         flip_pred_weight: float = 1.0,
         objective: str = 'eeg',
         frame_eeg_cond: str = 'global',
+        frame_motion_alpha: float = 0.0,
+        frame_motion_floor: float = 0.1,
+        frame_motion_ref: float = -1.0,
     ):
         super().__init__()
         assert objective in ('eeg', 'frame'), (
             f"objective must be 'eeg' or 'frame', got {objective!r}")
         assert frame_eeg_cond in ('global', 'tokens'), (
             f"frame_eeg_cond must be 'global' or 'tokens', got {frame_eeg_cond!r}")
+        assert frame_motion_alpha >= 0.0, (
+            f"frame_motion_alpha must be >= 0, got {frame_motion_alpha}")
+        assert 0.0 <= frame_motion_floor <= 1.0, (
+            f"frame_motion_floor must be in [0, 1], got {frame_motion_floor}")
+        # Per-patch motion weighting for the DENSE frame objective (see
+        # ``_motion_weight`` / ``_frame_prediction_step``). ``alpha == 0`` keeps
+        # the legacy uniform mean over patches (byte-identical); ``alpha > 0``
+        # up-weights each patch by how far its target moved from the anchor grid,
+        # so the loss concentrates on EEG-explainable motion instead of the
+        # near-static scene the copy-the-anchor shortcut already reproduces.
+        self.frame_motion_alpha = float(frame_motion_alpha)
+        self.frame_motion_floor = float(frame_motion_floor)
+        # Reference scale for the weight normalisation ``clip(motion/ref, floor)``.
+        # ``< 0`` (default) -> the FIXED baked-in per-horizon
+        # ``EGOBRAIN_FRAME_MOTION_REF_PER_STEP`` (stable, lag-appropriate floor
+        # threshold); ``== 0`` -> per-batch per-step mean (legacy dynamic,
+        # jitters); ``> 0`` -> this explicit scalar applied to every step
+        # (override for a different encoder/window config). Resolved by
+        # ``_resolved_motion_ref``.
+        self.frame_motion_ref = float(frame_motion_ref)
         # For the frame objective, condition the predictor on either the EEG
         # window-level global rep (``'global'``) or the full per-patch EEG token
         # set (``'tokens'``, M = C*N tokens). Ignored for the EEG objective.
@@ -535,6 +580,90 @@ class WorldModelWrapper(nn.Module):
         valid_tok = vcm.unsqueeze(2) & vlm.unsqueeze(1)        # (Bv, C, N)
         return ~valid_tok.reshape(valid_tok.size(0), C * N)    # True == ignore
 
+    @staticmethod
+    def _motion_weight(s_anchor: torch.Tensor, s_tgt: torch.Tensor,
+                       tgt_valid: torch.Tensor, alpha: float, floor: float,
+                       ref=None):
+        """Per-(row, step, patch) weight for the dense frame-prediction loss.
+
+        The dense frame target ``s_tgt`` (next 0.2 s DINOv2/V-JEPA grids) is
+        ~static in feature space, so a uniform mean over patches is dominated by
+        patches the anchor already explains — the predictor minimises it by
+        copying the anchor and never uses the EEG (``diag_frame_eeg_gap`` ~0).
+        Weighting each patch by how far its target MOVED from the anchor (the
+        residual the copy leaves unexplained) concentrates the loss on the
+        dynamic patches, the only place the EEG can lower it, so the copy
+        shortcut stops scoring well and gradient flows into the EEG embedding.
+
+        ``w = clip(motion / ref_τ, floor, inf) ** alpha`` where
+        ``motion[b,τ,p] = mean_d |s_tgt[b,τ,p] - s_anchor[b,p]|`` and ``ref_τ`` is
+        a PER-HORIZON reference (motion grows with the horizon, so a per-step
+        reference keeps the floor threshold ``floor*ref_τ`` lag-appropriate).
+        ``ref`` may be:
+          * ``None``     — per-batch per-step mean over VALID (row, patch) at each
+                           step (legacy dynamic; jitters step-to-step);
+          * a scalar     — the same reference for every step;
+          * a length-≥H sequence/tensor — the per-horizon reference (the fixed
+                           baked-in constant; recommended).
+        The reference only sets the floor threshold: because the reducer
+        normalises by ``w.sum()`` it otherwise cancels, so the loss magnitude
+        stays comparable to the uniform mean and ``latent_pred_weight`` needs no
+        retuning. ``alpha <= 0`` returns ``(None, None)`` and the caller falls
+        back to a plain mean (the legacy, byte-identical path). All motion is
+        computed under ``no_grad`` on the frozen-encoder targets, so no gradient
+        flows through the weight.
+
+        Returns ``(w, ref_per_step)`` with ``w`` of shape ``(Bv, H, P)`` and
+        ``ref_per_step`` of shape ``(H,)``, or ``(None, None)``.
+        """
+        if alpha <= 0:
+            return None, None
+        with torch.no_grad():
+            motion = (s_tgt - s_anchor.unsqueeze(1)).abs().mean(dim=-1)  # (Bv,H,P)
+            H = motion.size(1)
+            if ref is None:
+                vexp = tgt_valid.unsqueeze(-1)                           # (Bv,H,1)
+                num = (motion * vexp).sum(dim=(0, 2))                    # (H,)
+                den = vexp.expand_as(motion).sum(dim=(0, 2)).clamp(min=1.0)
+                ref_ps = num / den                                      # (H,)
+            else:
+                ref_ps = torch.as_tensor(
+                    ref, device=motion.device, dtype=motion.dtype)
+                if ref_ps.ndim == 0:
+                    ref_ps = ref_ps.expand(H)
+                assert ref_ps.numel() >= H, (
+                    f"frame_motion_ref has {ref_ps.numel()} entries < H={H}; "
+                    f"recompute EGOBRAIN_FRAME_MOTION_REF_PER_STEP for this "
+                    f"max_horizon")
+                ref_ps = ref_ps[:H]
+            w = (motion / ref_ps.view(1, H, 1).clamp(min=1e-6)
+                 ).clamp(min=floor).pow(alpha)
+        return w, ref_ps
+
+    def _resolved_motion_ref(self):
+        """Resolve ``self.frame_motion_ref`` to the reference passed to
+        ``_motion_weight``: ``< 0`` -> the fixed per-horizon
+        ``EGOBRAIN_FRAME_MOTION_REF_PER_STEP`` tuple (stable, default); ``== 0``
+        -> ``None`` (per-batch per-step mean); ``> 0`` -> that scalar (applied to
+        every step)."""
+        r = self.frame_motion_ref
+        if r < 0:
+            return EGOBRAIN_FRAME_MOTION_REF_PER_STEP
+        if r > 0:
+            return r
+        return None
+
+    @staticmethod
+    def _reduce_over_patches(x_bhp: torch.Tensor,
+                             w: Optional[torch.Tensor]) -> torch.Tensor:
+        """Reduce a per-(row, step, patch) tensor ``(Bv, H, P)`` over patches to
+        ``(Bv, H)``. ``w is None`` -> plain mean (legacy). Otherwise a weighted
+        mean by the motion weight ``w`` (same shape), normalised by ``w.sum()`` so
+        the scale matches the uniform mean regardless of the weight magnitude."""
+        if w is None:
+            return x_bhp.mean(dim=-1)
+        return (x_bhp * w).sum(dim=-1) / w.sum(dim=-1).clamp(min=1e-6)
+
     def _frame_prediction_step(self, out, info: dict, batch: dict,
                                cb_idx: torch.Tensor,
                                flip: Optional[torch.Tensor] = None):
@@ -639,8 +768,16 @@ class WorldModelWrapper(nn.Module):
 
         pred = self.predictor(s_anchor, eeg_emb,
                               eeg_key_padding_mask=eeg_kpm)    # (Bv, H, P, d)
-        per_step = F.l1_loss(
-            pred, s_tgt, reduction='none').mean(dim=(2, 3))    # (Bv, H)
+        # Optional per-patch motion weighting (kills the copy-the-anchor
+        # shortcut; ``alpha == 0`` -> uniform mean, byte-identical to legacy).
+        # ``ref`` is the fixed per-horizon constant by default (stable floor
+        # threshold) — see ``_resolved_motion_ref``.
+        w_motion, motion_ref = self._motion_weight(
+            s_anchor, s_tgt, tgt_valid,
+            self.frame_motion_alpha, self.frame_motion_floor,
+            ref=self._resolved_motion_ref())
+        err = F.l1_loss(pred, s_tgt, reduction='none').mean(dim=-1)  # (Bv, H, P)
+        per_step = self._reduce_over_patches(err, w_motion)         # (Bv, H)
         pred_loss = (per_step * tgt_valid).sum() / denom
 
         scale = self._pred_weight_scale()
@@ -656,8 +793,15 @@ class WorldModelWrapper(nn.Module):
             anchor_rep = s_anchor.unsqueeze(1).expand_as(s_tgt)   # (Bv,H,P,d)
             pred_zero = self.predictor(
                 s_anchor, torch.zeros_like(eeg_emb), eeg_key_padding_mask=eeg_kpm)
-            per_zero = F.l1_loss(pred_zero, s_tgt, reduction='none').mean(dim=(2, 3))
-            copy_l1 = F.l1_loss(anchor_rep, s_tgt, reduction='none').mean(dim=(2, 3))
+            # eeg_gap / copy_l1 reduce over patches with the SAME motion weight as
+            # the loss, so ``eeg_gap`` measures whether the EEG helps on the
+            # objective the encoder actually trains on (the whole point of the
+            # weighting). The cosine diagnostics stay unweighted — they
+            # characterise the raw prediction/data, not the objective.
+            per_zero = self._reduce_over_patches(
+                F.l1_loss(pred_zero, s_tgt, reduction='none').mean(dim=-1), w_motion)
+            copy_l1 = self._reduce_over_patches(
+                F.l1_loss(anchor_rep, s_tgt, reduction='none').mean(dim=-1), w_motion)
             pred_cos = F.cosine_similarity(pred, s_tgt, dim=-1).mean(dim=-1)   # (Bv,H)
             copy_cos = F.cosine_similarity(anchor_rep, s_tgt, dim=-1).mean(dim=-1)
 
@@ -668,6 +812,9 @@ class WorldModelWrapper(nn.Module):
             info['diag_frame_copy_l1'] = _m(copy_l1)
             info['diag_frame_pred_cos'] = _m(pred_cos)
             info['diag_frame_copy_cos'] = _m(copy_cos)
+            if w_motion is not None:
+                info['diag_frame_motion_ref'] = motion_ref.mean()
+                info['diag_frame_motion_w_mean'] = w_motion.mean()
             info['diag_frame_s_t_norm'] = s_anchor.flatten(end_dim=-2).norm(dim=-1).mean()
             info['diag_frame_pred_norm'] = pred.flatten(end_dim=-2).norm(dim=-1).mean()
             info['diag_frame_eeg_norm'] = eeg_emb.norm(dim=-1).mean()

@@ -225,6 +225,28 @@ def main():
                         help="For --wm_objective frame: which EEG representation conditions the frame "
                              "predictor. 'global' (default): the window-level global rep (one vector). "
                              "'tokens': all EEG per-patch tokens (C*N tokens). Ignored for the eeg objective.")
+    parser.add_argument('--wm_frame_motion_alpha', type=float, default=0.0,
+                        help="For --wm_objective frame: per-patch motion weighting exponent on the dense "
+                             "frame-prediction loss. 0 (default) = legacy UNIFORM mean over patches. >0 "
+                             "weights each patch by how far its target grid moved from the anchor "
+                             "(w=clip(motion/mean_motion, floor, inf)^alpha), concentrating the loss on "
+                             "DYNAMIC patches — the only place the EEG can lower it — so the static "
+                             "copy-the-anchor shortcut (which drives diag_frame_eeg_gap->0) stops scoring "
+                             "well and gradient reaches the EEG. 1.0 = motion-proportional (recommended); "
+                             "2.0 = aggressive. Self-normalising, so latent_pred_weight needs no retuning.")
+    parser.add_argument('--wm_frame_motion_floor', type=float, default=0.1,
+                        help="For --wm_objective frame with --wm_frame_motion_alpha>0: minimum per-patch "
+                             "weight in [0,1] (uniform floor keeping fully-static steps finite and every "
+                             "patch a little coverage). 0.1 = default.")
+    parser.add_argument('--wm_frame_motion_ref', type=float, default=-1.0,
+                        help="For --wm_objective frame with --wm_frame_motion_alpha>0: reference motion "
+                             "for the weight normalisation clip(motion/ref, floor). <0 (default) uses the "
+                             "FIXED baked-in per-horizon EGOBRAIN_FRAME_MOTION_REF_PER_STEP constant "
+                             "(stable, lag-appropriate floor threshold; precomputed by "
+                             "scripts/compute_frame_motion_ref.py). 0 = per-batch per-step mean (legacy, "
+                             "jitters step-to-step). >0 = that explicit scalar for every step (override "
+                             "for a different encoder/window config; recompute the constant instead if you "
+                             "can).")
     parser.add_argument('--latent_pred_weight', type=float, default=1.0)
     parser.add_argument('--cls_pred_weight', type=float, default=0.1)
     parser.add_argument('--pred_ramp_epochs', type=int, default=2, help='linearly ramp latent-prediction weight 0→1 over this many epochs')
@@ -243,7 +265,9 @@ def main():
     parser.add_argument('--egobrain_load_frames', type=int, default=1, help='whether to decode raw video frames (0 disables the alignment term)')
     parser.add_argument('--egobrain_max_channels', type=int, default=32, help='cap on the EgoBrain channel count after 10-20 montage filtering')
     parser.add_argument('--egobrain_hand_labels_dir', type=str, default=None,
-                        help='dir of per-subject hand-movement-annotation HDF5 (datasets/egobrain_hand_labels.py output, e.g. data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200). Enables the --aux_hand_pred objective. The window slug MUST match the egobrain_window_s/stride_s/erp_latency_s/n_windows/clip_s/fs_out used here or the (clip,window) label keys misalign.')
+                        help='LEGACY clip-keyed hand-movement-annotation HDF5 dir (datasets/egobrain_hand_labels.py output, e.g. data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200). Enables --aux_hand_pred on the clip-keyed path only. The window slug MUST match the egobrain_window_s/stride_s/erp_latency_s/n_windows/clip_s/fs_out used here or the (clip,window) label keys misalign. INCOMPATIBLE with --egobrain_use_frame_grid (raises) — use --egobrain_hand_grid_dir there.')
+    parser.add_argument('--egobrain_hand_grid_dir', type=str, default=None,
+                        help='TIME-KEYED (grid) hand-movement-annotation HDF5 dir (datasets/egobrain_extract_hand_labels_grid.py output, e.g. data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_r1.0_fs200). The --egobrain_use_frame_grid counterpart of --egobrain_hand_labels_dir: per-0.2s-slot continuous intensities read at each window frame slot, so --aux_hand_pred works under the grid path. Its grid_s MUST equal --egobrain_frame_grid_s (validated at load). Requires --egobrain_use_frame_grid.')
     parser.add_argument('--mix_egobrain_weight', type=float, default=1.0, help='sampling weight for EgoBrain in the mix+egobrain dataset')
     parser.add_argument('--egobrain_delta_whiten_g0', type=float, default=1.0,
                         help='ME->MI delta-whitening DC gain: per-channel low-freq gain at 0 Hz, '
@@ -634,6 +658,7 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             hand_labels_dir=params.egobrain_hand_labels_dir,
+            hand_grid_dir=params.egobrain_hand_grid_dir,
             use_embeddings=params.use_cached_embeddings,
             emb_cache_dir=params.egobrain_emb_cache_dir,
             use_frame_grid=params.egobrain_use_frame_grid,
@@ -721,6 +746,7 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             hand_labels_dir=params.egobrain_hand_labels_dir,
+            hand_grid_dir=params.egobrain_hand_grid_dir,
             use_embeddings=params.use_cached_embeddings,
             emb_cache_dir=params.egobrain_emb_cache_dir,
             use_frame_grid=params.egobrain_use_frame_grid,
@@ -789,6 +815,7 @@ def main():
             vision_encoder=params.vision_encoder,
             max_channels=params.egobrain_max_channels,
             hand_labels_dir=params.egobrain_hand_labels_dir,
+            hand_grid_dir=params.egobrain_hand_grid_dir,
             use_embeddings=params.use_cached_embeddings,
             emb_cache_dir=params.egobrain_emb_cache_dir,
             use_frame_grid=params.egobrain_use_frame_grid,
@@ -828,6 +855,7 @@ def main():
             ),
             pin_memory=True,
             drop_last=True,
+            prefetch_factor=4,
         )
 
     elif params.dataset_dir == 'cinebrain':

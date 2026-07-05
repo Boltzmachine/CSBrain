@@ -28,6 +28,9 @@ from datasets.egobrain_dataset import (           # noqa: E402
 from datasets.egobrain_extract_frames_grid import (  # noqa: E402
     _grid_cache_dir, _route_chapter,
 )
+from datasets.egobrain_extract_hand_labels_grid import (  # noqa: E402
+    default_grid_out_dir,
+)
 
 @pytest.fixture(autouse=True)
 def _restore_normalize_cache():
@@ -435,6 +438,124 @@ def test_legacy_path_unchanged_when_grid_off():
         for w in range(2):
             val = float(s['pixel_values'][w].mean() * 255.0)
             assert round(val) == (0 * 10 + w) % 256
+
+
+# --------------------------------------------------------------------------
+# Time-keyed grid HAND labels (datasets/egobrain_extract_hand_labels_grid.py)
+# --------------------------------------------------------------------------
+
+def _make_grid_hand_cache(root, sub, grid_s=0.2, hand_ref_s=1.0, n_slots=80,
+                          fs=FS):
+    """Time-keyed grid hand cache: slot k holds left_intensity=k,
+    right_intensity=k+1000 so the fetched slot is recoverable per column, plus
+    an all-True has_video. Written under the real default_grid_out_dir slug."""
+    d = default_grid_out_dir(root, 'wilor', grid_s, hand_ref_s, fs)
+    os.makedirs(d, exist_ok=True)
+    li = np.arange(n_slots, dtype=np.float32)
+    ri = np.arange(n_slots, dtype=np.float32) + 1000.0
+    with h5py.File(os.path.join(d, f'{sub}.h5'), 'w') as h:
+        h.create_dataset('left_intensity', data=li)
+        h.create_dataset('right_intensity', data=ri)
+        h.create_dataset('left_det_frac', data=np.ones(n_slots, np.float32))
+        h.create_dataset('right_det_frac', data=np.ones(n_slots, np.float32))
+        h.create_dataset('has_video', data=np.ones(n_slots, bool))
+        h.attrs['grid_s'] = grid_s
+        h.attrs['hand_ref_s'] = hand_ref_s
+    return d
+
+
+def test_grid_hand_labels_read_at_frame_slots():
+    with tempfile.TemporaryDirectory() as root:
+        hg = _make_grid_hand_cache(root, 'P0001')
+        ds = _grid_dataset(root, temporal_jitter=False, hand_grid_dir=hg)
+        assert ds.use_hand_grid
+        step = ds.stride_samples // ds.grid_samples          # 5
+        for ic in range(len(ds)):
+            s = ds[ic]
+            k = s['base_slot']
+            assert s['hand_targets'].shape == (2, 2)
+            for i in range(2):
+                slot = k + i * step                          # frame slot of window i
+                # left col == slot, right col == slot + 1000 (recoverable)
+                assert float(s['hand_targets'][i, 0]) == float(slot)
+                assert float(s['hand_targets'][i, 1]) == float(slot) + 1000.0
+                assert bool(s['hand_valid'][i, 0])
+                assert bool(s['hand_valid'][i, 1])
+
+
+def test_grid_hand_labels_nan_and_oob_masked():
+    with tempfile.TemporaryDirectory() as root:
+        hg = _make_grid_hand_cache(root, 'P0001')
+        # Poison one slot: NaN intensity + has_video False -> must mask out.
+        with h5py.File(os.path.join(hg, 'P0001.h5'), 'r+') as h:
+            h['left_intensity'][3] = np.nan
+            h['has_video'][3] = False
+        ds = _grid_dataset(root, temporal_jitter=False, hand_grid_dir=hg)
+        # Force window-0 frame slot to the poisoned slot 3 by finding a clip
+        # whose deterministic base_slot hits it; otherwise assert the general
+        # rule on whatever slot each window lands on.
+        for ic in range(len(ds)):
+            s = ds[ic]
+            k = s['base_slot']
+            step = ds.stride_samples // ds.grid_samples
+            for i in range(2):
+                slot = k + i * step
+                if slot == 3:
+                    assert not bool(s['hand_valid'][i, 0])   # NaN + no video
+                    assert float(s['hand_targets'][i, 0]) == 0.0  # nan_to_num
+
+
+def test_grid_hand_labels_absent_subject_zeros():
+    # No grid hand h5 for the subject -> zeros / all-invalid (aux masks it).
+    with tempfile.TemporaryDirectory() as root:
+        hg = default_grid_out_dir(root, 'wilor', 0.2, 1.0, FS)
+        os.makedirs(hg, exist_ok=True)                       # empty dir (isdir True)
+        ds = _grid_dataset(root, temporal_jitter=False, hand_grid_dir=hg)
+        s = ds[0]
+        assert not s['hand_valid'].any()
+        assert float(s['hand_targets'].abs().sum()) == 0.0
+
+
+def test_clip_hand_labels_rejected_under_frame_grid():
+    # The core bug guard: clip-keyed hand labels + frame grid must FAIL loud,
+    # not silently train on nothing.
+    with tempfile.TemporaryDirectory() as root:
+        _make_eeg_cache(root, 'P0001')
+        _make_grid_frame_cache(root, 'P0001')
+        _seed_identity_normalize()
+        clip_hand = os.path.join(root, 'cache_hand_labels_wilor_legacy')
+        os.makedirs(clip_hand, exist_ok=True)
+        with pytest.raises(ValueError, match='clip-keyed hand labels'):
+            EgoBrainDataset(
+                data_dir=root, subjects=['P0001'], in_dim=40, n_windows=2,
+                window_s=1.0, stride_s=1.0, clip_s=CLIP_S, fs_out=FS,
+                erp_latency_s=0.5, vision_encoder=ENC, frame_size=SZ,
+                use_frame_grid=True, frame_grid_s=0.2, max_channels=32,
+                hand_labels_dir=clip_hand)
+
+
+def test_grid_hand_dir_requires_frame_grid():
+    with tempfile.TemporaryDirectory() as root:
+        _make_eeg_cache(root, 'P0001')
+        old_dir = _make_old_frame_cache(root, 'P0001', n_windows=2)
+        _seed_identity_normalize()
+        hg = _make_grid_hand_cache(root, 'P0001')
+        with pytest.raises(ValueError, match='requires use_frame_grid'):
+            EgoBrainDataset(
+                data_dir=root, subjects=['P0001'], in_dim=40, n_windows=2,
+                window_s=1.0, stride_s=1.0, clip_s=CLIP_S, fs_out=FS,
+                erp_latency_s=0.5, vision_encoder=ENC, frame_size=SZ,
+                frames_cache_dir=old_dir, use_frame_grid=False,
+                max_channels=32, hand_grid_dir=hg)
+
+
+def test_grid_hand_grid_s_mismatch_raises():
+    # A wrong grid_s shifts every slot index -> misaligned labels; fail loud.
+    with tempfile.TemporaryDirectory() as root:
+        hg = _make_grid_hand_cache(root, 'P0001', grid_s=0.1)  # cache says 0.1
+        with pytest.raises(ValueError, match='grid_s'):
+            _grid_dataset(root, temporal_jitter=False, hand_grid_dir=hg,
+                          frame_grid_s=0.2)                      # dataset wants 0.2
 
 
 if __name__ == '__main__':

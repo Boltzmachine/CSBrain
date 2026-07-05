@@ -201,6 +201,7 @@ class EgoBrainDataset(Dataset):
         emb_cache_dir: Optional[str] = None,
         use_embeddings: bool = False,
         hand_labels_dir: Optional[str] = None,
+        hand_grid_dir: Optional[str] = None,
         frame_grid_dir: Optional[str] = None,
         use_frame_grid: bool = False,
         frame_grid_s: float = 0.2,
@@ -388,9 +389,42 @@ class EgoBrainDataset(Dataset):
         # dir is absent. The cache's window slug MUST match this dataset's
         # window_s/stride_s/erp_latency_s/n_windows/clip_s/fs_out or the
         # (clip, window) keys silently misalign — same contract as the frames.
+        #
+        # ``hand_grid_dir`` is the TIME-KEYED counterpart (datasets/
+        # egobrain_extract_hand_labels_grid.py): per-0.2 s-slot continuous
+        # intensities, read at each window's frame slot in the grid path — the
+        # ONLY hand-label source compatible with use_frame_grid. The clip-keyed
+        # ``hand_labels_dir`` is (clip, window)-keyed and CANNOT be indexed by an
+        # arbitrary grid offset, so mixing it with use_frame_grid used to
+        # silently train on nothing; the two are now mutually exclusive and
+        # guarded below.
         self.hand_labels_dir = hand_labels_dir
         self.use_hand_labels = (hand_labels_dir is not None
                                 and os.path.isdir(hand_labels_dir))
+        self.hand_grid_dir = hand_grid_dir
+        self.use_hand_grid = (hand_grid_dir is not None
+                              and os.path.isdir(hand_grid_dir))
+        if self.use_frame_grid and hand_labels_dir is not None:
+            raise ValueError(
+                "[EgoBrain] clip-keyed hand labels (--egobrain_hand_labels_dir) "
+                "are incompatible with use_frame_grid: they are (clip, window)-"
+                "keyed and cannot be indexed at the grid's arbitrary offsets, so "
+                "the aux objective would silently train on nothing. Build the "
+                "time-keyed grid hand cache instead:\n"
+                "    python datasets/egobrain_extract_hand_labels_grid.py "
+                "--data_dir <data_dir> --subjects all --grid_s "
+                f"{self.frame_grid_s} --fs_out {fs_out}\n"
+                "and pass it via --egobrain_hand_grid_dir.")
+        if hand_grid_dir is not None and not self.use_frame_grid:
+            raise ValueError(
+                "[EgoBrain] --egobrain_hand_grid_dir (time-keyed grid hand "
+                "labels) requires use_frame_grid=True; the legacy clip path "
+                "reads clip-keyed labels via --egobrain_hand_labels_dir.")
+        if self.use_hand_grid:
+            # Fail loud on a grid_s mismatch — a wrong spacing shifts every slot
+            # index, misaligning labels against the frames (the exact silent
+            # failure this whole path is fixing). Read one built subject's attr.
+            self._validate_hand_grid_spacing()
         if load_frames and not self.use_frames_cache and not self.use_frame_grid:
             # Live-decoding 4-5 GB GoPro MP4s on the fly is slow AND
             # memory-heavy — it OOM-kills DataLoader workers at scale. The
@@ -490,6 +524,30 @@ class EgoBrainDataset(Dataset):
                     f"alignment/frame objectives train on bogus all-zero "
                     f"targets. Re-run datasets.egobrain_extract_embeddings for "
                     f"those subjects before training.", stacklevel=2)
+
+        # Same half-built-cache guard for the grid hand labels: a VIDEO subject
+        # missing its per-subject h5 contributes only zeros/all-invalid, so the
+        # aux objective silently trains on nothing for those rows — the exact
+        # failure this path fixes. No-video subjects (P0025-P0040) legitimately
+        # have none, so gate on the clips.json video flag. Warn (don't raise) to
+        # match the embedding-cache precedent + allow a partial build in flight.
+        if self.use_hand_grid:
+            missing_hand = [
+                s for s in self.subjects
+                if self._subject_meta[s].get('video') is not None
+                and not os.path.exists(
+                    os.path.join(self.hand_grid_dir, f'{s}.h5'))]
+            if missing_hand:
+                import warnings
+                warnings.warn(
+                    f"[EgoBrain] --egobrain_hand_grid_dir is set but the grid "
+                    f"hand-label cache '{self.hand_grid_dir}' is MISSING "
+                    f"{len(missing_hand)} video subject(s): "
+                    f"{','.join(missing_hand)}. Those rows get zero / all-invalid "
+                    f"hand targets, so --aux_hand_pred trains on nothing for them. "
+                    f"Build them with sh/egobrain_hand_labels_grid.sh (grid_s must "
+                    f"equal --egobrain_frame_grid_s) before training.",
+                    stacklevel=2)
 
         # ------------------------------------------------------------------
         # Motion-weighted anchor resampling (grid mode only). EgoBrain's video
@@ -949,6 +1007,61 @@ class EgoBrainDataset(Dataset):
             tgt, val = tgt[:W], val[:W]
         return torch.from_numpy(tgt).float(), torch.from_numpy(val).bool()
 
+    def _validate_hand_grid_spacing(self) -> None:
+        """Fail loud if the grid hand cache's ``grid_s`` differs from this
+        dataset's ``frame_grid_s``. A mismatch shifts every slot index and
+        silently misaligns the labels against the frames — the exact bug the
+        grid path exists to avoid. Peeks the first built subject's attr."""
+        import h5py
+        for sub in self.subjects:
+            path = os.path.join(self.hand_grid_dir, f'{sub}.h5')
+            if not os.path.exists(path):
+                continue
+            with h5py.File(path, 'r') as h:
+                gs = h.attrs.get('grid_s')
+            if gs is None:
+                raise ValueError(
+                    f"[EgoBrain] hand grid cache '{path}' has no grid_s attr; "
+                    f"rebuild it with datasets/egobrain_extract_hand_labels_grid.py")
+            if abs(float(gs) - self.frame_grid_s) >= 1e-9:
+                raise ValueError(
+                    f"[EgoBrain] hand grid cache grid_s={float(gs)} != dataset "
+                    f"frame_grid_s={self.frame_grid_s}; the label slots would "
+                    f"misalign with the frames. Rebuild the hand grid cache with "
+                    f"--grid_s {self.frame_grid_s}.")
+            return                                   # one built subject is enough
+
+    def _read_grid_hand_labels(self, sub, frame_slots):
+        """Per-window continuous hand targets from the TIME-KEYED grid cache
+        (datasets/egobrain_extract_hand_labels_grid.py), read at each window's
+        absolute frame slot — the hand-label twin of ``_read_grid_embeddings``.
+
+        Returns ``(hand_targets (W,2) float32, hand_valid (W,2) bool)`` with
+        column 0 = left, 1 = right, or ``None`` when the subject has no grid
+        cache (no-video subjects; the caller then keeps zeros / all-invalid).
+        A column is valid iff its slot's frame was in-bounds AND the intensity
+        is finite (NaN = unmeasurable -> masked), matching ``_load_hand_labels``."""
+        path = os.path.join(self.hand_grid_dir, f'{sub}.h5')
+        if not os.path.exists(path):
+            return None
+        h = _get_h5_hand_handle(path)
+        li_ds, ri_ds, hv_ds = (h['left_intensity'], h['right_intensity'],
+                               h['has_video'])
+        n_slots = li_ds.shape[0]
+        W = self.n_windows
+        tgt = np.zeros((W, 2), np.float32)
+        val = np.zeros((W, 2), bool)
+        for i, slot in enumerate(frame_slots):
+            if not (0 <= slot < n_slots):
+                continue                             # off-grid -> invalid (masked)
+            l = float(li_ds[slot]); r = float(ri_ds[slot])
+            has = bool(hv_ds[slot])
+            tgt[i, 0] = np.nan_to_num(l)
+            tgt[i, 1] = np.nan_to_num(r)
+            val[i, 0] = has and np.isfinite(l)
+            val[i, 1] = has and np.isfinite(r)
+        return torch.from_numpy(tgt).float(), torch.from_numpy(val).bool()
+
     def _getitem_grid(self, idx: int) -> dict:
         """Continuous / 0.2 s grid path (use_frame_grid=True).
 
@@ -1022,10 +1135,18 @@ class EgoBrainDataset(Dataset):
                             pixel_values[i] = ((x - mean) / std)[0]
                             has_image[i] = True
 
-        # Hand labels are (clip, window)-keyed; not aligned to arbitrary
-        # offsets, so the grid path leaves them off (the aux loss masks them).
+        # Hand labels: the TIME-KEYED grid cache (datasets/egobrain_extract_
+        # hand_labels_grid.py) is read at each window's frame slot — the same
+        # per-slot lookup as the grid frames/embeddings above, so the aux target
+        # is the hand intensity around the frame that window actually saw. The
+        # clip-keyed cache is (clip, window)-keyed and unusable here (guarded off
+        # in __init__). Absent grid cache -> zeros / all-invalid (aux masks it).
         hand_targets = torch.zeros(self.n_windows, 2, dtype=torch.float32)
         hand_valid = torch.zeros(self.n_windows, 2, dtype=torch.bool)
+        if self.use_hand_grid:
+            hg = self._read_grid_hand_labels(sub, frame_slots)
+            if hg is not None:
+                hand_targets, hand_valid = hg
 
         out = {
             'timeseries': timeseries,

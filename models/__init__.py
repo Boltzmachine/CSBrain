@@ -255,6 +255,9 @@ def get_model(params, brain_regions, sorted_indices):
             flip_pred_weight=getattr(params, 'flip_pred_weight', 1.0),
             objective=wm_objective,
             frame_eeg_cond=getattr(params, 'wm_frame_eeg_cond', 'global'),
+            frame_motion_alpha=getattr(params, 'wm_frame_motion_alpha', 0.0),
+            frame_motion_floor=getattr(params, 'wm_frame_motion_floor', 0.1),
+            frame_motion_ref=getattr(params, 'wm_frame_motion_ref', -1.0),
         )
         return model
     elif params.model == 'ActionWorldModel':

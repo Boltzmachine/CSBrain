@@ -101,6 +101,33 @@
 #   --egobrain_motion_resample_cap_pct 99   --egobrain_motion_resample_floor_mix 0.1
 # Per-subject motion scores cache lazily under the embedding cache _motioncache/;
 # prebuild all subjects with `python -m scripts.build_egobrain_motion_cache`.
+#
+# --wm_frame_motion_alpha (--wm_objective frame only): per-PATCH motion weighting
+# on the dense frame-prediction loss — the SPATIAL analog of motion_resample
+# (which reweights WHICH frames), applied inside the loss over WHICH PATCHES. The
+# next-0.2s DINOv2 grid is ~static, so the uniform L1 over patches is dominated by
+# patches the anchor already explains; the predictor minimises it by COPYING the
+# anchor and never uses the EEG (diag_frame_eeg_gap ~0.16% and shrinking — the
+# 2026-07-04 ablation showed the predictor adds ~0). This weights each patch by
+# how far its target moved from the anchor grid,
+#   w = clip(motion/mean_motion, floor, inf)^alpha,  motion = mean_d|s_tgt - s_anchor|
+# concentrating the loss on DYNAMIC patches — the only place the EEG can lower it —
+# so the copy shortcut stops scoring well and gradient reaches the EEG. It is
+# self-normalising (weighted mean by w), so latent_pred_weight needs no retuning,
+# and adds NO parameters. Watch diag_frame_eeg_gap RISE and diag_frame_copy_l1
+# climb (copy now scores badly on the weighted objective). The reference in the
+# weight is the FIXED per-horizon EGOBRAIN_FRAME_MOTION_REF_PER_STEP constant
+# (motion grows with the horizon, so it is per-step) baked into
+# models/world_model.py — precompute it with scripts/compute_frame_motion_ref.py
+# and recompute if you change the vision encoder / grid_s / stride_s / max_horizon.
+# Knobs:
+#   --wm_frame_motion_alpha 0=uniform/legacy (default), 1.0=motion-proportional
+#       (recommended), 2.0=aggressive
+#   --wm_frame_motion_floor 0.1   min per-patch weight (keeps static steps finite)
+#   --wm_frame_motion_ref  <0 (default)=fixed baked-in per-horizon constant
+#       (stable); 0=per-batch per-step mean (jitters); >0=explicit scalar override
+# Best paired with the load-bearing frame-averaging (--frame_averaging), i.e. the
+# full dino-dense config, not this nofa run. To enable, add the flags below.
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
@@ -130,6 +157,11 @@ python pretrain_main.py \
     --mask_weight 1.0 \
     --clip_value 0.8 \
     --alignment_weight 0.1 \
+    --frame_averaging \
+    --frame_avg_flip_prob 0.5 \
+    --frame_avg_recon_weight 0.0 \
+    --flip_align_weight 0.1 \
+    --flip_n_col_bands 2 \
     --latent_pred_weight 2.0 \
     --cls_pred_weight 0.2 \
     --max_horizon 5 \
@@ -146,11 +178,21 @@ python pretrain_main.py \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
     --vision_encoder facebook/dinov2-base \
-    --run_name wm-dino-nofa \
+    --run_name wm-dino-dense \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \
-    --egobrain_motion_resample_alpha 1.0
+    --egobrain_motion_resample_alpha 1.0 \
+    --wm_frame_motion_alpha 0 
+    # Per-patch motion weighting of the dense frame-pred loss (kills the copy
+    # shortcut so the predictor uses the EEG). Move the trailing `\` up onto the
+    # motion_resample_alpha line above and uncomment to enable:
+    # --wm_frame_motion_floor 0.1 \
     # --aux_hand_pred \
     # --aux_hand_weight 0.1 \
-    # --egobrain_hand_labels_dir data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200 \
+    # This run uses --egobrain_use_frame_grid, so the hand aux needs the
+    # TIME-KEYED grid cache (build once: sbatch --array=1-24
+    # sh/egobrain_hand_labels_grid.sh; grid_s MUST match --egobrain_frame_grid_s
+    # above). The legacy clip-keyed --egobrain_hand_labels_dir is REJECTED under
+    # the frame grid (it would silently train on nothing).
+    # --egobrain_hand_grid_dir data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_r1.0_fs200 \

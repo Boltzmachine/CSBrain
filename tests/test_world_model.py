@@ -22,7 +22,9 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from models.alignment import CSBrainAlign
-from models.world_model import LatentPredictor, FramePredictor, WorldModelWrapper
+from models.world_model import (
+    LatentPredictor, FramePredictor, WorldModelWrapper,
+    EGOBRAIN_FRAME_MOTION_REF_PER_STEP)
 
 
 def _tiny_encoder(in_dim=40, n_ch=8, n_patches=2):
@@ -555,6 +557,142 @@ class TestWorldModelMixMode(unittest.TestCase):
         out, info = wrapper.training_step(batch, mask=mask)
         self.assertEqual(out.shape, batch['timeseries'].shape)
         self.assertNotIn('latent_pred_loss', info)
+
+
+class TestFrameMotionWeighting(unittest.TestCase):
+    """Unit tests for the per-patch motion weighting of the dense frame
+    objective (``WorldModelWrapper._motion_weight`` / ``_reduce_over_patches``).
+    These are pure tensor ops, so no encoder / vision weights are needed.
+    """
+
+    def _tgt(self, moving_patch_delta=1.0):
+        # (Bv, H, P, d): P=3 patches. Anchor is a fixed random grid; the target
+        # equals the anchor EXCEPT patch 0, which moves by `moving_patch_delta`.
+        torch.manual_seed(0)
+        Bv, H, P, d = 2, 2, 3, 4
+        s_anchor = torch.randn(Bv, P, d)
+        s_tgt = s_anchor.unsqueeze(1).expand(Bv, H, P, d).clone()
+        s_tgt[:, :, 0, :] += moving_patch_delta          # only patch 0 moves
+        tgt_valid = torch.ones(Bv, H)
+        return s_anchor, s_tgt, tgt_valid
+
+    def test_alpha_zero_is_uniform_mean(self):
+        # alpha<=0 -> no weight, reducer is a plain mean (legacy path).
+        s_anchor, s_tgt, tgt_valid = self._tgt()
+        w, ref = WorldModelWrapper._motion_weight(
+            s_anchor, s_tgt, tgt_valid, alpha=0.0, floor=0.1)
+        self.assertIsNone(w)
+        self.assertIsNone(ref)
+        x = torch.randn(2, 2, 3)
+        self.assertTrue(torch.allclose(
+            WorldModelWrapper._reduce_over_patches(x, None), x.mean(dim=-1)))
+
+    def test_weight_concentrates_on_moving_patch(self):
+        # With alpha>0 the moving patch (patch 0) must get a strictly larger
+        # weight than the static patches, so a per-patch error that is large only
+        # on patch 0 produces a HIGHER weighted loss than the uniform mean.
+        s_anchor, s_tgt, tgt_valid = self._tgt(moving_patch_delta=2.0)
+        w, ref = WorldModelWrapper._motion_weight(
+            s_anchor, s_tgt, tgt_valid, alpha=1.0, floor=0.1)
+        self.assertEqual(w.shape, (2, 2, 3))
+        self.assertEqual(ref.shape, (2,))                # per-horizon reference
+        self.assertTrue((ref > 0).all())
+        # Patch 0 (moved) weighted above the static patches (floored).
+        self.assertTrue((w[..., 0] > w[..., 1]).all())
+        self.assertTrue(torch.allclose(w[..., 1], w[..., 2]))          # both static
+        # Error that lives only on the moving patch: weighted >> uniform.
+        err = torch.zeros(2, 2, 3)
+        err[..., 0] = 1.0
+        weighted = WorldModelWrapper._reduce_over_patches(err, w)
+        uniform = WorldModelWrapper._reduce_over_patches(err, None)
+        self.assertTrue((weighted > uniform).all())
+
+    def test_constant_error_scale_preserved(self):
+        # A constant per-patch error reduces to that constant under BOTH the
+        # uniform and the weighted reducer -> the weighting does not rescale the
+        # loss (so latent_pred_weight needs no retuning).
+        s_anchor, s_tgt, tgt_valid = self._tgt()
+        w, _ = WorldModelWrapper._motion_weight(
+            s_anchor, s_tgt, tgt_valid, alpha=1.0, floor=0.1)
+        err = torch.full((2, 2, 3), 0.7)
+        self.assertTrue(torch.allclose(
+            WorldModelWrapper._reduce_over_patches(err, w),
+            torch.full((2, 2), 0.7), atol=1e-6))
+
+    def test_all_static_no_nan(self):
+        # motion == 0 everywhere: per-step ref==0, weights fall back to the floor,
+        # reducer is finite and equals the uniform mean (nothing to concentrate on).
+        s_anchor, s_tgt, tgt_valid = self._tgt(moving_patch_delta=0.0)
+        w, ref = WorldModelWrapper._motion_weight(
+            s_anchor, s_tgt, tgt_valid, alpha=1.0, floor=0.1)
+        self.assertTrue(torch.isfinite(w).all())
+        self.assertTrue((ref == 0).all())
+        err = torch.randn(2, 2, 3)
+        red = WorldModelWrapper._reduce_over_patches(err, w)
+        self.assertTrue(torch.isfinite(red).all())
+        self.assertTrue(torch.allclose(red, err.mean(dim=-1), atol=1e-5))
+
+    def test_invalid_steps_excluded_from_reference(self):
+        # An invalid (row, step) whose target is garbage must not skew the motion
+        # reference for the OTHER steps (per-batch per-step ref).
+        s_anchor, s_tgt, tgt_valid = self._tgt(moving_patch_delta=1.0)
+        s_tgt[:, 1] += 100.0                       # huge garbage on step 1
+        tgt_valid[:, 1] = 0.0                      # ...but step 1 is invalid
+        w_masked, ref_masked = WorldModelWrapper._motion_weight(
+            s_anchor, s_tgt, tgt_valid, alpha=1.0, floor=0.1)
+        # step-0 ref computed only over the valid step 0 -> unaffected by garbage.
+        s_a2, s_t2, v2 = self._tgt(moving_patch_delta=1.0)
+        _, ref_clean = WorldModelWrapper._motion_weight(
+            s_a2, s_t2[:, :1], v2[:, :1], alpha=1.0, floor=0.1)
+        self.assertTrue(torch.allclose(ref_masked[:1], ref_clean, atol=1e-5))
+        self.assertEqual(ref_masked[1].item(), 0.0)   # invalid step -> ref 0
+
+    def test_fixed_per_step_ref_is_batch_independent(self):
+        # A supplied per-step reference is used verbatim, regardless of the
+        # batch's own motion — the whole point of hard-coding it.
+        ref_vec = (0.5, 0.8)                        # H=2
+        sa, st, tv = self._tgt(moving_patch_delta=2.0)
+        _, ref_a = WorldModelWrapper._motion_weight(
+            sa, st, tv, alpha=1.0, floor=0.1, ref=ref_vec)
+        sa2, st2, tv2 = self._tgt(moving_patch_delta=0.3)   # different scale
+        _, ref_b = WorldModelWrapper._motion_weight(
+            sa2, st2, tv2, alpha=1.0, floor=0.1, ref=ref_vec)
+        self.assertTrue(torch.allclose(ref_a, torch.tensor([0.5, 0.8])))
+        self.assertTrue(torch.allclose(ref_b, torch.tensor([0.5, 0.8])))
+
+    def test_scalar_ref_broadcasts_to_all_steps(self):
+        sa, st, tv = self._tgt(moving_patch_delta=1.0)
+        _, ref = WorldModelWrapper._motion_weight(
+            sa, st, tv, alpha=1.0, floor=0.1, ref=0.5)
+        self.assertTrue(torch.allclose(ref, torch.tensor([0.5, 0.5])))
+
+    def test_ref_shorter_than_horizon_asserts(self):
+        sa, st, tv = self._tgt(moving_patch_delta=1.0)     # H=2
+        with self.assertRaises(AssertionError):
+            WorldModelWrapper._motion_weight(
+                sa, st, tv, alpha=1.0, floor=0.1, ref=(0.5,))   # only 1 < H=2
+
+    def test_resolved_motion_ref(self):
+        enc = _tiny_encoder()
+        neg = WorldModelWrapper(encoder=enc, predictor=None, max_horizon=0,
+                                objective='frame', frame_motion_ref=-1.0)
+        self.assertEqual(neg._resolved_motion_ref(),
+                         EGOBRAIN_FRAME_MOTION_REF_PER_STEP)
+        zero = WorldModelWrapper(encoder=enc, predictor=None, max_horizon=0,
+                                 objective='frame', frame_motion_ref=0.0)
+        self.assertIsNone(zero._resolved_motion_ref())
+        pos = WorldModelWrapper(encoder=enc, predictor=None, max_horizon=0,
+                                objective='frame', frame_motion_ref=2.5)
+        self.assertEqual(pos._resolved_motion_ref(), 2.5)
+
+    def test_wrapper_validates_params(self):
+        enc = _tiny_encoder()
+        with self.assertRaises(AssertionError):
+            WorldModelWrapper(encoder=enc, predictor=None, max_horizon=0,
+                              objective='frame', frame_motion_alpha=-1.0)
+        with self.assertRaises(AssertionError):
+            WorldModelWrapper(encoder=enc, predictor=None, max_horizon=0,
+                              objective='frame', frame_motion_floor=1.5)
 
 
 if __name__ == '__main__':

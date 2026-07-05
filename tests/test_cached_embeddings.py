@@ -115,14 +115,14 @@ class TestCachedCollateAndReshape(unittest.TestCase):
 # Parity tests — real DINOv2.
 # ---------------------------------------------------------------------------
 def _make_encoder(alignment_weight=0.1, n_patches=3, n_layer=3,
-                  vision_encoder='facebook/dinov2-base'):
+                  vision_encoder='facebook/dinov2-base', frame_averaging=True):
     in_dim = 40
     return CSBrainAlign(
         in_dim=in_dim, out_dim=in_dim, d_model=in_dim,
         dim_feedforward=4 * in_dim, seq_len=n_patches,
         n_layer=n_layer, nhead=4, TemEmbed_kernel_sizes=[(1,), (3,)],
         brain_regions=None, sorted_indices=[], causal=False,
-        alignment_weight=alignment_weight, frame_averaging=True,
+        alignment_weight=alignment_weight, frame_averaging=frame_averaging,
         flip_split_hidden=32, vision_encoder=vision_encoder)
 
 
@@ -275,6 +275,72 @@ class TestCachedEmbeddingParity(unittest.TestCase):
             self.assertTrue(torch.allclose(lv, cv, atol=1e-4),
                             f'flip_prob={flip_prob}: frame_pred_loss live '
                             f'{lv.item()} vs cached {cv.item()}')
+
+
+# ---------------------------------------------------------------------------
+# Plain (non-frame-averaging) forward: image alignment must ALSO consume the
+# cached frame_cls. This is the clean-ablation baseline (frame_averaging=False)
+# — a grid-embeddings run stores a 1x1 placeholder for pixel_values, so without
+# the cache the plain path runs the frozen DINOv2 live on a 1x1 input and the
+# patch-14 conv raises. Regression for that crash.
+# ---------------------------------------------------------------------------
+class TestPlainPathCachedEmbeddings(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(0)
+        try:
+            cls.enc = _make_encoder(frame_averaging=False).eval()
+        except Exception as e:                              # noqa: BLE001
+            raise unittest.SkipTest(
+                f'facebook/dinov2-base weights unavailable: {e}')
+        cls.B = 4
+        cls.pv = torch.randn(cls.B, 3, 224, 224)
+        cls.emb = encode_frame_embeddings(cls.enc.pretrained_image_encoder, cls.pv)
+
+    def _batch(self, pixel_values):
+        return {
+            'timeseries': torch.randn(self.B, len(NAMES), 3, 40) / 100.0,
+            'ch_coords': torch.randn(self.B, len(NAMES), 3).abs() + 0.1,
+            'ch_names': [list(NAMES) for _ in range(self.B)],
+            'image_encoder_inputs': {'pixel_values': pixel_values},
+            'has_image': torch.tensor([True, True, False, True]),
+            'source': ['egobrain'] * self.B,
+        }
+
+    def _mask(self):
+        m = torch.zeros(self.B, len(NAMES), 3, dtype=torch.long)
+        m[:, :, 0] = 1
+        return m
+
+    def test_cached_matches_live(self):
+        # Same real frames AND same EEG batch: live (pixel_values only, runs the
+        # frozen encoder) vs cached (frame_cls present). Only the image target
+        # differs, so the plain-path alignment loss must match. NB: share ONE
+        # base batch — _batch() draws fresh random EEG each call.
+        base = self._batch(self.pv)
+        live = base
+        cached = {**base, 'frame_cls': self.emb['cls']}
+        with torch.no_grad():
+            torch.manual_seed(1)
+            _, info_live = self.enc(live, mask=self._mask())
+            torch.manual_seed(1)
+            _, info_cached = self.enc(cached, mask=self._mask())
+        self.assertIn('contrastive_loss_0', info_live)
+        self.assertIn('contrastive_loss_0', info_cached)
+        lv = info_live['contrastive_loss_0'][1]
+        cv = info_cached['contrastive_loss_0'][1]
+        self.assertTrue(torch.allclose(lv, cv, atol=1e-4),
+                        f'plain cached vs live: {(lv - cv).abs().max().item()}')
+
+    def test_placeholder_pixels_do_not_crash(self):
+        # grid-embeddings mode stores a 1x1 placeholder; with frame_cls present
+        # the plain path must use the cache and never touch the frozen encoder
+        # (DINOv2 patch-14 conv would raise on a 1x1 input).
+        cached = {**self._batch(torch.zeros(self.B, 3, 1, 1)),
+                  'frame_cls': self.emb['cls']}
+        with torch.no_grad():
+            _, info = self.enc(cached, mask=self._mask())
+        self.assertIn('contrastive_loss_0', info)
 
 
 # ---------------------------------------------------------------------------

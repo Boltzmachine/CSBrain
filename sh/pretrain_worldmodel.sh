@@ -130,11 +130,6 @@ python pretrain_main.py \
     --mask_weight 1.0 \
     --clip_value 0.8 \
     --alignment_weight 0.1 \
-    --frame_averaging \
-    --frame_avg_flip_prob 0.5 \
-    --frame_avg_recon_weight 0.0 \
-    --flip_align_weight 0.1 \
-    --flip_n_col_bands 2 \
     --latent_pred_weight 2.0 \
     --cls_pred_weight 0.2 \
     --max_horizon 5 \
@@ -151,7 +146,7 @@ python pretrain_main.py \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
     --vision_encoder facebook/dinov2-base \
-    --run_name wm-dino-dense \
+    --run_name wm-dino-nofa \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \

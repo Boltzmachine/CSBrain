@@ -1651,6 +1651,24 @@ class CSBrainAlign(nn.Module):
             out[f"contrastive_acc_{src}"] = torch.stack(acc_list).mean()
         return out
 
+    def _cached_image_hidden_states(self, batch, has_image):
+        """Frozen-encoder alignment target from the embedding cache
+        (use_grid_embeddings): the cached DINOv2 CLS (or, for V-JEPA 2, a
+        column-band pool over the cached grid), subset to ``has_image`` and
+        shaped (B_img, 1, d) to feed ``_image_contrastive``'s
+        ``image_hidden_states`` so the live frozen encoder is SKIPPED. Returns
+        None when no cache is present, so the caller falls back to the live
+        encoder unchanged. NB: no per-row flip here — the equivariant mirroring
+        lives only in ``_forward_frame_averaging``; this is the plain path, so
+        the target is always the original-orientation embedding. Mirrors the
+        cached branch of ``_forward_frame_averaging`` (minus the flip)."""
+        if 'frame_cls' in batch:
+            return batch['frame_cls'][has_image].unsqueeze(1)           # (B_img,1,d)
+        if 'frame_grid' in batch and self.encoder_kind == 'vjepa2':
+            return self._colband_pool(
+                grid=batch['frame_grid'][has_image], center=False).unsqueeze(1)
+        return None
+
     @staticmethod
     def _symmetric_infonce(pred, target, temperature=0.07, weight=None):
         """Symmetric InfoNCE between L2-normalised ``pred`` and ``target``
@@ -2360,8 +2378,10 @@ class CSBrainAlign(nn.Module):
                     and self.alignment_weight > 0):
                 semantic_emb = self.semantic_readout(branch_global[has_image])
                 pred_flatten = self.contrastive_proj(semantic_emb)
+                img_hs = self._cached_image_hidden_states(batch, has_image)
                 contrastive_loss.update(
-                    self._image_contrastive(pred_flatten, batch, has_image))
+                    self._image_contrastive(pred_flatten, batch, has_image,
+                                            image_hidden_states=img_hs))
         elif self.use_spectral_bands:
             # Learnable-filterbank band stream: decompose -> per-band embed
             # (+ band-type) -> shared encoder folded over (B*K) with optional
@@ -2480,8 +2500,10 @@ class CSBrainAlign(nn.Module):
                                 semantic_emb = self.semantic_readout(branch_embs.view(branch_embs.size(0), branch_embs.size(1), -1))
                             pred_flatten = self.contrastive_proj(semantic_emb) # (B, n_events, d_model) <- does not work
 
+                        img_hs = self._cached_image_hidden_states(batch, has_image)
                         contrastive_loss.update(
-                            self._image_contrastive(pred_flatten, batch, has_image, i_branch))
+                            self._image_contrastive(pred_flatten, batch, has_image,
+                                                    i_branch, image_hidden_states=img_hs))
 
             # Extract global token and patch-level representations
             global_rep = patch_emb[:, 0, 0, :] if self.add_global else patch_emb.mean(dim=(1, 2))

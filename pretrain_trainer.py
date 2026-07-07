@@ -102,7 +102,29 @@ class Trainer(object):
                 step_size_down=self.data_length*2, mode='exp_range', gamma=0.9, cycle_momentum=False
             )
 
+        # --- GradNorm adaptive loss balancing (opt-in) ---
+        self.gradnorm = None
+        if getattr(self.params, 'gradnorm', False):
+            from models.gradnorm import GradNormBalancer
+            self.gradnorm = GradNormBalancer(
+                alpha=getattr(self.params, 'gradnorm_alpha', 1.5),
+                lr=getattr(self.params, 'gradnorm_lr', 0.025),
+            ).to(self.device)
+
         print(self.model)
+
+    def _gradnorm_shared_params(self):
+        """Shared layer W for GradNorm gradient norms: the encoder's channel-
+        independent frontend (``patch_embedding``), through which EVERY loss term
+        backprops. Falls back to the first encoder parameter if absent."""
+        m = self.model.module if hasattr(self.model, 'module') else self.model
+        enc = getattr(m, 'encoder', m)
+        pe = getattr(enc, 'patch_embedding', None)
+        if pe is not None:
+            ps = [p for p in pe.parameters() if p.requires_grad]
+            if ps:
+                return ps
+        return [p for p in enc.parameters() if p.requires_grad][:1]
 
     def _get_dino_model(self):
         """Return the underlying DINOEEGModel if wrapped, else None."""
@@ -129,6 +151,10 @@ class Trainer(object):
             losses = []
             for batch_idx, x in enumerate(tqdm(self.data_loader, mininterval=10)):
                 self.optimizer.zero_grad()
+                # GradNorm: raw (unweighted) tensor per ENABLED loss term this
+                # step; populated alongside the manual loss below, consumed only
+                # when --gradnorm is set (otherwise inert).
+                raw_losses = {}
                 # Coefficient on the masked-reconstruction term (mask_loss /
                 # freq_mask_loss). Default 1.0 = byte-identical to legacy; the
                 # term is the reference scale all other losses are tuned against.
@@ -195,6 +221,7 @@ class Trainer(object):
                                     logs[key] = lss.data.cpu().numpy()
                                     if coef != 0:
                                         loss_dict[key] = coef * lss
+                                        raw_losses[key] = lss
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
                                 elif key.startswith('diag_'):
@@ -211,6 +238,7 @@ class Trainer(object):
                             causal_loss = self.criterion(pred, target)
                             loss = causal_loss + sum(loss_dict.values())
                             logs["causal_loss"] = causal_loss.data.cpu().numpy()
+                            raw_losses['causal_loss'] = causal_loss
                     elif self.params.need_mask:
                         bz, ch_num, patch_num, patch_size = x.shape
                         freq_mask_prob = getattr(self.params, 'freq_mask_prob', 0.0)
@@ -252,6 +280,7 @@ class Trainer(object):
                                     logs[key] = lss.data.cpu().numpy()
                                     if coef != 0:
                                         loss_dict[key] = coef * lss
+                                        raw_losses[key] = lss
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
                                 elif key.startswith('diag_'):
@@ -271,6 +300,8 @@ class Trainer(object):
                             freq_loss = (mag_diff_sq * bm).sum() / bm.sum().clamp(min=1)
                             loss = freq_loss * mask_w + sum(loss_dict.values())
                             logs["freq_mask_loss"] = freq_loss.data.cpu().numpy()
+                            if mask_w != 0:
+                                raw_losses['freq_mask_loss'] = freq_loss
                         elif isinstance(out, tuple) and info.get('skip_external_recon', False):
                             # Frame-averaging step under PER-SAMPLE flip. Flipped
                             # rows present P(z) (no ground-truth flipped raw
@@ -320,6 +351,8 @@ class Trainer(object):
                                     mask_loss = self.criterion(masked_y, masked_x)
                                 loss = loss + mask_loss * ratio_nf * mask_w
                                 logs["mask_loss"] = mask_loss.data.cpu().numpy()
+                                if mask_w != 0:
+                                    raw_losses['mask_loss'] = mask_loss * ratio_nf
 
                                 # Aux band targets on the SAME non-flip rows: zero
                                 # the mask on flip rows so they don't contribute.
@@ -339,8 +372,10 @@ class Trainer(object):
                                     logs["aux_env_loss"] = env_loss.data.cpu().numpy()
                                     if self.params.aux_phase_weight != 0:
                                         loss = loss + self.params.aux_phase_weight * phase_loss * ratio_nf
+                                        raw_losses['aux_phase_loss'] = phase_loss * ratio_nf
                                     if self.params.aux_envelope_weight != 0:
                                         loss = loss + self.params.aux_envelope_weight * env_loss * ratio_nf
+                                        raw_losses['aux_env_loss'] = env_loss * ratio_nf
                         else:
                             masked_x = x[mask == 1]
                             masked_y = y[mask == 1]
@@ -358,6 +393,8 @@ class Trainer(object):
                                 mask_loss = self.criterion(masked_y, masked_x)
                             loss = mask_loss * mask_w + sum(loss_dict.values())
                             logs["mask_loss"] = mask_loss.data.cpu().numpy()
+                            if mask_w != 0:
+                                raw_losses['mask_loss'] = mask_loss
 
                             # On top of the plain MSE, predict instantaneous
                             # delta-band PHASE and mu/beta-band POWER ENVELOPE on
@@ -377,8 +414,10 @@ class Trainer(object):
                                 logs["aux_env_loss"] = env_loss.data.cpu().numpy()
                                 if self.params.aux_phase_weight != 0:
                                     loss = loss + self.params.aux_phase_weight * phase_loss
+                                    raw_losses['aux_phase_loss'] = phase_loss
                                 if self.params.aux_envelope_weight != 0:
                                     loss = loss + self.params.aux_envelope_weight * env_loss
+                                    raw_losses['aux_env_loss'] = env_loss
                     else:
                         out = self.model.training_step(batch, mask=None)
 
@@ -395,6 +434,7 @@ class Trainer(object):
                                     logs[key] = lss.data.cpu().numpy()
                                     if coef != 0:
                                         loss_dict[key] = coef * lss
+                                        raw_losses[key] = lss
                                 elif 'acc' in key:
                                     logs[key] = value.data.cpu().numpy()
                                 elif key.startswith('diag_'):
@@ -423,6 +463,12 @@ class Trainer(object):
                     logs = {
                         "mask_loss": mask_loss.data.cpu().numpy(),
                     }
+                # GradNorm: replace the manually-weighted total with the learned
+                # balance over the ENABLED terms (weights are updated after the
+                # model backward, below). Only when >=2 terms are present.
+                if self.gradnorm is not None and len(raw_losses) >= 2:
+                    loss = self.gradnorm.weighted_sum(raw_losses)
+
                 # --- Adversarial session-agnostic training ---
                 if self.adversarial_weight > 0 and isinstance(out, tuple):
                     global_rep = info.get('global_rep')
@@ -468,7 +514,15 @@ class Trainer(object):
                             logs["disc_acc"] = disc_acc.data.cpu().numpy()
                             logs["adv_loss"] = adv_loss.data.cpu().numpy()
 
-                loss.backward()
+                if self.gradnorm is not None and len(raw_losses) >= 2:
+                    # Retain the graph so GradNorm can recompute per-task gradient
+                    # norms at the shared layer, then take its weight step (uses
+                    # autograd.grad — never touches the model's .grad).
+                    loss.backward(retain_graph=True)
+                    logs.update(self.gradnorm.update(
+                        raw_losses, self._gradnorm_shared_params()))
+                else:
+                    loss.backward()
                 if self.params.clip_value > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
                 else:

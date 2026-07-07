@@ -196,6 +196,68 @@ class TestFlipPerm(unittest.TestCase):
         self.assertTrue(torch.equal(x_lat_flip[:, 1], x_lat[:, 0]))
         self.assertTrue(torch.equal(x_lat_flip[:, 2], x_lat[:, 2]))
 
+    @staticmethod
+    def _ref(ch_names_batch, vcm=None):
+        # From-scratch reference: the un-memoised, per-element algorithm.
+        from models.alignment import _normalize_ch_name, _get_homologous_name
+        B = len(ch_names_batch)
+        C = max(len(n) for n in ch_names_batch)
+        perm = torch.arange(C, dtype=torch.long).unsqueeze(0).expand(B, -1).clone()
+        for b, ch_names in enumerate(ch_names_batch):
+            n2i = {}
+            for i, name in enumerate(ch_names):
+                if vcm is not None and not bool(vcm[b, i]):
+                    continue
+                nm = _normalize_ch_name(name)
+                if nm == 'PAD':
+                    continue
+                n2i[nm] = i
+            for i, name in enumerate(ch_names):
+                if vcm is not None and not bool(vcm[b, i]):
+                    continue
+                nm = _normalize_ch_name(name)
+                if nm == 'PAD':
+                    continue
+                pair = _get_homologous_name(nm)
+                if pair in n2i:
+                    perm[b, i] = n2i[pair]
+        return perm
+
+    def test_memoized_matches_reference(self):
+        # Ragged batch (padding) + a validity mask: memoised output must match the
+        # per-element reference exactly.
+        names = [['C3', 'C4', 'F3', 'F4', 'Cz'],
+                 ['C3', 'C4', 'PAD', 'PAD', 'PAD'],
+                 ['Fp1', 'Fp2', 'T7', 'T8', 'Oz']]
+        vcm = torch.ones(3, 5, dtype=torch.bool)
+        vcm[0, 3] = False        # invalidate F4 -> F3/F4 no longer swap for row 0
+        vcm[2, :2] = False       # invalidate Fp1/Fp2 for row 2
+        got = build_flip_perm_batch(names, vcm)
+        ref = self._ref(names, vcm)
+        self.assertTrue(torch.equal(got, ref), f"{got.tolist()} != {ref.tolist()}")
+        # and the no-mask path
+        self.assertTrue(torch.equal(
+            build_flip_perm_batch(names), self._ref(names)))
+
+    def test_pad_width_independent(self):
+        # The same row montage in batches with different pad widths C must yield
+        # the same per-row remapping (cache is C-independent).
+        row = ['C3', 'C4', 'Cz']
+        a = build_flip_perm_batch([row])[0]                       # C=3
+        b = build_flip_perm_batch([row, ['C3', 'C4', 'Cz', 'Fp1', 'Fp2']])[0]  # C=5
+        self.assertTrue(torch.equal(a, b[:3]))
+
+    def test_gpu_vcm_matches_cpu(self):
+        if not torch.cuda.is_available():
+            self.skipTest('no CUDA')
+        names = [['C3', 'C4', 'F3', 'F4', 'Cz']]
+        vcm = torch.ones(1, 5, dtype=torch.bool)
+        vcm[0, 3] = False
+        cpu = build_flip_perm_batch(names, vcm)
+        gpu = build_flip_perm_batch(names, vcm.cuda())   # must not need per-elem sync
+        self.assertTrue(torch.equal(cpu, gpu))
+        self.assertEqual(gpu.device.type, 'cpu')          # returns a CPU perm
+
 
 class TestFlipAlignmentForward(unittest.TestCase):
     """Full encoder smoke: forward emits the flip losses and they backprop."""

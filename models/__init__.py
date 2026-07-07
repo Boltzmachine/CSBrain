@@ -258,6 +258,16 @@ def get_model(params, brain_regions, sorted_indices):
             frame_motion_alpha=getattr(params, 'wm_frame_motion_alpha', 0.0),
             frame_motion_floor=getattr(params, 'wm_frame_motion_floor', 0.1),
             frame_motion_ref=getattr(params, 'wm_frame_motion_ref', -1.0),
+            frame_clean_cond=getattr(params, 'wm_frame_clean_cond', False),
+            frame_contrast_weight=getattr(params, 'wm_frame_contrast_weight', 0.0),
+            frame_contrast_n_neg=getattr(params, 'wm_frame_contrast_n_neg', 1),
+            frame_contrast_temp=getattr(params, 'wm_frame_contrast_temp', 0.1),
+            frame_contrast_mode=getattr(params, 'wm_frame_contrast_mode', 'infonce'),
+            frame_contrast_margin=getattr(params, 'wm_frame_contrast_margin', 0.1),
+            frame_contrast_detach_neg=getattr(
+                params, 'wm_frame_contrast_detach_neg', True),
+            frame_contrast_batched=getattr(
+                params, 'wm_frame_contrast_batched', False),
         )
         return model
     elif params.model == 'ActionWorldModel':

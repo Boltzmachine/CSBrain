@@ -50,6 +50,22 @@ def main():
     parser.add_argument('--mask_ratio', type=float, default=0.5, help='mask_ratio')
     parser.add_argument('--mask_weight', type=float, default=1.0,
                         help='coefficient on the masked-reconstruction (mask_loss) term in the total pretrain loss. mask_loss is the reference scale all other terms are tuned as a fraction of, so it defaults to 1.0 (byte-identical to legacy). Lower it to down-weight raw recon relative to the world-model / alignment / aux terms; raise it to do the opposite. Applies to the WorldModel patch-recon, frame-averaging non-flip recon, freq-mask recon, and the plain non-WorldModel path.')
+    parser.add_argument('--gradnorm', action='store_true', default=False,
+                        help='enable GradNorm adaptive loss balancing (Chen et al. 2018): learn a '
+                             'per-term weight online so every ENABLED loss term (masked recon, frame '
+                             'prediction, image alignment, band-phase/envelope aux, ...) contributes a '
+                             'comparable gradient norm at the shared frontend, scaled by its relative '
+                             'training rate. SUPERSEDES the hand-tuned static weights (mask_weight / '
+                             'latent_pred_weight / aux_*_weight / alignment_weight) for terms it '
+                             'balances — those weights now only act as ON/OFF gates (0 = drop the term). '
+                             'Costs ~1 extra backward per balanced term/step (autograd.grad at the '
+                             'shared layer). Watch gnw_<term> / gngrad_<term> in wandb.')
+    parser.add_argument('--gradnorm_alpha', type=float, default=1.5,
+                        help='GradNorm asymmetry: 0 = just equalise gradient norms; larger pulls '
+                             'slow-training terms up harder (paper default 1.5).')
+    parser.add_argument('--gradnorm_lr', type=float, default=0.025,
+                        help='learning rate for the GradNorm loss-weight optimiser (Adam over the '
+                             'per-term weights; separate from the model optimiser).')
     parser.add_argument('--freq_mask_prob', type=float, default=0.0,
                         help='probability of replacing patch-mask reconstruction with masked-frequency-band reconstruction on a given batch (0 = always patch-mask)')
     parser.add_argument('--freq_recon_n_bands', type=int, default=5,
@@ -247,6 +263,62 @@ def main():
                              "jitters step-to-step). >0 = that explicit scalar for every step (override "
                              "for a different encoder/window config; recompute the constant instead if you "
                              "can).")
+    parser.add_argument('--wm_frame_clean_cond', action='store_true', default=False,
+                        help="For --wm_objective frame: asymmetric TWO-VIEW split. The masked forward "
+                             "(needed for recon) feeds half mask-token reconstruction guesses + "
+                             "intermittent masking, so alignment/prediction learn to ignore the EEG "
+                             "(diag_frame_eeg_gap ~0). With this on, the MASKED view is the reconstruction "
+                             "pretext ONLY (mask_loss + spectral aux + frame_recon), and a second UNMASKED "
+                             "forward carries everything downstream-facing on the complete signal — image "
+                             "alignment, flip-align, hand-pred, and the frame predictor's EEG conditioning. "
+                             "Costs one extra (cheap) EEG-encoder forward. Off = legacy (single masked "
+                             "forward carries all losses).")
+    parser.add_argument('--wm_frame_contrast_weight', type=float, default=0.0,
+                        help="For --wm_objective frame: weight of the negative-EEG CONTRASTIVE term. "
+                             "The dense frame predictor learns to copy the anchor grid and ignore the "
+                             "EEG (diag_frame_eeg_gap ~0). This re-runs the predictor on the SAME anchor "
+                             "grid conditioned on OTHER rows' EEG (in-batch negatives) and penalises it "
+                             "for reproducing the true future from the WRONG EEG — so the copy shortcut "
+                             "can no longer win and the EEG conditioning becomes load-bearing. Negatives "
+                             "are drawn only from rows sharing the anchor's frame-averaging flip (so "
+                             "orientation can't be the discriminator under --frame_averaging). Watch "
+                             "diag_frame_contrast_acc (chance~1/(realised negs+1); strict tie-break -> the "
+                             "EEG-ignoring copy mode reads chance, not 1) and "
+                             "diag_frame_contrast_gap (d_neg - d_pos; > 0 & growing). Costs n_neg extra "
+                             "predictor forwards/step. 0 (default) = OFF (no extra forwards). BEST PAIRED "
+                             "with --wm_frame_motion_alpha>0 so the contrast focuses on DYNAMIC patches "
+                             "(else it can be satisfied by encoding static scene identity).")
+    parser.add_argument('--wm_frame_contrast_n_neg', type=int, default=1,
+                        help="For --wm_frame_contrast_weight>0: number of in-batch negative EEG samples "
+                             "(distinct batch rolls) per row. More = harder task / stronger signal but "
+                             "n_neg extra predictor forwards/step. Capped at batch_valid_rows-1.")
+    parser.add_argument('--wm_frame_contrast_temp', type=float, default=0.1,
+                        help="For --wm_frame_contrast_weight>0 with mode infonce: softmax temperature on "
+                             "-distance logits. Smaller amplifies the (initially tiny) distance gaps.")
+    parser.add_argument('--wm_frame_contrast_mode', type=str, default='infonce',
+                        choices=['infonce', 'margin'],
+                        help="For --wm_frame_contrast_weight>0: 'infonce' (softmax over {pos, negs}, the "
+                             "true EEG must give the smallest prediction distance) or 'margin' "
+                             "(softplus(margin + d_pos - d_neg), each negative must exceed the positive "
+                             "distance by --wm_frame_contrast_margin).")
+    parser.add_argument('--wm_frame_contrast_margin', type=float, default=0.1,
+                        help="For --wm_frame_contrast_mode margin: required d_neg - d_pos margin.")
+    parser.add_argument('--wm_frame_contrast_detach_neg', action='store_true', default=True,
+                        help="For --wm_frame_contrast_weight>0: detach the negative EEG from the encoder "
+                             "graph (default) so ONLY the predictor learns the discrimination from the "
+                             "negatives; the EEG backbone is still pushed via the positive term. This "
+                             "keeps the arbitrary (eeg_j, scene_i) pairings from injecting noise into the "
+                             "downstream-facing EEG rep.")
+    parser.add_argument('--wm_frame_contrast_grad_neg', dest='wm_frame_contrast_detach_neg',
+                        action='store_false',
+                        help="Let the negative EEG carry gradient to the EEG encoder too (standard "
+                             "InfoNCE; overrides the default --wm_frame_contrast_detach_neg).")
+    parser.add_argument('--wm_frame_contrast_batched', action='store_true', default=False,
+                        help="For --wm_frame_contrast_weight>0: run all n_neg negative predictor "
+                             "forwards as ONE batched call over n_neg*Bv rows instead of an n_neg-step "
+                             "loop. Numerically identical (up to dropout RNG); fewer/larger kernels but "
+                             "~n_neg x peak attention memory. Off (default) = the memory-safe loop; turn "
+                             "ON to test whether the GPU has the capacity for the single-forward path.")
     parser.add_argument('--latent_pred_weight', type=float, default=1.0)
     parser.add_argument('--cls_pred_weight', type=float, default=0.1)
     parser.add_argument('--pred_ramp_epochs', type=int, default=2, help='linearly ramp latent-prediction weight 0→1 over this many epochs')

@@ -53,6 +53,52 @@ def _get_homologous_name(norm_name):
     return f'{base}{pair_num}'
 
 
+# Per-row hemispheric-flip remapping cache. The permutation is a PURE function of
+# a row's montage (channel names + validity), which is constant across steps for a
+# fixed source, so it is computed once per distinct montage and reused. Without
+# this, ``build_flip_perm_batch`` re-runs a Python double-loop over batch×channels
+# on EVERY encoder forward — and the per-element ``valid_channel_mask[b, i]`` on a
+# CUDA tensor forces a GPU->CPU sync each time (~2·B·C syncs/forward), which
+# starves the GPU (the dominant per-step host cost when the vision encoder is
+# cached). Keyed by ``(tuple(ch_names_row), vcm_row_tuple_or_None)``.
+_FLIP_PERM_ROW_CACHE: dict = {}
+
+
+def _flip_perm_row(ch_names, vcm_row):
+    """Non-identity ``(i, target)`` remappings for one row's hemispheric flip.
+
+    ``vcm_row`` is a tuple of python bools (validity per channel) or ``None``.
+    Pure function of ``(ch_names, vcm_row)`` -> memoised. The remapping indices
+    are within the row's own channels, so the result is independent of the batch
+    pad width ``C`` and can be applied to any ``C >= len(ch_names)``.
+    """
+    key = (tuple(ch_names), vcm_row)
+    cached = _FLIP_PERM_ROW_CACHE.get(key)
+    if cached is not None:
+        return cached
+    norm_to_idx = {}
+    for i, name in enumerate(ch_names):
+        if vcm_row is not None and not vcm_row[i]:
+            continue
+        norm = _normalize_ch_name(name)
+        if norm == 'PAD':
+            continue
+        norm_to_idx[norm] = i
+    remap = []
+    for i, name in enumerate(ch_names):
+        if vcm_row is not None and not vcm_row[i]:
+            continue
+        norm = _normalize_ch_name(name)
+        if norm == 'PAD':
+            continue
+        pair_norm = _get_homologous_name(norm)
+        if pair_norm in norm_to_idx:
+            remap.append((i, norm_to_idx[pair_norm]))
+    remap = tuple(remap)
+    _FLIP_PERM_ROW_CACHE[key] = remap
+    return remap
+
+
 def build_flip_perm_batch(ch_names_batch, valid_channel_mask=None):
     """Build a hemispheric-flip permutation for every sample in a batch.
 
@@ -65,35 +111,29 @@ def build_flip_perm_batch(ch_names_batch, valid_channel_mask=None):
 
     Returns
     -------
-    perm : (B, C) long tensor
+    perm : (B, C) long tensor (on CPU)
         ``perm[b, i]`` is the index of the channel whose *data* should
         appear at position *i* after the hemispheric flip.  Midline and
         unpaired channels map to themselves.
+
+    The per-row remapping is memoised by montage (see ``_flip_perm_row``); the
+    validity mask is moved to the CPU ONCE (not indexed per element) so this runs
+    without any per-element GPU->CPU sync.
     """
     B = len(ch_names_batch)
     C = max(len(names) for names in ch_names_batch)
     perm = torch.arange(C, dtype=torch.long).unsqueeze(0).expand(B, -1).clone()
 
-    for b, ch_names in enumerate(ch_names_batch):
-        # normalised-name → original index  (valid channels only)
-        norm_to_idx = {}
-        for i, name in enumerate(ch_names):
-            if valid_channel_mask is not None and not valid_channel_mask[b, i]:
-                continue
-            norm = _normalize_ch_name(name)
-            if norm == 'PAD':
-                continue
-            norm_to_idx[norm] = i
+    # One host transfer for the whole mask, instead of a per-element GPU index.
+    vcm_rows = None
+    if valid_channel_mask is not None:
+        vcm_rows = valid_channel_mask.detach().to('cpu', torch.bool).tolist()
 
-        for i, name in enumerate(ch_names):
-            if valid_channel_mask is not None and not valid_channel_mask[b, i]:
-                continue
-            norm = _normalize_ch_name(name)
-            if norm == 'PAD':
-                continue
-            pair_norm = _get_homologous_name(norm)
-            if pair_norm in norm_to_idx:
-                perm[b, i] = norm_to_idx[pair_norm]
+    for b, ch_names in enumerate(ch_names_batch):
+        vcm_row = (tuple(vcm_rows[b][:len(ch_names)])
+                   if vcm_rows is not None else None)
+        for i, target in _flip_perm_row(ch_names, vcm_row):
+            perm[b, i] = target
     return perm
 
 

@@ -45,6 +45,21 @@ from utils.util import generate_mask
 EGOBRAIN_FRAME_MOTION_REF_PER_STEP = (0.4215, 0.5227, 0.5842, 0.6280, 0.6628)
 
 
+# ``frame_clean_cond`` two-view split (see WorldModelWrapper.training_step). The
+# MASKED view is the reconstruction pretext ONLY; the CLEAN (unmasked) view
+# carries everything downstream-facing (alignment, flip-align, hand, prediction).
+# Batch keys stripped from the recon (masked) forward so the encoder SKIPS the
+# alignment / flip-align / hand branches (they gate on these keys) — recon needs
+# none of them, and dropping them saves that compute on the masked pass.
+_RECON_ONLY_STRIP = frozenset({
+    'image_encoder_inputs', 'has_image', 'frame_cls', 'frame_cls_flip',
+    'frame_grid', 'frame_grid_flip', 'hand_targets', 'hand_valid', 'flip_motion'})
+# info keys taken from the MASKED view (reconstruction-related); everything else
+# in the returned info comes from the CLEAN view.
+_RECON_VIEW_INFO_KEYS = frozenset({
+    'frame_recon_loss', 'skip_external_recon', 'flip_row'})
+
+
 # ---------------------------------------------------------------------------
 # Latent predictor
 # ---------------------------------------------------------------------------
@@ -295,6 +310,14 @@ class WorldModelWrapper(nn.Module):
         frame_motion_alpha: float = 0.0,
         frame_motion_floor: float = 0.1,
         frame_motion_ref: float = -1.0,
+        frame_clean_cond: bool = False,
+        frame_contrast_weight: float = 0.0,
+        frame_contrast_n_neg: int = 1,
+        frame_contrast_temp: float = 0.1,
+        frame_contrast_mode: str = 'infonce',
+        frame_contrast_margin: float = 0.1,
+        frame_contrast_detach_neg: bool = True,
+        frame_contrast_batched: bool = False,
     ):
         super().__init__()
         assert objective in ('eeg', 'frame'), (
@@ -305,6 +328,15 @@ class WorldModelWrapper(nn.Module):
             f"frame_motion_alpha must be >= 0, got {frame_motion_alpha}")
         assert 0.0 <= frame_motion_floor <= 1.0, (
             f"frame_motion_floor must be in [0, 1], got {frame_motion_floor}")
+        assert frame_contrast_weight >= 0.0, (
+            f"frame_contrast_weight must be >= 0, got {frame_contrast_weight}")
+        assert frame_contrast_mode in ('infonce', 'margin'), (
+            f"frame_contrast_mode must be 'infonce' or 'margin', got "
+            f"{frame_contrast_mode!r}")
+        assert frame_contrast_temp > 0.0, (
+            f"frame_contrast_temp must be > 0, got {frame_contrast_temp}")
+        assert frame_contrast_n_neg >= 1, (
+            f"frame_contrast_n_neg must be >= 1, got {frame_contrast_n_neg}")
         # Per-patch motion weighting for the DENSE frame objective (see
         # ``_motion_weight`` / ``_frame_prediction_step``). ``alpha == 0`` keeps
         # the legacy uniform mean over patches (byte-identical); ``alpha > 0``
@@ -321,10 +353,62 @@ class WorldModelWrapper(nn.Module):
         # (override for a different encoder/window config). Resolved by
         # ``_resolved_motion_ref``.
         self.frame_motion_ref = float(frame_motion_ref)
+        # Frame-objective two-view split. The masked forward (needed for the recon
+        # objective) feeds EEG tokens that are half mask-token reconstruction
+        # guesses AND intermittently masked, so the predictor / alignment learn to
+        # ignore the EEG (diag_frame_eeg_gap ~0). When True, run a second UNMASKED
+        # forward and route the objectives by view (MAE-world-model style): the
+        # masked view is the reconstruction pretext ONLY (mask_loss + spectral aux
+        # + frame_recon); the clean view carries everything downstream-facing —
+        # image alignment, flip-align, hand-pred, and the frame prediction's EEG
+        # conditioning — on the complete signal. Masked recon is untouched. Costs
+        # one extra (cheap) EEG-encoder forward. Default off (legacy: single masked
+        # forward carries all losses; predictor conditions on the masked tokens).
+        self.frame_clean_cond = bool(frame_clean_cond)
         # For the frame objective, condition the predictor on either the EEG
         # window-level global rep (``'global'``) or the full per-patch EEG token
         # set (``'tokens'``, M = C*N tokens). Ignored for the EEG objective.
         self.frame_eeg_cond = frame_eeg_cond
+        # Negative-EEG contrastive term (see ``_add_frame_contrast``). The dense
+        # frame predictor learns to COPY the anchor grid and ignore the EEG
+        # (diag_frame_eeg_gap ~0). This term re-runs the predictor on the SAME
+        # anchor grid conditioned on OTHER rows' EEG (in-batch negatives) and
+        # penalises the predictor for reproducing the true future from the wrong
+        # EEG — so the copy shortcut can no longer win and the predictor is forced
+        # to read the motion out of the EEG. ``weight == 0`` (default) is a no-op:
+        # the whole block (and its K extra predictor forwards) is skipped, so
+        # existing runs are byte-identical. Frame objective only.
+        #   * mode 'infonce' — softmax over {positive, K negatives} on -distance;
+        #     the correct EEG must give the smallest prediction distance.
+        #   * mode 'margin'  — softplus(margin + d_pos - d_neg): each negative's
+        #     distance must exceed the positive's by ``margin``.
+        # Negatives are OTHER rows' EEG conditioning drawn from rows sharing the
+        # anchor's frame-averaging flip (so the predictor can't discriminate on
+        # orientation instead of motion; see _same_flip_neg_indices). With
+        # ``detach_neg`` (default) the negative EEG is detached so ONLY the
+        # predictor (not the EEG encoder) learns the discrimination from the
+        # negatives, while the encoder is still pushed — through the positive term
+        # of the softmax — to make its OWN EEG the most predictive. This keeps the
+        # arbitrary (eeg_j, scene_i) pairings from injecting noise into the
+        # downstream-facing EEG backbone. NOTE the negatives are still DIFFERENT
+        # scenes, so the term can be partly satisfied by scene identity rather than
+        # motion — BEST PAIRED with frame_motion_alpha > 0:
+        # the motion weighting focuses the contrastive distance on DYNAMIC patches,
+        # otherwise the objective can be satisfied by encoding static SCENE IDENTITY
+        # into the EEG (the anchor already carries that, but a scene-match detector
+        # would still lower the loss without learning motion).
+        self.frame_contrast_weight = float(frame_contrast_weight)
+        self.frame_contrast_n_neg = int(frame_contrast_n_neg)
+        self.frame_contrast_temp = float(frame_contrast_temp)
+        self.frame_contrast_mode = frame_contrast_mode
+        self.frame_contrast_margin = float(frame_contrast_margin)
+        self.frame_contrast_detach_neg = bool(frame_contrast_detach_neg)
+        # Run all K negative predictor forwards as ONE batched call over K*Bv rows
+        # (fewer/larger kernels) instead of a K-step Python loop. Numerically
+        # identical to the loop (up to dropout RNG in train), but raises peak
+        # attention memory ~K x — this flag exists to test whether the GPU has the
+        # capacity for it. Default off = the memory-safe loop.
+        self.frame_contrast_batched = bool(frame_contrast_batched)
         # ``'eeg'`` (default): predict the next EEG window's latent from the
         # current EEG latent (the original world-model objective). ``'frame'``:
         # predict the next video frame's per-patch embedding from the current
@@ -664,24 +748,246 @@ class WorldModelWrapper(nn.Module):
             return x_bhp.mean(dim=-1)
         return (x_bhp * w).sum(dim=-1) / w.sum(dim=-1).clamp(min=1e-6)
 
+    def _row_frame_distance(self, pred: torch.Tensor, s_tgt: torch.Tensor,
+                            w_motion: Optional[torch.Tensor],
+                            tgt_valid: torch.Tensor,
+                            row_denom: torch.Tensor) -> torch.Tensor:
+        """Per-row motion-weighted L1 distance between a dense prediction and the
+        target grids, reduced over patches (same weighting as the main loss) and
+        averaged over each row's VALID horizon steps.
+
+        ``pred`` / ``s_tgt``: ``(Bv, H, P, d)``; ``w_motion``: ``(Bv, H, P)`` or
+        None; ``tgt_valid``: ``(Bv, H)``; ``row_denom``: ``(Bv,)`` = per-row valid
+        step count (clamped >= 1). Returns ``(Bv,)``. This is the SAME reduction
+        the frame_pred_loss uses, just kept per-row (not summed) so it can serve as
+        the contrastive energy.
+        """
+        err = F.l1_loss(pred, s_tgt, reduction='none').mean(dim=-1)   # (Bv,H,P)
+        per_step = self._reduce_over_patches(err, w_motion)          # (Bv,H)
+        return (per_step * tgt_valid).sum(dim=1) / row_denom         # (Bv,)
+
+    def _frame_neg_distances(self, neg_idx: torch.Tensor,
+                             s_anchor: torch.Tensor, s_tgt: torch.Tensor,
+                             eeg_emb: torch.Tensor,
+                             eeg_kpm: Optional[torch.Tensor],
+                             w_motion: Optional[torch.Tensor],
+                             tgt_valid: torch.Tensor,
+                             row_denom: torch.Tensor) -> torch.Tensor:
+        """Per-(row, slot) negative distances ``d_neg`` ``(Bv, K)``: the
+        motion-weighted distance from ``predictor(anchor_i, eeg_{neg_idx[i, m]})``
+        to ``s_tgt_i`` for each of the ``K`` negative slots.
+
+        Two paths, selected by ``frame_contrast_batched``:
+          * loop (default) — ``K`` predictor forwards of ``Bv`` rows each; lowest
+            peak memory (one negative's activations live at a time).
+          * batched — ONE predictor forward over all ``K * Bv`` (anchor, neg-EEG)
+            pairs (slot-major: block ``m`` = every row's slot-``m`` negative); fewer
+            + larger kernels, but ~``K x`` peak attention memory. The predictor is
+            batched over dim 0 with no cross-row attention, so this is numerically
+            identical to the loop (up to dropout RNG in ``train()``).
+        Negatives are detached from the EEG-encoder graph iff
+        ``frame_contrast_detach_neg`` in BOTH paths.
+        """
+        Bv, K = neg_idx.shape
+        if not self.frame_contrast_batched:
+            d_negs = []
+            for m in range(K):
+                idx = neg_idx[:, m]                                # (Bv,)
+                eeg_neg = eeg_emb.index_select(0, idx)
+                if self.frame_contrast_detach_neg:
+                    eeg_neg = eeg_neg.detach()
+                kpm_neg = (eeg_kpm.index_select(0, idx)
+                           if eeg_kpm is not None else None)
+                pred_neg = self.predictor(
+                    s_anchor, eeg_neg, eeg_key_padding_mask=kpm_neg)  # (Bv,H,P,d)
+                d_negs.append(self._row_frame_distance(
+                    pred_neg, s_tgt, w_motion, tgt_valid, row_denom))
+            return torch.stack(d_negs, dim=1)                      # (Bv, K)
+
+        # Batched: stack all K negatives along the batch dim -> one forward. Row
+        # ``m * Bv + i`` pairs anchor_i with slot-m negative EEG of row i.
+        P, d = s_anchor.size(1), s_anchor.size(2)
+        H = s_tgt.size(1)
+        flat = neg_idx.t().reshape(-1)                             # (K*Bv,) slot-major
+        anchor_rep = (s_anchor.unsqueeze(0).expand(K, -1, -1, -1)
+                      .reshape(K * Bv, P, d))
+        eeg_all = eeg_emb.index_select(0, flat)                    # (K*Bv, ...)
+        if self.frame_contrast_detach_neg:
+            eeg_all = eeg_all.detach()
+        kpm_all = (eeg_kpm.index_select(0, flat)
+                   if eeg_kpm is not None else None)
+        pred_all = self.predictor(
+            anchor_rep, eeg_all, eeg_key_padding_mask=kpm_all)     # (K*Bv,H,P,d)
+        tgt_rep = (s_tgt.unsqueeze(0).expand(K, -1, -1, -1, -1)
+                   .reshape(K * Bv, H, P, d))
+        w_rep = (w_motion.unsqueeze(0).expand(K, -1, -1, -1).reshape(K * Bv, H, P)
+                 if w_motion is not None else None)
+        tv_rep = tgt_valid.unsqueeze(0).expand(K, -1, -1).reshape(K * Bv, H)
+        rd_rep = row_denom.unsqueeze(0).expand(K, -1).reshape(K * Bv)
+        d_flat = self._row_frame_distance(
+            pred_all, tgt_rep, w_rep, tv_rep, rd_rep)              # (K*Bv,)
+        return d_flat.reshape(K, Bv).t()                          # (Bv, K)
+
+    @staticmethod
+    def _same_flip_neg_indices(flip_valid: torch.Tensor, K: int):
+        """Per-row negative row indices drawn ONLY from rows sharing the anchor's
+        frame-averaging flip state.
+
+        Under frame averaging the anchor + target grids AND the positive EEG for
+        row ``i`` are all presented in row ``i``'s orientation ``flip_i``. A
+        negative from a row with the OPPOSITE flip is orientation-mismatched vs the
+        anchor, letting the predictor win the contrastive task on orientation
+        bookkeeping instead of motion. Restricting negatives to the SAME flip group
+        removes that shortcut. ``flip_valid`` is the per-row flip (``(Bv,)`` bool);
+        pass an all-equal tensor when frame averaging is off (any row is then a
+        valid negative).
+
+        Returns ``(neg_idx, neg_valid)`` both ``(Bv, K)``. ``neg_idx[i, m]`` is the
+        row supplying the slot-``m`` negative EEG for row ``i``; ``neg_valid[i, m]``
+        is False when row ``i``'s flip group has too few members to fill slot ``m``
+        (fewer than ``m + 2`` rows) — the caller masks those slots out of the loss
+        and the diagnostics. A row in a singleton flip group gets no valid negative.
+        The realised per-row negative count therefore varies with the group sizes,
+        which is why the caller must never assume a fixed ``K`` per row.
+        """
+        Bv = flip_valid.numel()
+        device = flip_valid.device
+        neg_idx = torch.zeros(Bv, K, dtype=torch.long, device=device)
+        neg_valid = torch.zeros(Bv, K, dtype=torch.bool, device=device)
+        ar = torch.arange(Bv, device=device)
+        for g in (False, True):
+            members = ar[flip_valid == g]                  # rows in this flip group
+            n_g = int(members.numel())
+            if n_g < 2:
+                continue                                   # no same-flip partner
+            r = torch.arange(n_g, device=device)
+            # Slot m (1-indexed) -> the member m positions ahead cyclically; valid
+            # only while m <= n_g - 1 (m == n_g would alias the positive itself).
+            for m in range(1, min(K, n_g - 1) + 1):
+                neg_idx[members, m - 1] = members[(r + m) % n_g]
+                neg_valid[members, m - 1] = True
+        return neg_idx, neg_valid
+
+    def _add_frame_contrast(self, info: dict, per_step_pos: torch.Tensor,
+                            s_anchor: torch.Tensor, s_tgt: torch.Tensor,
+                            eeg_emb: torch.Tensor,
+                            eeg_kpm: Optional[torch.Tensor],
+                            w_motion: Optional[torch.Tensor],
+                            tgt_valid: torch.Tensor, scale: float,
+                            flip_valid: Optional[torch.Tensor] = None) -> None:
+        """Negative-EEG contrastive term for the dense frame objective.
+
+        For each row ``i`` (anchor grid ``s_anchor[i]``, target grids ``s_tgt[i]``,
+        EEG conditioning ``eeg_emb[i]``) we re-run the predictor on the SAME anchor
+        conditioned on up to ``K`` OTHER rows' EEG (in-batch negatives) and compare
+        each prediction's distance to ``s_tgt[i]``:
+
+          * ``d_pos``   = distance(predictor(anchor_i, eeg_i), s_tgt_i)
+          * ``d_neg_m`` = distance(predictor(anchor_i, eeg_j), s_tgt_i), j != i
+
+        Holding the anchor fixed and swapping ONLY the EEG isolates the EEG's
+        contribution: the copy-the-anchor shortcut produces the same prediction for
+        every EEG, so it CANNOT make ``d_pos < d_neg`` — the only way to lower the
+        loss is to read the future motion out of the EEG. ``d_pos`` reuses the
+        already-computed positive ``per_step_pos`` (no extra forward for it).
+
+        Negatives are restricted to rows sharing the anchor's frame-averaging flip
+        (``flip_valid``) so the predictor cannot discriminate on ORIENTATION
+        bookkeeping instead of motion; with frame averaging off, ``flip_valid`` is
+        all-equal and any other row is a valid negative. The per-row realised
+        negative count varies (a small flip group yields fewer than ``K``); invalid
+        slots are masked out of the loss and diagnostics, and a row with no valid
+        negative is dropped from the reduction.
+
+        Writes ``info['frame_contrast_loss']`` and ``diag_frame_contrast_*``.
+        Negatives are detached from the EEG-encoder graph iff
+        ``frame_contrast_detach_neg`` (default True) so only the predictor learns
+        the discrimination from them; the encoder is still pushed via the positive.
+        """
+        Bv = s_anchor.size(0)
+        K = min(self.frame_contrast_n_neg, Bv - 1)
+        if K < 1:
+            return
+        if flip_valid is None:
+            flip_valid = torch.zeros(Bv, dtype=torch.bool, device=s_anchor.device)
+        neg_idx, neg_valid = self._same_flip_neg_indices(flip_valid, K)  # (Bv, K)
+
+        row_denom = tgt_valid.sum(dim=1).clamp(min=1.0)            # (Bv,)
+        # A row is usable only if it has >= 1 valid target step AND >= 1 same-flip
+        # negative. Rows failing either are dropped from every reduction below.
+        rv = ((tgt_valid.sum(dim=1) > 0) & neg_valid.any(dim=1)).to(s_anchor.dtype)
+        rv_sum = rv.sum().clamp(min=1.0)
+        if float(rv.sum()) == 0.0:
+            return
+
+        # Positive per-row distance from the shared positive per-step reduction.
+        d_pos = (per_step_pos * tgt_valid).sum(dim=1) / row_denom  # (Bv,)
+
+        # K negative distances via a loop or a single batched forward (equivalent;
+        # ``frame_contrast_batched`` trades peak memory for kernel efficiency).
+        d_neg = self._frame_neg_distances(
+            neg_idx, s_anchor, s_tgt, eeg_emb, eeg_kpm,
+            w_motion, tgt_valid, row_denom)                       # (Bv, K)
+        nv = neg_valid.to(d_neg.dtype)                            # (Bv, K) 1=real slot
+
+        if self.frame_contrast_mode == 'infonce':
+            # logits = -distance / temp; positive is column 0. Invalid negative
+            # slots get -inf so they drop out of the softmax denominator (fewer
+            # negatives for that row) without touching the finite positive logit.
+            neg_logits = (-d_neg / self.frame_contrast_temp).masked_fill(
+                ~neg_valid, float('-inf'))
+            pos_logit = (-d_pos / self.frame_contrast_temp).unsqueeze(1)
+            logits = torch.cat([pos_logit, neg_logits], dim=1)    # (Bv, K+1)
+            target = torch.zeros(Bv, dtype=torch.long, device=logits.device)
+            ce = F.cross_entropy(logits, target, reduction='none')  # (Bv,)
+            contrast_loss = (ce * rv).sum() / rv_sum
+        else:  # 'margin' — each valid negative must beat the positive by ``margin``.
+            gap = self.frame_contrast_margin + d_pos.unsqueeze(1) - d_neg   # (Bv,K)
+            per_row = (F.softplus(gap) * nv).sum(dim=1) / nv.sum(dim=1).clamp(min=1.0)
+            contrast_loss = (per_row * rv).sum() / rv_sum
+
+        info['frame_contrast_loss'] = (
+            self.frame_contrast_weight * scale, contrast_loss)
+
+        with torch.no_grad():
+            # Accuracy: is the true EEG STRICTLY closer than every valid negative?
+            # Strict '<' makes the copy-the-anchor tie (pred_neg == pred_pos ->
+            # d_pos == d_neg) count as INCORRECT, so acc reports chance-level in the
+            # EEG-ignoring failure mode instead of a misleading 1.0. ->1 means the
+            # predictor genuinely discriminates on the EEG.
+            min_neg = d_neg.masked_fill(~neg_valid, float('inf')).min(dim=1).values
+            correct = (d_pos < min_neg).to(s_anchor.dtype)
+            info['diag_frame_contrast_acc'] = (correct * rv).sum() / rv_sum
+            # Mean (d_neg - d_pos) over valid negatives; > 0 & growing = EEG used.
+            gap_diag = (((d_neg - d_pos.unsqueeze(1)) * nv).sum(dim=1)
+                        / nv.sum(dim=1).clamp(min=1.0))
+            info['diag_frame_contrast_gap'] = (gap_diag * rv).sum() / rv_sum
+            # Mean realised negatives per usable row (varies with flip-group sizes).
+            info['diag_frame_contrast_n_neg'] = (nv.sum(dim=1) * rv).sum() / rv_sum
+            info['diag_frame_contrast_n_rows'] = rv.sum()
+
     def _frame_prediction_step(self, out, info: dict, batch: dict,
                                cb_idx: torch.Tensor,
-                               flip: Optional[torch.Tensor] = None):
+                               flip: Optional[torch.Tensor] = None,
+                               cond_info: Optional[dict] = None):
         """Cross-modal DENSE frame-prediction objective (``objective='frame'``).
 
         Predicts the per-patch grids of the next ``H = max_horizon`` frames —
         the co-occurring 0.2 s frame grid over the current 1 s EEG window —
         from the anchor (window-0) frame grid, conditioned on the current
-        window's EEG tokens (``info['patch_tokens']`` / ``global_rep``). Every
+        window's EEG tokens (``patch_tokens`` / ``global_rep``). Every
         0.2 s step is supervised in one predictor call. All grids come from the
         FROZEN vision encoder, so the targets are fixed (no EMA, no collapse) and
         only the EEG embedding + predictor carry gradient. Only the *current*
         EEG segment is used; the loaded future EEG windows are ignored.
 
         ``out``/``info`` are the window-0 reconstruction + loss dict already
-        produced by the shared encoder forward; we only add the prediction
-        terms and return them.
+        produced by the shared (masked) encoder forward; we only add the
+        prediction terms and return them. ``cond_info`` optionally supplies the
+        EEG CONDITIONING tokens from a separate CLEAN (unmasked) encode
+        (``frame_clean_cond``); when None the masked forward's ``info`` is used.
         """
+        cond = cond_info if cond_info is not None else info
         has_f = batch.get('has_image_future')     # (M, W) bool
         gfut = batch.get('frame_grid_future')     # (M, W, P, d) cached grids or None
         pv_f = batch.get('pixel_values_future')   # (M, W, 3, H, W) raw frames or None
@@ -710,16 +1016,18 @@ class WorldModelWrapper(nn.Module):
         # Current-window EEG conditioning for the (cb -> valid) rows.
         # ``global_rep`` is (B, d_model), ``patch_tokens`` is (B, C, N, d_model);
         # index by cb_idx (M rows, same order as pv_f) then by valid.
+        # ``cond`` is the clean unmasked encode when frame_clean_cond is set,
+        # else the masked forward's ``info`` (see caller).
         eeg_kpm = None
         if self.frame_eeg_cond == 'tokens':
-            pt = info['patch_tokens'][cb_idx][valid]           # (Bv, C, N, d_model)
+            pt = cond['patch_tokens'][cb_idx][valid]           # (Bv, C, N, d_model)
             eeg_emb = pt.reshape(pt.size(0), -1, pt.size(-1))  # (Bv, C*N, d_model)
             # Mask padded channels / invalid time so they cannot leak into the
             # predictor's attention.
             eeg_kpm = self._eeg_token_padding_mask(
                 batch, cb_idx, valid, pt.size(1), pt.size(2))  # (Bv, C*N) or None
         else:
-            eeg_emb = info['global_rep'][cb_idx][valid]        # (Bv, d_model)
+            eeg_emb = cond['global_rep'][cb_idx][valid]        # (Bv, d_model)
 
         if 'frame_grid_future' in batch:
             # Cached path: presented per-row grid stack straight from the cache
@@ -784,6 +1092,21 @@ class WorldModelWrapper(nn.Module):
         # Reuse ``latent_pred_weight`` as the predictor's loss weight (the
         # objective is a swap-in, not an addition), ramped the same way.
         info['frame_pred_loss'] = (self.latent_pred_weight * scale, pred_loss)
+
+        # Negative-EEG contrastive term: penalise the predictor for reproducing the
+        # true future from OTHER rows' EEG on the same anchor, so the copy shortcut
+        # stops winning and the EEG conditioning becomes load-bearing. Negatives are
+        # restricted to rows sharing this row's frame-averaging flip (``flip`` is the
+        # per-cb-row flip; restrict to the ``valid`` anchor rows) so orientation
+        # can't be used to discriminate; None when frame averaging is off. Skipped
+        # (no extra forwards) when the weight is 0, the ramp scale is 0 (loss would
+        # be dropped anyway), or the batch has < 2 valid rows. Reuses the positive
+        # ``per_step`` so ``d_pos`` costs no forward.
+        if self.frame_contrast_weight > 0 and scale > 0 and s_anchor.size(0) >= 2:
+            flip_valid = flip[valid] if flip is not None else None
+            self._add_frame_contrast(
+                info, per_step, s_anchor, s_tgt, eeg_emb, eeg_kpm,
+                w_motion, tgt_valid, scale, flip_valid)
 
         # Diagnostics. The dominant failure is the predictor IGNORING the EEG and
         # copying the anchor frame (short-horizon frames are ~static in DINOv2/
@@ -861,7 +1184,37 @@ class WorldModelWrapper(nn.Module):
             motion = self._compute_flip_motion(batch)
             if motion is not None:
                 encoder_batch['flip_motion'] = motion
-        out, info = self.encoder(encoder_batch, mask=mask)
+        # ``frame_clean_cond`` two-view split: the masked view is the
+        # reconstruction pretext ONLY; the clean (unmasked) view carries alignment
+        # + flip-align + hand + the tokens that condition the predictor. Masking
+        # (needed for recon) feeds the predictor/alignment half mask-token
+        # reconstruction guesses, so they learn to ignore the EEG (eeg_gap ~0);
+        # the clean view gives them the complete signal. The masked forward runs on
+        # a RECON-ONLY batch (alignment/hand inputs stripped, so those branches are
+        # skipped) and its ``out`` drives the trainer's mask_loss + spectral aux.
+        clean_cond_info = None
+        two_view = (self.frame_clean_cond and self.objective == 'frame'
+                    and self.predictor is not None and self.max_horizon >= 1)
+        if two_view:
+            # Clean view (full inputs, no mask): alignment + flip-align + hand +
+            # conditioning tokens. Its own reconstruction is discarded. Shallow
+            # copy — forward mutates its batch dict.
+            _, clean_info = self.encoder({**encoder_batch}, mask=None)
+            # Masked view (recon only): strip the downstream-facing inputs so the
+            # encoder skips those branches. ``out`` feeds the trainer's recon.
+            recon_batch = {k: v for k, v in encoder_batch.items()
+                           if k not in _RECON_ONLY_STRIP}
+            out, masked_info = self.encoder(recon_batch, mask=mask)
+            # Non-recon losses/diags come from the clean view; recon-related keys
+            # (frame_recon_loss, skip_external_recon, flip_row) from the masked one.
+            info = {k: v for k, v in clean_info.items()
+                    if k not in _RECON_VIEW_INFO_KEYS}
+            for k in _RECON_VIEW_INFO_KEYS:
+                if k in masked_info:
+                    info[k] = masked_info[k]
+            clean_cond_info = clean_info
+        else:
+            out, info = self.encoder(encoder_batch, mask=mask)
 
         # 2. Latent prediction on a random horizon.
         # ``max_horizon=0`` (predictor=None) reduces the wrapper to the
@@ -902,7 +1255,7 @@ class WorldModelWrapper(nn.Module):
             # mirrored iff its own EEG row was presented mirrored.
             flip_cb = flip.index_select(0, cb_idx) if flip is not None else None
             return self._frame_prediction_step(
-                out, info, batch, cb_idx, flip_cb)
+                out, info, batch, cb_idx, flip_cb, cond_info=clean_cond_info)
 
         ts_future = batch['timeseries_future']  # (M, W, C, N, d)
         W = ts_future.size(1)

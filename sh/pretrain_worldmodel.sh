@@ -128,6 +128,73 @@
 #       (stable); 0=per-batch per-step mean (jitters); >0=explicit scalar override
 # Best paired with the load-bearing frame-averaging (--frame_averaging), i.e. the
 # full dino-dense config, not this nofa run. To enable, add the flags below.
+#
+# --wm_frame_clean_cond (--wm_objective frame only): asymmetric TWO-VIEW split.
+# With mask_ratio=0.5 the masked forward feeds half mask-token reconstruction
+# guesses + intermittent masking, so alignment/prediction learn to ignore the EEG
+# (diag_frame_eeg_gap ~0 regardless of the motion weighting). With this on, the
+# MASKED view is the reconstruction pretext ONLY (mask_loss + aux_phase/aux_env +
+# frame_recon), and a second UNMASKED forward carries everything downstream-facing
+# on the complete signal — image alignment, flip-align, hand-pred, and the frame
+# predictor's EEG conditioning. Masked recon is untouched. Costs one extra (cheap)
+# EEG-encoder forward. Watch diag_frame_eeg_gap: if it RISES, masking was the
+# suppressor; if it stays ~0, the anchor confound (I(EEG;future|anchor)~0) is the
+# real ceiling. Independent of --wm_frame_motion_alpha (can run with alpha=0).
+#
+# --wm_frame_contrast_weight (--wm_objective frame only): negative-EEG CONTRASTIVE
+# term. The clean-cond + motion-weight ablations still leave diag_frame_eeg_gap ~0
+# because both only change WHAT the copy shortcut is scored against — the predictor
+# can still ignore the EEG. This term instead re-runs the predictor on the SAME
+# anchor grid conditioned on OTHER rows' EEG (in-batch negatives) and penalises it
+# for reproducing the true future from the WRONG EEG:
+#   infonce: softmax over {pos, K negs} on -distance -> the true EEG must give the
+#            smallest prediction distance (CE, self-normalising).
+#   margin : softplus(margin + d_pos - d_neg) -> each negative's distance must
+#            exceed the positive's by --wm_frame_contrast_margin.
+# Holding the anchor fixed and swapping only the EEG isolates the EEG's motion
+# contribution: the copy-the-anchor shortcut gives the SAME prediction for every
+# EEG, so it can no longer make d_pos < d_neg — the only way to lower the loss is to
+# read the motion out of the EEG. Negatives are drawn ONLY from rows sharing the
+# anchor's frame-averaging flip, so under --frame_averaging the predictor can't win
+# on orientation bookkeeping (a flip-mismatched negative) instead of motion; the
+# realised negatives/row = min(n_neg, same-flip-group-size - 1). NOTE negatives are
+# still DIFFERENT scenes, so scene identity remains a partial shortcut — pair with
+# --wm_frame_motion_alpha>0. Negatives are detached from the EEG encoder by
+# default (--wm_frame_contrast_detach_neg; use --wm_frame_contrast_grad_neg for
+# standard InfoNCE) so only the predictor learns discrimination from them while the
+# encoder is still pushed via the positive — keeps arbitrary (eeg_j, scene_i)
+# pairings out of the downstream EEG rep. Costs n_neg extra predictor forwards/step.
+# Watch diag_frame_contrast_acc (chance~1/(realised negs+1); strict tie-break so the
+# EEG-ignoring copy mode reads chance, not 1) and diag_frame_contrast_gap
+# (d_neg - d_pos, > 0 & growing = EEG used). BEST PAIRED with
+# --wm_frame_motion_alpha>0 so the contrast focuses on DYNAMIC patches; with alpha=0
+# it can be satisfied by encoding static SCENE IDENTITY into the EEG (which the
+# anchor already carries) rather than motion. Knobs:
+#   --wm_frame_contrast_weight 0=OFF (default) | ~0.5-2.0 to enable
+#   --wm_frame_contrast_n_neg 1..K  (more = harder/stronger, K extra forwards)
+#   --wm_frame_contrast_temp 0.1    (infonce; smaller amplifies tiny gaps)
+#   --wm_frame_contrast_mode infonce | margin   --wm_frame_contrast_margin 0.1
+#   --wm_frame_contrast_batched  run all n_neg negatives as ONE predictor forward
+#       (n_neg*Bv rows) instead of an n_neg-step loop — identical result, fewer/
+#       larger kernels but ~n_neg x peak attention memory. On = test GPU capacity;
+#       off (default) = memory-safe loop. If it OOMs, drop it or lower n_neg.
+# To enable, add a trailing `\` to the last active flag and uncomment the block
+# in the optional section below.
+#
+# --gradnorm (GradNorm adaptive loss balancing; Chen et al. 2018): the loss terms
+# (masked recon, frame prediction, image alignment, band phase/envelope aux, ...)
+# have gradient norms at the shared frontend that differ by orders of magnitude,
+# so the hand-tuned static weights are fragile. GradNorm learns a per-term weight
+# online so every ENABLED term contributes a comparable gradient norm, scaled by
+# its relative training rate. It SUPERSEDES the static weights (mask_weight /
+# latent_pred_weight / aux_*_weight / alignment_weight) for the terms it balances —
+# those now act only as ON/OFF gates (0 = drop the term entirely). Costs ~1 extra
+# backward per balanced term/step (autograd.grad at patch_embedding). Knobs:
+#   --gradnorm_alpha 1.5   asymmetry (0=equalise grad norms; larger respects rates)
+#   --gradnorm_lr    0.025 lr of the per-term weight optimiser
+# Watch gnw_<term> (learned weight) / gngrad_<term> (grad norm) in wandb — the
+# gngrad_<term> values should converge together. To enable, add the flag below.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python pretrain_main.py \
     --model WorldModel \
     --TemEmbed_kernel_sizes "[(1,), (3,), (5,),]" \
@@ -178,16 +245,36 @@ python pretrain_main.py \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
     --vision_encoder facebook/dinov2-base \
-    --run_name wm-dino-dense \
+    --wm_frame_clean_cond \
+    --run_name wm-dino-dense-clean-gradneg \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \
     --egobrain_motion_resample_alpha 1.0 \
-    --wm_frame_motion_alpha 0 
+    --wm_frame_motion_alpha 0 \
+    --wm_frame_contrast_weight 0.1 \
+    --wm_frame_contrast_n_neg 4 \
+    --wm_frame_contrast_temp 0.1 \
+    --wm_frame_contrast_grad_neg \
+    --wm_frame_contrast_mode infonce
     # Per-patch motion weighting of the dense frame-pred loss (kills the copy
     # shortcut so the predictor uses the EEG). Move the trailing `\` up onto the
     # motion_resample_alpha line above and uncomment to enable:
     # --wm_frame_motion_floor 0.1 \
+    # Unmasked EEG conditioning for the predictor (recon stays masked). Add a
+    # trailing `\` to the last active flag above, then uncomment:
+    # --wm_frame_clean_cond \
+    # Negative-EEG contrastive term (forces the predictor to use the EEG; pair with
+    # --wm_frame_motion_alpha>0). Uncomment:
+    # --wm_frame_contrast_weight 1.0 \
+    # --wm_frame_contrast_n_neg 4 \
+    # --wm_frame_contrast_temp 0.1 \
+    # --wm_frame_contrast_mode infonce \
+    # GradNorm adaptive loss balancing (learns the per-term weights online;
+    # supersedes the static loss weights for balanced terms). Uncomment:
+    # --gradnorm \
+    # --gradnorm_alpha 1.5 \
+    # --gradnorm_lr 0.025 \
     # --aux_hand_pred \
     # --aux_hand_weight 0.1 \
     # This run uses --egobrain_use_frame_grid, so the hand aux needs the

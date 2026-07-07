@@ -695,5 +695,380 @@ class TestFrameMotionWeighting(unittest.TestCase):
                               objective='frame', frame_motion_floor=1.5)
 
 
+class TestFrameCleanCond(unittest.TestCase):
+    """``frame_clean_cond`` two-view split: the masked view is recon-only; the
+    clean (unmasked) view carries prediction/alignment/hand. Uses synthetic cached
+    grids so no vision weights are needed."""
+
+    def _wrapper(self, clean_cond):
+        in_dim, n_ch, n_patches, fdim, H = 40, 8, 4, 12, 2
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+        pred = FramePredictor(frame_dim=fdim, eeg_dim=in_dim, predictor_d_model=48,
+                              n_layers=2, n_heads=4, dim_feedforward=96, max_horizon=H)
+        w = WorldModelWrapper(
+            encoder=enc, predictor=pred, latent_pred_weight=1.0, cls_pred_weight=0.0,
+            max_horizon=H, ramp_epochs=0, objective='frame', frame_eeg_cond='tokens',
+            frame_clean_cond=clean_cond)
+        w.train()
+        return w, n_ch, n_patches, fdim, H
+
+    def _batch(self, B, n_ch, n_patches, fdim, H):
+        torch.manual_seed(3)
+        W = H + 1
+        grid_f = torch.randn(B, W, 9, fdim)
+        return {
+            'timeseries': torch.randn(B, n_ch, n_patches, 40) / 100.0,
+            'ch_coords': torch.randn(B, n_ch, 3).abs() + 0.1,
+            'ch_names': [['pad'] * n_ch for _ in range(B)],
+            'valid_channel_mask': torch.ones(B, n_ch, dtype=torch.bool),
+            'valid_length_mask': torch.ones(B, n_patches, dtype=torch.bool),
+            'has_image': torch.zeros(B, dtype=torch.bool),
+            'timeseries_future': torch.randn(B, W, n_ch, n_patches, 40),
+            'pixel_values_future': torch.zeros(B, W, 1, 1, 1),
+            'has_image_future': torch.ones(B, W, dtype=torch.bool),
+            'frame_grid_future': grid_f,
+            'frame_grid_flip_future': grid_f.clone(),
+            'source': ['egobrain'] * B,
+        }
+
+    def _spy_forwards(self, w, batch, mask):
+        # Record (mask_is_None, 'has_image' in batch) at each encoder forward.
+        orig = w.encoder.forward
+        calls = []
+
+        def spy(fwd_batch, *a, **k):
+            calls.append((k.get('mask', a[0] if a else None) is None,
+                          'has_image' in fwd_batch))
+            return orig(fwd_batch, *a, **k)
+
+        w.encoder.forward = spy
+        try:
+            _, info = w.training_step(batch, mask=mask)
+        finally:
+            w.encoder.forward = orig
+        return calls, info
+
+    def test_two_view_split_structure(self):
+        B = 4
+        wf, n_ch, n_patches, fdim, H = self._wrapper(clean_cond=False)
+        wt, *_ = self._wrapper(clean_cond=True)
+        batch = self._batch(B, n_ch, n_patches, fdim, H)
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1                                   # mask ~half the patches
+
+        calls_off, info_off = self._spy_forwards(wf, batch, mask)
+        calls_on, info_on = self._spy_forwards(wt, batch, mask)
+
+        # Legacy: a single masked forward carrying the downstream inputs.
+        self.assertEqual(len(calls_off), 1)
+        self.assertEqual(calls_off[0], (False, True))       # mask set, has_image kept
+
+        # Two-view: one extra forward. Exactly one unmasked (clean) pass, and the
+        # MASKED (recon) pass has the downstream inputs stripped (no has_image).
+        self.assertEqual(len(calls_on), 2)
+        self.assertEqual(sum(1 for is_none, _ in calls_on if is_none), 1)   # 1 clean
+        masked = [c for c in calls_on if not c[0]]
+        clean = [c for c in calls_on if c[0]]
+        self.assertEqual(len(masked), 1)
+        self.assertFalse(masked[0][1])                      # recon batch stripped
+        self.assertTrue(clean[0][1])                        # clean batch keeps it
+
+        # frame_pred_loss present & finite both ways, and differs (masked vs clean
+        # conditioning under frame_eeg_cond='tokens' with patches masked).
+        for info in (info_off, info_on):
+            self.assertIn('frame_pred_loss', info)
+            self.assertTrue(torch.isfinite(info['frame_pred_loss'][1]).item())
+        self.assertFalse(torch.allclose(
+            info_off['frame_pred_loss'][1], info_on['frame_pred_loss'][1]))
+
+    def test_two_view_out_is_masked_view(self):
+        # The returned ``out`` (which drives the trainer's mask_loss) must be the
+        # MASKED forward's reconstruction, not the clean one.
+        B = 4
+        w, n_ch, n_patches, fdim, H = self._wrapper(clean_cond=True)
+        batch = self._batch(B, n_ch, n_patches, fdim, H)
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+        out, info = w.training_step(batch, mask=mask)
+        self.assertEqual(out.shape, batch['timeseries'].shape)
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_two_view_backward(self):
+        B = 4
+        w, n_ch, n_patches, fdim, H = self._wrapper(clean_cond=True)
+        batch = self._batch(B, n_ch, n_patches, fdim, H)
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+        out, info = w.training_step(batch, mask=mask)
+        loss = sum(v[0] * v[1] for k, v in info.items()
+                   if isinstance(v, tuple) and 'loss' in k)
+        # include a recon term on the masked out so both views get gradient
+        loss = loss + (out[mask == 1] ** 2).mean()
+        loss.backward()
+        g = [p.grad for p in w.encoder.patch_embedding.parameters()
+             if p.grad is not None]
+        self.assertTrue(len(g) > 0 and any(torch.isfinite(x).all() for x in g))
+
+
+class TestFrameContrast(unittest.TestCase):
+    """Negative-EEG contrastive term (``WorldModelWrapper._add_frame_contrast``).
+
+    Re-runs the frame predictor on the same anchor grid with OTHER rows' EEG and
+    penalises reproducing the true future from the wrong EEG. Uses synthetic
+    cached grids so no vision weights are needed.
+    """
+
+    def _wrapper(self, weight, mode='infonce', n_neg=2, detach_neg=True,
+                 motion_alpha=0.0):
+        in_dim, n_ch, n_patches, fdim, H = 40, 8, 4, 12, 2
+        enc = _tiny_encoder(in_dim=in_dim, n_ch=n_ch, n_patches=n_patches)
+        pred = FramePredictor(frame_dim=fdim, eeg_dim=in_dim, predictor_d_model=48,
+                              n_layers=2, n_heads=4, dim_feedforward=96, max_horizon=H)
+        w = WorldModelWrapper(
+            encoder=enc, predictor=pred, latent_pred_weight=1.0, cls_pred_weight=0.0,
+            max_horizon=H, ramp_epochs=0, objective='frame', frame_eeg_cond='tokens',
+            frame_motion_alpha=motion_alpha,
+            frame_contrast_weight=weight, frame_contrast_mode=mode,
+            frame_contrast_n_neg=n_neg, frame_contrast_detach_neg=detach_neg)
+        w.train()
+        return w, n_ch, n_patches, fdim, H
+
+    def _batch(self, B, n_ch, n_patches, fdim, H):
+        torch.manual_seed(5)
+        W = H + 1
+        grid_f = torch.randn(B, W, 9, fdim)
+        return {
+            'timeseries': torch.randn(B, n_ch, n_patches, 40) / 100.0,
+            'ch_coords': torch.randn(B, n_ch, 3).abs() + 0.1,
+            'ch_names': [['pad'] * n_ch for _ in range(B)],
+            'valid_channel_mask': torch.ones(B, n_ch, dtype=torch.bool),
+            'valid_length_mask': torch.ones(B, n_patches, dtype=torch.bool),
+            'has_image': torch.zeros(B, dtype=torch.bool),
+            'timeseries_future': torch.randn(B, W, n_ch, n_patches, 40),
+            'pixel_values_future': torch.zeros(B, W, 1, 1, 1),
+            'has_image_future': torch.ones(B, W, dtype=torch.bool),
+            'frame_grid_future': grid_f,
+            'frame_grid_flip_future': grid_f.clone(),
+            'source': ['egobrain'] * B,
+        }
+
+    def _run(self, w, B, n_ch, n_patches, fdim, H):
+        batch = self._batch(B, n_ch, n_patches, fdim, H)
+        mask = torch.zeros(B, n_ch, n_patches, dtype=torch.long)
+        mask[:, :, 0] = 1
+        return w.training_step(batch, mask=mask), batch, mask
+
+    def test_off_by_default_no_key(self):
+        # weight=0 -> the contrastive block (and its extra forwards) is skipped.
+        w, n_ch, n_patches, fdim, H = self._wrapper(weight=0.0)
+        (out, info), *_ = self._run(w, 4, n_ch, n_patches, fdim, H)
+        self.assertIn('frame_pred_loss', info)
+        self.assertNotIn('frame_contrast_loss', info)
+        self.assertNotIn('diag_frame_contrast_acc', info)
+
+    def _check_on(self, mode, detach_neg, motion_alpha):
+        w, n_ch, n_patches, fdim, H = self._wrapper(
+            weight=1.0, mode=mode, n_neg=2, detach_neg=detach_neg,
+            motion_alpha=motion_alpha)
+        (out, info), batch, mask = self._run(w, 5, n_ch, n_patches, fdim, H)
+        self.assertIn('frame_contrast_loss', info)
+        coef, val = info['frame_contrast_loss']
+        self.assertGreater(coef, 0.0)
+        self.assertTrue(torch.isfinite(val).item())
+        self.assertGreaterEqual(val.item(), 0.0)
+        # Diagnostics present and in range.
+        acc = info['diag_frame_contrast_acc']
+        self.assertTrue(0.0 <= acc.item() <= 1.0)
+        self.assertTrue(torch.isfinite(info['diag_frame_contrast_gap']).item())
+        self.assertEqual(info['diag_frame_contrast_n_neg'].item(), 2.0)
+
+        # Backward reaches the predictor (always) and the EEG backbone (via the
+        # positive term, even when negatives are detached).
+        loss = sum(v[0] * v[1] for k, v in info.items()
+                   if isinstance(v, tuple) and 'loss' in k)
+        loss = loss + (out[mask == 1] ** 2).mean()
+        loss.backward()
+        pred_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in w.predictor.parameters())
+        self.assertTrue(pred_grad, 'predictor received no gradient')
+        enc_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in w.encoder.patch_embedding.parameters())
+        self.assertTrue(enc_grad, 'EEG backbone received no gradient')
+
+    def test_infonce_detached(self):
+        self._check_on(mode='infonce', detach_neg=True, motion_alpha=0.0)
+
+    def test_infonce_grad_neg_with_motion(self):
+        self._check_on(mode='infonce', detach_neg=False, motion_alpha=1.0)
+
+    def test_margin_mode(self):
+        self._check_on(mode='margin', detach_neg=True, motion_alpha=0.0)
+
+    def test_single_row_skips_contrast(self):
+        # With one usable row there is no negative to form -> no contrast term,
+        # and the rest of the frame objective still runs.
+        w, n_ch, n_patches, fdim, H = self._wrapper(weight=1.0, n_neg=4)
+        (out, info), *_ = self._run(w, 1, n_ch, n_patches, fdim, H)
+        self.assertIn('frame_pred_loss', info)
+        self.assertNotIn('frame_contrast_loss', info)
+
+    def test_n_neg_capped_to_batch(self):
+        # n_neg larger than (valid_rows - 1) is capped, not an error.
+        w, n_ch, n_patches, fdim, H = self._wrapper(weight=1.0, n_neg=99)
+        (out, info), *_ = self._run(w, 3, n_ch, n_patches, fdim, H)
+        self.assertIn('frame_contrast_loss', info)
+        self.assertEqual(info['diag_frame_contrast_n_neg'].item(), 2.0)  # 3-1
+
+    def test_detach_neg_controls_negative_grad_path(self):
+        # The contrastive term ALWAYS reaches the encoder via the positive d_pos;
+        # ``detach_neg`` only controls whether the NEGATIVE predictor calls also
+        # feed the encoder. Spy on the predictor's EEG argument: the first call is
+        # the positive (always requires_grad), calls 1..K are the negatives, whose
+        # requires_grad must equal ``not detach_neg``.
+        for detach in (True, False):
+            w, n_ch, n_patches, fdim, H = self._wrapper(
+                weight=1.0, mode='infonce', n_neg=2, detach_neg=detach)
+            orig = w.predictor.forward
+            seen = []
+
+            def spy(s_anchor, eeg_emb, *a, **k):
+                seen.append(bool(eeg_emb.requires_grad))
+                return orig(s_anchor, eeg_emb, *a, **k)
+
+            w.predictor.forward = spy
+            try:
+                self._run(w, 5, n_ch, n_patches, fdim, H)
+            finally:
+                w.predictor.forward = orig
+            self.assertTrue(seen[0], 'positive predictor call must carry grad')
+            negatives = seen[1:3]  # K=2 negative calls follow the positive
+            self.assertEqual(
+                negatives, [not detach, not detach],
+                f'detach_neg={detach}: negative eeg requires_grad={negatives}')
+
+    def test_same_flip_neg_indices(self):
+        W = WorldModelWrapper
+        # All same flip group (frame averaging off): every row gets K distinct
+        # valid negatives, none of which is the row itself.
+        flip = torch.zeros(5, dtype=torch.bool)
+        idx, val = W._same_flip_neg_indices(flip, K=2)
+        self.assertEqual(idx.shape, (5, 2))
+        self.assertTrue(val.all())
+        for i in range(5):
+            for m in range(2):
+                self.assertNotEqual(idx[i, m].item(), i)
+        # Two balanced groups of 3: negatives stay within the same flip group, and
+        # a group of size 3 yields only 2 valid negatives (slot 3 is masked).
+        flip = torch.tensor([False, True, False, True, False, True])
+        idx, val = W._same_flip_neg_indices(flip, K=3)
+        for i in range(6):
+            for m in range(3):
+                if val[i, m]:
+                    self.assertEqual(flip[idx[i, m]].item(), flip[i].item())
+        self.assertTrue((val.sum(dim=1) == 2).all())
+        # Singleton group -> that row has no valid negative.
+        flip = torch.tensor([False, False, False, True])
+        idx, val = W._same_flip_neg_indices(flip, K=2)
+        self.assertFalse(val[3].any())
+        self.assertTrue(val[:3].any(dim=1).all())
+
+    class _CopyPred(torch.nn.Module):
+        """Predictor stub that IGNORES the EEG and copies the anchor grid across
+        all H horizon steps — the copy-the-anchor failure mode the term targets."""
+        def __init__(self, H):
+            super().__init__()
+            self.H = H
+
+        def forward(self, s_anchor, eeg_emb, eeg_key_padding_mask=None):
+            return s_anchor.unsqueeze(1).expand(-1, self.H, -1, -1).clone()
+
+    def _copy_case(self, mode, flip_valid, n_neg):
+        Bv, H, P, d = flip_valid.numel(), 2, 3, 4
+        w, *_ = self._wrapper(weight=1.0, mode=mode, n_neg=n_neg)
+        w.predictor = self._CopyPred(H)
+        torch.manual_seed(4)
+        s_anchor = torch.randn(Bv, P, d)
+        s_tgt = torch.randn(Bv, H, P, d)
+        eeg_emb = torch.randn(Bv, d)  # ignored by the stub
+        tgt_valid = torch.ones(Bv, H)
+        copy = s_anchor.unsqueeze(1).expand(-1, H, -1, -1)
+        err = torch.nn.functional.l1_loss(copy, s_tgt, reduction='none').mean(-1)
+        per_step_pos = WorldModelWrapper._reduce_over_patches(err, None)
+        info = {}
+        w._add_frame_contrast(info, per_step_pos, s_anchor, s_tgt, eeg_emb, None,
+                              None, tgt_valid, scale=1.0, flip_valid=flip_valid)
+        return info
+
+    def test_strict_accuracy_reports_chance_when_predictor_ignores_eeg(self):
+        # Copy-the-anchor => d_pos == every d_neg. Strict '<' must count that as
+        # INCORRECT (acc 0.0), NOT the misleading 1.0 an argmin tie-break gives.
+        info = self._copy_case('infonce', torch.zeros(6, dtype=torch.bool), n_neg=3)
+        self.assertIn('frame_contrast_loss', info)
+        self.assertEqual(info['diag_frame_contrast_acc'].item(), 0.0)
+
+    def test_flip_valid_excludes_singleton_group(self):
+        # 4 rows in one flip group + 1 lone row of the other flip. The lone row
+        # has no same-flip negative, so it is dropped from the reduction (n_rows=4)
+        # and the loss stays finite.
+        flip_valid = torch.tensor([False, False, False, False, True])
+        info = self._copy_case('margin', flip_valid, n_neg=3)
+        self.assertEqual(info['diag_frame_contrast_n_rows'].item(), 4.0)
+        self.assertTrue(torch.isfinite(info['frame_contrast_loss'][1]).item())
+        # Realised negatives per usable row = min(n_neg, group_size-1) = min(3,3)=3.
+        self.assertEqual(info['diag_frame_contrast_n_neg'].item(), 3.0)
+
+    def _equiv_case(self, cond, flip_valid, n_neg):
+        # Real predictor in eval() (no dropout) => the loop and batched negative
+        # forwards must produce identical distances. Only d_neg differs between the
+        # two paths (d_pos is the same shared per_step_pos), so this isolates the
+        # batched _frame_neg_distances against the reference loop.
+        Bv = flip_valid.numel()
+        H, P, fdim, edim, M = 2, 4, 12, 40, 5
+        w, *_ = self._wrapper(weight=1.0, mode='infonce', n_neg=n_neg)
+        w.eval()
+        torch.manual_seed(7)
+        s_anchor = torch.randn(Bv, P, fdim)
+        s_tgt = torch.randn(Bv, H, P, fdim)
+        if cond == 'global':
+            eeg, kpm = torch.randn(Bv, edim), None
+        else:
+            eeg = torch.randn(Bv, M, edim)
+            kpm = torch.zeros(Bv, M, dtype=torch.bool)
+            kpm[:, -1] = True                       # a padded token per row
+        tv = torch.ones(Bv, H)
+        with torch.no_grad():
+            pos = w.predictor(s_anchor, eeg, eeg_key_padding_mask=kpm)
+            err = torch.nn.functional.l1_loss(pos, s_tgt, reduction='none').mean(-1)
+            per_step_pos = WorldModelWrapper._reduce_over_patches(err, None)
+        outs = {}
+        for batched in (False, True):
+            w.frame_contrast_batched = batched
+            info = {}
+            with torch.no_grad():
+                w._add_frame_contrast(info, per_step_pos, s_anchor, s_tgt, eeg,
+                                      kpm, None, tv, 1.0, flip_valid)
+            outs[batched] = info
+        return outs[False], outs[True]
+
+    def test_batched_matches_loop(self):
+        # Balanced flip split so same-flip selection + masked slots are exercised
+        # in both paths, for global and token conditioning.
+        for cond in ('global', 'tokens'):
+            flip = torch.tensor([False, True, False, True, False, True])
+            loop, batch = self._equiv_case(cond, flip, n_neg=4)
+            self.assertTrue(torch.allclose(
+                loop['frame_contrast_loss'][1], batch['frame_contrast_loss'][1],
+                atol=1e-5), f'{cond}: contrast loss loop vs batched differ')
+            self.assertTrue(torch.allclose(
+                loop['diag_frame_contrast_gap'], batch['diag_frame_contrast_gap'],
+                atol=1e-5), f'{cond}: gap differs')
+            self.assertEqual(loop['diag_frame_contrast_acc'].item(),
+                             batch['diag_frame_contrast_acc'].item())
+            self.assertEqual(loop['diag_frame_contrast_n_neg'].item(),
+                             batch['diag_frame_contrast_n_neg'].item())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

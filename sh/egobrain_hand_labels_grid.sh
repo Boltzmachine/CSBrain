@@ -16,28 +16,31 @@
 # l40s -> qos_nmi, a40 -> qos_ying_rex. Keep this in sync with --gres above.
 #SBATCH --qos=qos_nmi
 
-# TIME-KEYED (grid) hand-movement intensities for EgoBrain — the
+# TIME-KEYED (grid) hand-movement speeds for EgoBrain — the
 # --egobrain_use_frame_grid counterpart of sh/egobrain_hand_labels.sh. Runs
-# WiLoR on the egocentric GoPro frame at every --grid_s slot and stores the
-# per-slot continuous left/right intensity (averaged over a --hand_ref_s window
-# centred on the slot). Unlike the clip-keyed cache, this is INDEPENDENT of the
-# training window/stride/erp/n_windows/clip_s — only --grid_s and --hand_ref_s
-# affect it. See datasets/egobrain_extract_hand_labels_grid.py. Install the
+# WiLoR on the egocentric GoPro frame at every --grid_s slot and stores the RAW
+# per-slot left/right speed over the single FORWARD pair (s, s+1), dt=grid_s.
+# NO temporal averaging / smoothing (format_version 2): any window or centering
+# you may want later is derivable offline from these raw values with numpy —
+# WiLoR never needs to run again. Unlike the clip-keyed cache, this is
+# INDEPENDENT of the training window/stride/erp/n_windows/clip_s; only --grid_s
+# affects it. See datasets/egobrain_extract_hand_labels_grid.py. Install the
 # backend FIRST on a login node: `bash sh/install_wilor.sh`.
 #
 # --grid_s MUST equal the world-model run's --egobrain_frame_grid_s (0.2) so the
 # label slot k aligns 1:1 with the frame/embedding grid; the dataset validates
 # this on load. Output:
-#   data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_r1.0_fs200/
-# (NEW dir; never overwrites the EEG cache, frame/embedding grid, raw video, or
-# the clip-keyed hand cache. Reruns with a different config refuse to clobber
-# unless --overwrite.)
+#   data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_raw_fs200/
+# (NEW dir; never overwrites the EEG cache, frame/embedding grid, raw video, the
+# clip-keyed hand cache, or the superseded smoothed *_r1.0_* dir. Reruns with a
+# different config refuse to clobber unless --overwrite.)
 #
-# Only P0001-P0024 ship video, so only those get labels; P0025-P0040 report
-# "no_video" and are skipped (matching the frame grid).
+# ALL 40 subjects ship video as of the 2026-07 EgoBrain update (P0025-P0040
+# gained it), so all 40 get labels. Subjects whose clips.json still reports no
+# video are skipped as "no_video".
 #
 # Per-subject parallelism: launch as an array (one subject per task), e.g.
-#   sbatch --array=1-24 sh/egobrain_hand_labels_grid.sh
+#   sbatch --array=1-40 sh/egobrain_hand_labels_grid.sh
 # and the SLURM_ARRAY_TASK_ID below selects the subject.
 
 # Uses the DEDICATED wilor env (built by sh/install_wilor.sh), NOT cbramod —
@@ -70,7 +73,6 @@ python datasets/egobrain_extract_hand_labels_grid.py \
     --subjects "${SUBJECTS}" \
     --backend wilor \
     --grid_s 0.2 \
-    --hand_ref_s 1.0 \
     --clip_s 4.0 \
     --fs_out 200 \
     --handedness_source hybrid \

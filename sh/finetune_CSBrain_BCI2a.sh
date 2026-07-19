@@ -1,56 +1,46 @@
 #!/bin/bash
-
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --cpus-per-gpu=6
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:a40:1
-#SBATCH --time=1-00:00:00
-#SBATCH --job-name=csbrain-finetune
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --time=06:00:00
+#SBATCH --job-name=csbrain-ft-bci2a
 #SBATCH --output=outputs/slurms/%j.out
-#SBATCH --qos=qos_ying_rex
-# Get the script directory
-SCRIPT_DIR=$(dirname "$0")
+#SBATCH --qos=qos_nmi
 
-# Create log directory if it doesn't exist
-LOG_DIR="log"
-mkdir -p "$LOG_DIR"
+# BCIC-IV-2a finetune, STANDARD protocol (mirrors the PhysioNet-MI plain eval):
+# world-model checkpoint loaded via load_pretrain_checkpoint + allowlist,
+# frame-averaging pinned (flip prob 0), input cropped to the pretrained 1s window
+# (--use_initial_segment_only), 4-class softmax. No equivariance/flip aug.
 
-# Get the script file name without the .sh extension
-LOG_FILE_NAME=$(basename "$0" .sh)
+FOUNDATION_DIR="${1:-outputs/wm-dino-dense/epoch10_loss2.1733548641204834.pth}"
+SEED="${2:-42}"
+NUM_WORKERS="${3:-4}"
+SEGMENT_INDEX="${4:-0}"
+HIGHPASS_HZ="${5:-0}"
+CKPT_NAME=$(basename "$(dirname "$FOUNDATION_DIR")")
+EPOCH=$(basename "$FOUNDATION_DIR" .pth | sed 's/_loss.*//')
+WANDB_RUN_NAME="BCI2a_${CKPT_NAME}_${EPOCH}_seed${SEED}_seg${SEGMENT_INDEX}"
 
-# Set the log file path
-LOG_FILE="${LOG_DIR}/${LOG_FILE_NAME}.log"
-
-# Log the job start time
-echo "Job started at $(date)" | tee -a "$LOG_FILE"
-
-# Set CUDA device and run the Python fine-tuning script
-# python finetune_main.py  \
-#     --downstream_dataset BCIC-IV-2a \
-#     --datasets_dir data/preprocessed/BCICIV2a \
-#     --num_of_classes 4 \
-#     --model_dir outputs/CSBrain/finetune_CSBrain_BCICIV2a \
-#     --foundation_dir outputs/llm_vq/epoch21_loss0.03721848130226135.pth \
-#     --model LLMVQ \
-#     --use_pretrained_weights \
-#     --dropout 0.3 \
-#     --weight_decay  0.01 \
-#     --lr 0.0001 
-
-python finetune_main.py  \
+python finetune_main.py \
+    --model Align \
     --downstream_dataset BCIC-IV-2a \
     --datasets_dir data/preprocessed/BCICIV2a \
     --num_of_classes 4 \
     --model_dir outputs/CSBrain/finetune_CSBrain_BCICIV2a \
-    --foundation_dir outputs/ours_all_zerosync_16/epoch17_loss0.017739474773406982.pth \
-    --model OurModel \
+    --foundation_dir "$FOUNDATION_DIR" \
+    --seed "$SEED" \
+    --wandb_run_name "$WANDB_RUN_NAME" \
+    --results_csv outputs/finetune_results_bci2a.csv \
     --use_pretrained_weights \
+    --use_initial_segment_only \
+    --segment_index "$SEGMENT_INDEX" \
+    --highpass_hz "$HIGHPASS_HZ" \
+    --num_workers "$NUM_WORKERS" \
     --dropout 0.3 \
     --weight_decay  0.01 \
-    --lr 0.0001 
+    --lr 0.00005
 
 wait
-
-# Log the task completion time
-echo "All tasks completed at $(date)" | tee -a "$LOG_FILE"
+echo "All tasks completed at $(date)"

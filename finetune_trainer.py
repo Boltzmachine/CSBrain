@@ -39,11 +39,11 @@ class Trainer(object):
         self.test_eval = Evaluator(params, self.data_loader['test'])
 
         self.model = model.cuda()
-        if self.params.downstream_dataset in ['FACED', 'SEED-V', 'PhysioNet-MI', 'ISRUC', 'BCIC2020-3', 'TUEV', 'BCIC-IV-2a', 'TUSL', 'HMC']:
+        if self.params.downstream_dataset in ['FACED', 'SEED-V', 'PhysioNet-MI', 'ISRUC', 'BCIC2020-3', 'TUEV', 'BCIC-IV-2a', 'FineMI', 'TUSL', 'HMC', 'Weibo2014', 'Jeong2020', 'Kaya5F', 'Forenzo2024']:
             self.criterion = CrossEntropyLoss(label_smoothing=self.params.label_smoothing).cuda()
         elif self.params.downstream_dataset in ['SHU-MI', 'CHB-MIT', 'Mumtaz2016', 'MentalArithmetic', 'TUAB', 'siena']:
             self.criterion = BCEWithLogitsLoss().cuda()
-        elif self.params.downstream_dataset == 'SEED-VIG':
+        elif self.params.downstream_dataset in ['SEED-VIG', 'Forenzo2024Reg']:
             self.criterion = MSELoss().cuda()
 
         # Bilateral two-bit head: the model emits two independent sigmoids
@@ -123,14 +123,20 @@ class Trainer(object):
             for batch in tqdm(self.data_loader['train'], mininterval=10):
                 self.optimizer.zero_grad()
                 batch = to_device(batch, "cuda")
-                # Bilateralization-prior augmentations (no-ops unless their
-                # flags are set): flip (left<->right) then symmetrize
-                # (single-hand -> both fists). Both may edit x and remap y.
-                y = self.model.flip_augment(batch)
-                y = self.model.symmetrize_augment(batch, y)
-                # Frame-native equivariance flip aug: 2x-batch concat of canonical
-                # + mirrored views (returns the plain forward when disabled).
-                pred, y = self.model.frame_flip_forward(batch, y)
+                # PhysioNet-MI-specific augmentations (bilateralization-prior
+                # flip / symmetrize / frame-native equivariance flip). Only
+                # model_for_physio defines these; every other multiclass model
+                # (FACED, SEED-V, TUEV, ISRUC, BCIC-IV-2a, FineMI, ...) uses the
+                # standard protocol with no such aug, so guard on their presence
+                # and fall back to the plain forward. All are no-ops unless their
+                # flags are set even on model_for_physio.
+                if hasattr(self.model, 'flip_augment'):
+                    y = self.model.flip_augment(batch)
+                    y = self.model.symmetrize_augment(batch, y)
+                    pred, y = self.model.frame_flip_forward(batch, y)
+                else:
+                    y = batch['y']
+                    pred = self.model(batch)
                 if getattr(self.params, 'bilateral_head', False):
                     # BCE over the two hemisphere bits; map 4-class y -> (N,2) bits.
                     loss = self.criterion(pred, self.model.bilateral_bit_targets(y))
@@ -309,6 +315,68 @@ class Trainer(object):
             torch.save(self.model.state_dict(), model_path)
             print("model save in " + model_path)
 
+
+    def train_for_regression_dict(self):
+        """Dict-batch 2D regression training (Forenzo continuous-pursuit cursor
+        velocity). Mirrors train_for_multiclass' loop/selection structure but
+        uses MSE loss + regression metrics (corr / r2 / rmse), selecting on val
+        r2. The model consumes the standard dict batch, unlike the legacy
+        train_for_regression (tuple (x,y) + model(x), used by SEED-VIG)."""
+        r2_best = -1e18
+        best_epoch = 0
+        self.best_model_states = copy.deepcopy(self.model.state_dict())
+        for epoch in range(self.params.epochs):
+            self.model.train()
+            start_time = timer()
+            losses = []
+            for batch in tqdm(self.data_loader['train'], mininterval=10):
+                self.optimizer.zero_grad()
+                batch = to_device(batch, "cuda")
+                y = batch['y']
+                pred = self.model(batch)
+                loss = self.criterion(pred, y)
+                # NaN/inf guard: skip the step (don't backprop a non-finite loss,
+                # which clip_grad_norm would turn into NaN weights that persist).
+                if not torch.isfinite(loss):
+                    self.optimizer.zero_grad()
+                    continue
+                loss.backward()
+                wandb.log({"train/loss": loss.item()})
+                losses.append(loss.data.cpu().numpy())
+                if self.params.clip_value > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
+                self.optimizer.step()
+                self.optimizer_scheduler.step()
+
+            with torch.no_grad():
+                corr, r2, rmse = self.val_eval.get_metrics_for_regression_dict(self.model)
+                t_corr, t_r2, t_rmse = self.test_eval.get_metrics_for_regression_dict(self.model)
+                print("Epoch {} : Loss {:.5f} | val corr {:.4f} r2 {:.4f} rmse {:.4f} | "
+                      "test corr {:.4f} r2 {:.4f} rmse {:.4f} | {:.2f} min".format(
+                          epoch + 1, np.mean(losses), corr, r2, rmse,
+                          t_corr, t_r2, t_rmse, (timer() - start_time) / 60))
+                wandb.log({"epoch": epoch + 1, "val/corr": corr, "val/r2": r2,
+                           "val/rmse": rmse, "test/corr": t_corr, "test/r2": t_r2,
+                           "test/rmse": t_rmse})
+                if r2 > r2_best:
+                    print("val r2 increasing....saving weights !!")
+                    r2_best = r2
+                    best_epoch = epoch + 1
+                    self.best_model_states = copy.deepcopy(self.model.state_dict())
+
+        self.model.load_state_dict(self.best_model_states)
+        with torch.no_grad():
+            corr, r2, rmse = self.test_eval.get_metrics_for_regression_dict(self.model)
+        print("*************** Forenzo regression TEST ***************")
+        print("Test: corr {:.4f} r2 {:.4f} rmse {:.4f} (best val epoch {})".format(
+            corr, r2, rmse, best_epoch))
+        if not os.path.isdir(self.params.model_dir):
+            os.makedirs(self.params.model_dir)
+        model_path = self.params.model_dir + "/epoch{}_r2_{:.4f}_rmse_{:.4f}.pth".format(
+            best_epoch, r2, rmse)
+        torch.save(self.model.state_dict(), model_path)
+        print("model save in " + model_path)
+        return None
 
     def train_for_regression(self):
         corrcoef_best = 0

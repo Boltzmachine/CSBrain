@@ -302,15 +302,24 @@ def _preprocess_subject(sub: str) -> dict:
         # Re-verify .npy files exist to detect partial caches.
         if all(os.path.exists(os.path.join(out_dir, f'{i}.npy'))
                for i in range(n_clips)):
-            # Existing video meta is either None (no video for this subject),
-            # the new {"chapters": [...]} schema, or the legacy {"path": ...}
-            # single-chapter shape. Refresh only the legacy shape so we
-            # cover the full session without re-running the expensive EEG
-            # filter/notch/resample.
+            # Existing video meta is either None (no video was on disk when this
+            # subject was preprocessed), the new {"chapters": [...]} schema, or
+            # the legacy {"path": ...} single-chapter shape. Refresh the legacy
+            # shape AND the None case -- EgoBrain later released GoPro video for
+            # subjects that were originally EEG-only (P0025-P0040), so a null
+            # here just means "no video *then*". A None with still no MP4s on
+            # disk falls through to 'skip' below (chapters == []), so this is a
+            # cheap dir scan for genuinely video-less subjects.
+            #
+            # Either way we ONLY reassign meta['video']: the EEG .npy clips are
+            # never rewritten and n_clips/clip_s/fs_out/ch_names/events/
+            # preprocess are copied through verbatim, so previously-cached EEG
+            # stays byte-identical and prior results remain reproducible.
             video_meta = meta.get('video')
             needs_video_refresh = (
-                isinstance(video_meta, dict) and
-                'chapters' not in video_meta)
+                video_meta is None or
+                (isinstance(video_meta, dict) and
+                 'chapters' not in video_meta))
             if not needs_video_refresh:
                 return {'subject': sub, 'status': 'skip',
                         'n_clips': n_clips}
@@ -332,7 +341,8 @@ def _preprocess_subject(sub: str) -> dict:
                          'duration_s': c.get('duration_s')}
                         for c in chapters_full
                     ],
-                    'video_offset_s': video_meta.get(
+                    # video_meta is None for a newly-videoed subject.
+                    'video_offset_s': (video_meta or {}).get(
                         'video_offset_s', cfg['video_offset_s']),
                     'total_duration_s': sum(
                         c.get('duration_s', 0.0) for c in chapters_full),

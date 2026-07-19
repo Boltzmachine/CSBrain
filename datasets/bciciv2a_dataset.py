@@ -50,6 +50,7 @@ class CustomDataset(Dataset):
             'x': to_tensor(x_data),
             'y': to_tensor(y_label).long(),
             'ch_coords': to_tensor(ch_coords),
+            'ch_names': [x['ch_names'] for x in batch],
         }
 
 

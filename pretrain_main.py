@@ -14,6 +14,22 @@ import os
 import logging
 logger = logging.getLogger(__name__)
 
+def _resolve_video_subjects(spec):
+    """Parse --egobrain_video_subjects into a subject whitelist (or None = all).
+
+    'all'/None -> None (every subject with a cache contributes video).
+    'legacy24' -> P0001..P0024, the subjects that had GoPro video before
+    EgoBrain released MP4s for P0025-P0040; use it to reproduce pre-release
+    results bit-for-bit while the new subjects' caches sit on disk.
+    Otherwise a comma-separated subject list.
+    """
+    if spec is None or spec.strip().lower() == 'all':
+        return None
+    if spec.strip().lower() == 'legacy24':
+        return [f'P{i:04d}' for i in range(1, 25)]
+    return [s.strip() for s in spec.split(',') if s.strip()]
+
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -92,6 +108,8 @@ def main():
                         help='Auxiliary objective: decode the CONTINUOUS EgoBrain hand-movement annotations (per-window left/right hand intensity in hand-lengths/s; see datasets/egobrain_hand_labels.py) from each EEG window global rep via a small MLP head + masked SmoothL1 regression, added to the pretrain loss as info["hand_pred_loss"]. Per-column masked to EgoBrain rows with a detected hand (undetected hand -> NaN -> skipped); non-EgoBrain rows contribute nothing. On frame-averaging flip steps the left/right targets are swapped to match the mirrored scene. Requires --egobrain_hand_labels_dir + an EgoBrain source. Watch hand_pred_loss / diag_hand_mae in wandb.')
     parser.add_argument('--aux_hand_weight', type=float, default=0.1,
                         help='weight of the --aux_hand_pred regression loss. Targets are O(0.05-4) hand-lengths/s (mostly <1) so SmoothL1 runs ~0.1-0.5; default 0.1 keeps weight*hand_pred_loss a small fraction of mask_loss. Retune so it sits ~5-20%% of mask_loss.')
+    parser.add_argument('--use_brain_embed', action='store_true', default=False,
+                        help="CSBrain spatial-mixing residual (models/CSBrain.py): add BrainEmbedEEGLayer(patch_emb)+patch_emb — a circular conv across EEG channels — after the TemEmbed residual in every encoder layer of the world-model backbone. Channels are region-GROUPED first (per-sample from ch_names, the EgoBrain analogue of CSBrain's fixed x=x[:,sorted_indices]); since area_config is None here, this is the only channel-order-dependent op so grouping it locally leaves the coord PE / masks / reconstruction target in native channel order. Off = current behavior (byte-identical).")
     parser.add_argument('--dataset_dir', type=str, default='path/to/dataset', help='dataset_dir')
     parser.add_argument('--model_dir', type=str, default='outputs', help='model_dir') # eg. 'CSBrain/pth'
     parser.add_argument('--TemEmbed_kernel_sizes', type=str, default="[(1,), (3,), (5,)]")
@@ -212,6 +230,11 @@ def main():
     parser.add_argument('--freq_max_bands', type=int, default=None, help='maximum number of bands to keep (default: all)')
     parser.add_argument('--last_layer_freeze_iters', type=int, default=1250, help='freeze weight-norm magnitude of prototype layer for this many initial iterations (0 = never freeze)')
     parser.add_argument('--lr_warmup_iters', type=int, default=0, help='linear LR warmup iterations (0 = disabled)')
+    parser.add_argument('--lr_warmup_frac', type=float, default=0.0,
+                        help='linear LR warmup as a FRACTION of total training steps '
+                             '(epochs * iters_per_epoch); 0 = disabled. Takes precedence '
+                             'over --lr_warmup_iters when > 0, so it auto-scales with the '
+                             'dataset size / epoch count.')
     # Multi-crop
     parser.add_argument('--n_local_crops', type=int, default=4, help='number of local EEG crops for DINO CLS loss (0 = single-view)')
     parser.add_argument('--local_crop_time_scale', type=str, default='(0.3, 0.7)', help='(min, max) fraction of time patches in local crops')
@@ -339,7 +362,7 @@ def main():
     parser.add_argument('--egobrain_hand_labels_dir', type=str, default=None,
                         help='LEGACY clip-keyed hand-movement-annotation HDF5 dir (datasets/egobrain_hand_labels.py output, e.g. data/EgoBrain/cache_hand_labels_wilor_w1.0s1.0_e0.5_nw2_k7_c4.0_fs200). Enables --aux_hand_pred on the clip-keyed path only. The window slug MUST match the egobrain_window_s/stride_s/erp_latency_s/n_windows/clip_s/fs_out used here or the (clip,window) label keys misalign. INCOMPATIBLE with --egobrain_use_frame_grid (raises) — use --egobrain_hand_grid_dir there.')
     parser.add_argument('--egobrain_hand_grid_dir', type=str, default=None,
-                        help='TIME-KEYED (grid) hand-movement-annotation HDF5 dir (datasets/egobrain_extract_hand_labels_grid.py output, e.g. data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_r1.0_fs200). The --egobrain_use_frame_grid counterpart of --egobrain_hand_labels_dir: per-0.2s-slot continuous intensities read at each window frame slot, so --aux_hand_pred works under the grid path. Its grid_s MUST equal --egobrain_frame_grid_s (validated at load). Requires --egobrain_use_frame_grid.')
+                        help='TIME-KEYED (grid) hand-movement-annotation HDF5 dir (datasets/egobrain_extract_hand_labels_grid.py output, e.g. data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_raw_fs200). The --egobrain_use_frame_grid counterpart of --egobrain_hand_labels_dir: RAW per-0.2s-slot hand speed (forward pair, no smoothing) read at each window frame slot, so --aux_hand_pred works under the grid path. Its grid_s MUST equal --egobrain_frame_grid_s (validated at load). Requires --egobrain_use_frame_grid.')
     parser.add_argument('--mix_egobrain_weight', type=float, default=1.0, help='sampling weight for EgoBrain in the mix+egobrain dataset')
     parser.add_argument('--egobrain_delta_whiten_g0', type=float, default=1.0,
                         help='ME->MI delta-whitening DC gain: per-channel low-freq gain at 0 Hz, '
@@ -395,6 +418,17 @@ def main():
     parser.add_argument('--egobrain_emb_grid_dir', type=str, default=None,
                         help='override the time-keyed embedding-grid cache dir; default '
                              'derives the cache_embeddings_grid_<enc>_g<g>_sz<sz> slug.')
+    parser.add_argument('--egobrain_video_subjects', type=str, default=None,
+                        help='Which EgoBrain subjects may contribute VIDEO (frames / '
+                             'embeddings / hand-labels / motion resampling). Accepts '
+                             '"all" (default: every subject that has a cache file), '
+                             '"legacy24" (P0001-P0024 = the subjects that had video '
+                             'before EgoBrain released MP4s for P0025-P0040), or a '
+                             'comma-separated subject list. Blacklisted subjects keep '
+                             'has_image=False and contribute EEG-only losses, exactly '
+                             'as before their video existed. Use "legacy24" to '
+                             'reproduce pre-release results bit-for-bit while the new '
+                             'subjects\' caches sit on disk.')
     parser.add_argument('--egobrain_motion_resample', action='store_true', default=False,
                         help='with --egobrain_use_frame_grid, bias the random anchor draw '
                              'toward visually DYNAMIC moments instead of uniform-in-time. '
@@ -739,6 +773,7 @@ def main():
             temporal_jitter=not params.egobrain_no_temporal_jitter,
             use_grid_embeddings=params.egobrain_use_grid_embeddings,
             emb_grid_dir=params.egobrain_emb_grid_dir,
+            video_subjects=_resolve_video_subjects(params.egobrain_video_subjects),
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
@@ -827,6 +862,7 @@ def main():
             temporal_jitter=not params.egobrain_no_temporal_jitter,
             use_grid_embeddings=params.egobrain_use_grid_embeddings,
             emb_grid_dir=params.egobrain_emb_grid_dir,
+            video_subjects=_resolve_video_subjects(params.egobrain_video_subjects),
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,
@@ -896,6 +932,7 @@ def main():
             temporal_jitter=not params.egobrain_no_temporal_jitter,
             use_grid_embeddings=params.egobrain_use_grid_embeddings,
             emb_grid_dir=params.egobrain_emb_grid_dir,
+            video_subjects=_resolve_video_subjects(params.egobrain_video_subjects),
             ea_matrices=ea_egobrain,
             delta_whiten_g0=params.egobrain_delta_whiten_g0,
             delta_whiten_cutoff_hz=params.egobrain_delta_whiten_cutoff_hz,

@@ -1,21 +1,36 @@
-"""Offline extractor: per-slot HAND-MOVEMENT intensity for EgoBrain on a
+"""Offline extractor: RAW per-slot HAND-MOVEMENT speed for EgoBrain on a
 CONTINUOUS, time-keyed grid (one value every ``grid_s`` seconds of EEG-clock
 time), one per-subject HDF5 file.
 
 This is the knob-agnostic successor to :mod:`datasets.egobrain_hand_labels`.
 The clip-keyed extractor stored intensities at the fixed ``(clip, window)``
 positions implied by ``window_s / stride_s / erp_latency_s / n_windows /
-clip_s`` — which are exactly the knobs :class:`EgoBrainDataset` bakes into the
-LEGACY clip path. Under ``--egobrain_use_frame_grid`` the dataset instead
-samples EEG windows at arbitrary 0.2 s-snapped offsets across the whole
-recording and looks up each window's frame by ABSOLUTE EEG-clock slot; the
-clip-keyed labels can't be indexed that way, so the aux objective silently
-trains on nothing. This extractor keys the labels the SAME way the grid frames
-are keyed (slot ``k`` <-> EEG-clock time ``k*grid_s``), so
-``EgoBrainDataset._read_grid_hand_labels`` can read them at each window's frame
-slot — exactly as ``_read_grid_embeddings`` reads the grid DINOv2 embeddings.
+clip_s``. Under ``--egobrain_use_frame_grid`` the dataset instead samples EEG
+windows at arbitrary 0.2 s-snapped offsets across the whole recording and looks
+up each window's frame by ABSOLUTE EEG-clock slot; the clip-keyed labels can't
+be indexed that way, so the aux objective silently trains on nothing. This
+extractor keys the labels the SAME way the grid frames are keyed (slot ``k``
+<-> EEG-clock time ``k*grid_s``), so ``EgoBrainDataset._read_grid_hand_labels``
+can read them at each window's frame slot — exactly as ``_read_grid_embeddings``
+reads the grid DINOv2 embeddings.
 
-Design (two passes per subject):
+NO SMOOTHING / NO TEMPORAL AVERAGING (format_version 2). ``left_intensity[s]``
+is the RAW ego-compensated, scale-normalised hand speed over the SINGLE pair of
+adjacent grid frames ``(s, s+1)`` — i.e. the FORWARD interval
+``[s*grid_s, (s+1)*grid_s]``, ``dt = grid_s``:
+
+  * FORWARD, not centred/backward, because the EEG window this target is
+    regressed from starts at ``frame + erp`` (with the current
+    ``erp_latency_s=-0.15`` that is ``frame + 0.15 s``), so the forward interval
+    is the only adjacent pair that overlaps the EEG window at all.
+  * Because the RAW per-pair speeds are stored, ANY other convention is
+    derivable offline with numpy and NO WiLoR rerun: the backward interval at
+    slot ``s`` is ``left_intensity[s-1]``; a centred ``W``-slot moving average is
+    ``np.nanmean`` over ``left_intensity[s-W//2 : s+W//2]``; etc. (Format
+    version 1 pre-averaged over a ``hand_ref_s`` window and is NOT readable by
+    the current dataset — it is rejected on load.)
+
+Two passes per subject:
 
   1. WiLoR pass (expensive, GPU). Decode the video frame at each grid slot
      (slot ``k`` = EEG time ``k*grid_s`` -> video time ``k*grid_s -
@@ -25,43 +40,44 @@ Design (two passes per subject):
      consecutive slots, and the real per-pair dt. Streaming / batched so peak
      memory is one decode batch, not the whole recording.
 
-  2. Aggregation pass (cheap, numpy). For each slot ``s`` the stored intensity
-     is the ego-compensated, scale-normalised hand speed over a FIXED
-     ``hand_ref_s``-second window of slots CENTRED on ``s`` — computed by the
-     same tested :func:`datasets.egobrain_hand_labels._hand_speed` over that
-     slot window. Because a slice of the per-slot ``track/ego/dts`` arrays is a
-     valid ``_hand_speed`` input, this reuses the clip-path motion logic
-     verbatim; only the KEYING (per absolute slot, not per ``(clip, window)``)
-     differs. ``hand_ref_s`` is the ONLY window knob baked into the cache — it
-     is independent of the training window/stride/erp/n_windows, matching the
-     grid philosophy.
+  2. Aggregation pass (cheap, numpy). ``aggregate_grid_raw`` turns the per-slot
+     tracks into the single-pair speed at each slot, via the same tested
+     :func:`datasets.egobrain_hand_labels._hand_speed` applied to a 2-slot
+     slice. Only the KEYING (per absolute slot, not per ``(clip, window)``)
+     differs from the clip path.
 
 Output layout (a NEW cache dir; never touches raw data, the EEG cache, the
 frame cache, or the clip-keyed hand cache — and refuses to overwrite a
 per-subject file built with a different config unless ``--overwrite``):
 
-    <data_dir>/cache_hand_labels_grid_<backend>_g<grid_s>_r<hand_ref_s>_fs<fs>/
+    <data_dir>/cache_hand_labels_grid_<backend>_g<grid_s>_raw_fs<fs>/
         grid_label_mapping.json     provenance + config
         <subject>.h5
-            left_intensity   (n_slots,) float32 hand-lengths/s (NaN = unmeasurable)
+            left_intensity   (n_slots,) float32 hand-lengths/s over [s, s+1]
+                                       (NaN = unmeasurable: a frame missing, the
+                                        hand undetected in either frame, or no
+                                        valid dt). Last slot is always NaN.
             right_intensity  (n_slots,) float32
-            left_det_frac    (n_slots,) float32 frac slots in the ref window with left hand seen
-            right_det_frac   (n_slots,) float32
-            has_video        (n_slots,) bool    this slot's frame decoded in-bounds
-            attrs: full config + backend + grid_s + hand_ref_s + n_slots
+            left_det         (n_slots,) bool  left hand detected AT slot s
+            right_det        (n_slots,) bool
+            has_video        (n_slots,) bool  this slot's frame decoded in-bounds
+            attrs: full config + backend + grid_s + n_slots + format_version=2
+                   + speed_interval='forward' + smoothing='none'
 
 The slot grid (``n_slots``, slot<->time mapping, chapter routing) is IDENTICAL
 to :mod:`datasets.egobrain_extract_frames_grid` so the label at slot ``k`` lines
 up with the frame / embedding at slot ``k``. The dir name deliberately omits
-``vision_encoder`` / ``frame_size``: hand intensities come from the RAW GoPro
-video (WiLoR does its own preprocessing), not the EEG model's vision encoder.
+``vision_encoder`` / ``frame_size``: hand speeds come from the RAW GoPro video
+(WiLoR does its own preprocessing), not the EEG model's vision encoder.
+
+All 40 subjects ship video as of the 2026-07 EgoBrain update (P0025-P0040 gained
+it); subjects whose clips.json still reports no video are skipped as 'no_video'.
 
 Runs in the dedicated ``wilor`` env (see sh/install_wilor.sh), NOT cbramod.
 Invoke as a DIRECT script so datasets/__init__.py (training-only deps) isn't
 imported — this module needs none of it:
     python datasets/egobrain_extract_hand_labels_grid.py \\
-        --data_dir data/EgoBrain --subjects all \\
-        --grid_s 0.2 --hand_ref_s 1.0 --fs_out 200
+        --data_dir data/EgoBrain --subjects all --grid_s 0.2 --fs_out 200
 """
 
 from __future__ import annotations
@@ -91,7 +107,9 @@ except ImportError:                                         # direct script (wil
     )
 
 
-_FORMAT_VERSION = 1
+# 1 = legacy, pre-averaged over a hand_ref_s window (SMOOTHED; rejected on load)
+# 2 = raw single-pair forward speed, no temporal averaging
+_FORMAT_VERSION = 2
 
 
 # ===========================================================================
@@ -107,78 +125,67 @@ def n_slots_for(n_clips: int, clip_s: float, grid_s: float,
     return int(np.floor((total_duration_s + margin_s) / grid_s)) + 1
 
 
-def ref_window_radius(hand_ref_s: float, grid_s: float) -> int:
-    """Half-width ``R`` (in slots) of the intensity reference window: the
-    per-slot intensity averages the ego-compensated hand speed over the
-    ``2R+1`` slots centred on the slot (``2R`` consecutive-slot pairs, i.e.
-    ``2R*grid_s`` s of motion ~= ``hand_ref_s``). ``R>=1`` so at least one
-    pair exists."""
-    return max(1, int(round(hand_ref_s / (2.0 * grid_s))))
-
-
-def aggregate_grid(left_track: list, right_track: list,
-                   ego: list, dts: list, has_video: np.ndarray, *,
-                   grid_s: float, hand_ref_s: float) -> dict:
-    """Per-slot windowed hand intensities from the per-slot tracks.
+def aggregate_grid_raw(left_track: list, right_track: list,
+                       ego: list, dts: list, has_video: np.ndarray) -> dict:
+    """Per-slot RAW (unsmoothed) hand speed from the per-slot tracks.
 
     ``left_track[k]`` / ``right_track[k]`` are the :class:`Hand` (or ``None``)
     detected at slot ``k``; ``ego[k]`` is the background shift for the pair
     ``(k-1, k)`` (or ``None``); ``dts[k]`` is that pair's real elapsed time (or
     ``None`` when the slots aren't truly adjacent / a frame is missing). All
-    four are indexed by ABSOLUTE slot, so a slice ``[a:b]`` is a valid
-    ``_hand_speed`` input for the window ``[a, b)`` — this is why the clip-path
-    motion logic is reused verbatim.
+    are indexed by ABSOLUTE slot, so the 2-element slice ``[s:s+2]`` is a valid
+    ``_hand_speed`` input describing exactly the FORWARD pair ``(s, s+1)``:
+    inside ``_hand_speed`` the single pair ``k=1`` reads ``dts[s+1]`` /
+    ``ego[s+1]``, which by this module's convention IS the ``(s, s+1)`` pair.
+    That is why the clip-path motion logic is reused verbatim — no averaging.
 
-    Intensity at slot ``s`` = mean ego-compensated, scale-normalised speed over
-    the ``[s-R, s+R]`` slot window (``R = ref_window_radius``); ``NaN`` when the
-    window has no measurable pair (never seen / only non-adjacent frames),
-    distinct from ``0.0`` = seen and still — so the reader can mask it out.
-    Returns arrays keyed by slot: ``left_intensity`` / ``right_intensity``
-    (float32, NaN-where-unmeasurable), ``left_det_frac`` / ``right_det_frac``
-    (float32, fraction of the window's slots with that hand detected), and the
-    passed-through ``has_video``.
+    ``left_intensity[s]`` = that single pair's ego-compensated, scale-normalised
+    speed (hand-lengths/s over ``[s, s+1]``), or ``NaN`` when unmeasurable (a
+    frame missing, the hand undetected in either frame of the pair, or no valid
+    dt). The final slot has no forward pair and is always ``NaN``.
+    ``left_det[s]`` is whether the hand was detected AT slot ``s`` (per-slot,
+    not a windowed fraction). Returns arrays keyed by slot.
     """
     n = len(left_track)
-    R = ref_window_radius(hand_ref_s, grid_s)
     li = np.full(n, np.nan, np.float32)
     ri = np.full(n, np.nan, np.float32)
-    ldf = np.zeros(n, np.float32)
-    rdf = np.zeros(n, np.float32)
+    ldet = np.zeros(n, dtype=bool)
+    rdet = np.zeros(n, dtype=bool)
     for s in range(n):
-        a = max(0, s - R)
-        b = min(n, s + R + 1)
-        lt, rt = left_track[a:b], right_track[a:b]
-        eg, dt = ego[a:b], dts[a:b]
-        l_mean, _, l_pairs = _hand_speed(lt, eg, dt)
-        r_mean, _, r_pairs = _hand_speed(rt, eg, dt)
-        li[s] = l_mean if l_pairs >= 1 else np.nan
-        ri[s] = r_mean if r_pairs >= 1 else np.nan
-        span = b - a
-        ldf[s] = sum(h is not None for h in lt) / span if span else 0.0
-        rdf[s] = sum(h is not None for h in rt) / span if span else 0.0
+        ldet[s] = left_track[s] is not None
+        rdet[s] = right_track[s] is not None
+        if s + 2 > n:
+            continue                                  # last slot: no forward pair
+        eg, dt = ego[s:s + 2], dts[s:s + 2]
+        l_mean, _, l_pairs = _hand_speed(left_track[s:s + 2], eg, dt)
+        r_mean, _, r_pairs = _hand_speed(right_track[s:s + 2], eg, dt)
+        if l_pairs >= 1:
+            li[s] = l_mean
+        if r_pairs >= 1:
+            ri[s] = r_mean
     return {'left_intensity': li, 'right_intensity': ri,
-            'left_det_frac': ldf, 'right_det_frac': rdf,
+            'left_det': ldet, 'right_det': rdet,
             'has_video': np.asarray(has_video, dtype=bool)}
 
 
 def default_grid_out_dir(data_dir: str, backend: str, grid_s: float,
-                         hand_ref_s: float, fs_out: int) -> str:
+                         fs_out: int) -> str:
     """Cache dir; encodes only the knobs that change the stored values.
-    Deliberately omits vision_encoder/frame_size (labels come from the raw
-    video) and window/stride/erp/n_windows/clip_s (the point of the grid)."""
+    ``raw`` marks the unsmoothed (format 2) layout, distinguishing it from the
+    legacy ``_r<hand_ref_s>_`` window-averaged dirs. Deliberately omits
+    vision_encoder/frame_size (labels come from the raw video) and
+    window/stride/erp/n_windows/clip_s (the point of the grid)."""
     return os.path.join(
         data_dir,
-        f'cache_hand_labels_grid_{backend}_g{grid_s}_r{hand_ref_s}_fs{fs_out}')
+        f'cache_hand_labels_grid_{backend}_g{grid_s}_raw_fs{fs_out}')
 
 
 # All config keys that determine the stored arrays — used to refuse silently
 # reusing a sidecar built with a different config (mirrors the clip-keyed
-# _config_mismatch). move_thresh/min_det_frac are NOT here: the grid cache
-# stores only the CONTINUOUS intensity (no discrete label), which is
-# threshold-independent.
-_CONFIG_KEYS = ('backend', 'grid_s', 'hand_ref_s', 'fs_out', 'clip_s',
-                'margin_s', 'handedness_source', 'ego_compensate',
-                'max_frame_width')
+# _config_mismatch). No move_thresh/min_det_frac: the grid cache stores only the
+# CONTINUOUS speed (no discrete label), which is threshold-independent.
+_CONFIG_KEYS = ('backend', 'grid_s', 'fs_out', 'clip_s', 'margin_s',
+                'handedness_source', 'ego_compensate', 'max_frame_width')
 
 
 def _config_mismatch(out_path: str, cfg: dict) -> Optional[str]:
@@ -189,7 +196,8 @@ def _config_mismatch(out_path: str, cfg: dict) -> Optional[str]:
     except OSError as e:
         return f'unreadable ({e})'
     if int(attrs.get('format_version', -1)) != _FORMAT_VERSION:
-        return f'format_version {attrs.get("format_version")} != {_FORMAT_VERSION}'
+        return (f'format_version {attrs.get("format_version")} != '
+                f'{_FORMAT_VERSION} (v1 was window-averaged / smoothed)')
     for k in _CONFIG_KEYS:
         if k not in attrs:
             return f'{k} missing'
@@ -261,7 +269,7 @@ def process_subject(sub: str, cfg: dict, estimator: Optional[HandEstimator]
     n_clips = int(meta['n_clips'])
     video_info = meta.get('video')
     if video_info is None:
-        return {'subject': sub, 'status': 'no_video'}         # P0025-P0040
+        return {'subject': sub, 'status': 'no_video'}
     chapters = build_chapters(video_info, data_dir)
     if not chapters:
         return {'subject': sub, 'status': 'no usable video chapters'}
@@ -322,7 +330,9 @@ def process_subject(sub: str, cfg: dict, estimator: Optional[HandEstimator]
         del vr_meta
         gc.collect()
         # Rolling previous VALID slot (gray + hand bboxes + frame index), reset
-        # per chapter so no pair straddles a chapter boundary or an OOB gap.
+        # per chapter so no pair straddles a chapter boundary or an OOB gap
+        # (slots k/k+1 across a boundary live in different video files, so their
+        # frame indices are not comparable).
         prev_gray = prev_fidx = prev_slot = None
         for start in range(0, len(wanted), decode_batch):
             chunk = wanted[start:start + decode_batch]
@@ -360,8 +370,7 @@ def process_subject(sub: str, cfg: dict, estimator: Optional[HandEstimator]
                       f'frames ({pct:.0f}%)', flush=True)
         gc.collect()
 
-    arrays = aggregate_grid(left_track, right_track, ego, dts, has_video,
-                            grid_s=grid_s, hand_ref_s=cfg['hand_ref_s'])
+    arrays = aggregate_grid_raw(left_track, right_track, ego, dts, has_video)
     _write_subject(out_path, cfg, arrays, sub, n_clips, n_slots, clip_s,
                    video_offset_s)
     return {'subject': sub, 'status': 'ok', 'n_clips': n_clips,
@@ -382,9 +391,13 @@ def _write_subject(out_path, cfg, arrays, sub, n_clips, n_slots, clip_s,
         h.attrs['n_slots'] = n_slots
         h.attrs['clip_s'] = clip_s
         h.attrs['video_offset_s'] = video_offset_s
-        for k in ('backend', 'grid_s', 'hand_ref_s', 'fs_out', 'margin_s',
+        for k in ('backend', 'grid_s', 'fs_out', 'margin_s',
                   'handedness_source', 'ego_compensate', 'max_frame_width'):
             h.attrs[k] = cfg[k]
+        # Explicit temporal semantics so a reader can never mistake this for the
+        # legacy window-averaged layout.
+        h.attrs['speed_interval'] = 'forward'      # slot s == pair (s, s+1)
+        h.attrs['smoothing'] = 'none'
         h.attrs['format_version'] = _FORMAT_VERSION
     os.replace(tmp, out_path)
 
@@ -411,12 +424,8 @@ def main():
     # the frame/embedding grid so the label slot indexes line up.
     p.add_argument('--grid_s', type=float, default=0.2,
                    help='time-grid spacing (s); MUST match the frame grid '
-                        '(--egobrain_frame_grid_s) so slot k aligns 1:1')
-    p.add_argument('--hand_ref_s', type=float, default=1.0,
-                   help='reference window (s) the per-slot intensity averages '
-                        'hand speed over, centred on the slot; the only window '
-                        'knob baked into the cache (training window/stride/erp/'
-                        'n_windows do NOT affect it)')
+                        '(--egobrain_frame_grid_s) so slot k aligns 1:1. Also '
+                        'the dt of the stored per-pair speed.')
     p.add_argument('--margin_s', type=float, default=2.0,
                    help='extra seconds of slots past the EEG end (must match '
                         'the frame grid so n_slots agrees)')
@@ -451,10 +460,10 @@ def main():
             torch.cuda.init()
 
     out_dir = args.out_dir or default_grid_out_dir(
-        args.data_dir, args.backend, args.grid_s, args.hand_ref_s, args.fs_out)
+        args.data_dir, args.backend, args.grid_s, args.fs_out)
     cfg = dict(
         data_dir=args.data_dir, out_dir=out_dir, backend=args.backend,
-        grid_s=args.grid_s, hand_ref_s=args.hand_ref_s, margin_s=args.margin_s,
+        grid_s=args.grid_s, margin_s=args.margin_s,
         clip_s=args.clip_s, fs_out=args.fs_out,
         handedness_source=args.handedness_source,
         ego_compensate=not args.no_ego_compensate,
@@ -471,11 +480,16 @@ def main():
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, 'grid_label_mapping.json'), 'w') as f:
-        json.dump({'note': 'time-keyed (grid) per-slot continuous hand-movement '
-                           'intensity; slot k <-> EEG time k*grid_s, aligned 1:1 '
-                           'with the frame/embedding grid. Read by '
-                           'EgoBrainDataset._read_grid_hand_labels under '
-                           '--egobrain_use_frame_grid.',
+        json.dump({'note': 'time-keyed (grid) RAW per-slot hand speed; slot k '
+                           '<-> EEG time k*grid_s, aligned 1:1 with the frame/'
+                           'embedding grid. left_intensity[s] = ego-compensated, '
+                           'scale-normalised speed over the FORWARD pair '
+                           '(s, s+1), dt=grid_s. NO temporal averaging: any '
+                           'window/centering is derivable offline from these raw '
+                           'values. Read by EgoBrainDataset.'
+                           '_read_grid_hand_labels under --egobrain_use_frame_grid.',
+                   'format_version': _FORMAT_VERSION,
+                   'speed_interval': 'forward', 'smoothing': 'none',
                    'config': {k: cfg[k] for k in cfg if k != 'data_dir'}}, f,
                   indent=2)
     print(f'[hand-labels-grid] {len(subjects)} subject(s) → {out_dir}')

@@ -401,6 +401,73 @@ def test_grid_embeddings_require_frame_grid():
                 use_frame_grid=False, use_grid_embeddings=True)
 
 
+def test_video_subjects_whitelist_blocks_frames():
+    """A blacklisted subject must behave exactly as if it had no video: zeros +
+    has_image all-False, even though its frame cache file exists on disk. This
+    is the backward-compat lever for EgoBrain's newly-released P0025-P0040."""
+    with tempfile.TemporaryDirectory() as root:
+        # allowed: reads the grid frame cache -> has_image True
+        ds_on = _grid_dataset(root, temporal_jitter=False)
+        s_on = ds_on[0]
+        assert bool(s_on['has_image'].any())
+        assert torch.count_nonzero(s_on['pixel_values']) > 0
+
+        # blacklisted (whitelist excludes P0001) -> no frames despite cache file
+        _seed_identity_normalize()
+        ds_off = EgoBrainDataset(
+            data_dir=root, subjects=['P0001'], in_dim=40, n_windows=2,
+            window_s=1.0, stride_s=1.0, clip_s=CLIP_S, fs_out=FS,
+            erp_latency_s=0.5, vision_encoder=ENC, frame_size=SZ,
+            use_frame_grid=True, frame_grid_s=0.2, max_channels=32,
+            temporal_jitter=False, video_subjects=['P9999'])
+        s_off = ds_off[0]
+        assert not bool(s_off['has_image'].any()), 'blacklisted subject leaked video'
+        assert torch.count_nonzero(s_off['pixel_values']) == 0
+        # EEG is unaffected by the whitelist
+        assert torch.equal(s_on['timeseries'], s_off['timeseries'])
+
+
+def test_video_subjects_whitelist_blocks_grid_embeddings():
+    """Same guarantee on the grid-embedding path: no frame_* tensors emitted."""
+    with tempfile.TemporaryDirectory() as root:
+        ds_on = _grid_emb_dataset(root)
+        assert 'frame_grid' in ds_on[0] and bool(ds_on[0]['has_image'].any())
+    with tempfile.TemporaryDirectory() as root:
+        ds_off = _grid_emb_dataset(root, video_subjects=['P9999'])
+        s = ds_off[0]
+        assert 'frame_grid' not in s, 'blacklisted subject emitted cached embeddings'
+        assert not bool(s['has_image'].any())
+
+
+def test_whitelist_mixed_batch_collates():
+    """A batch mixing an allowed and a blacklisted subject must still stack:
+    pixel_values shape is decided by the MODE (1x1 placeholder under
+    use_grid_embeddings), never per-subject. Guards the exact regression where
+    the blacklisted row fell into the full-size branch."""
+    with tempfile.TemporaryDirectory() as root:
+        for s in ('P0001', 'P0002'):
+            _make_eeg_cache(root, s)
+            _make_grid_frame_cache(root, s)
+            _make_grid_emb_cache(root, s)
+        ds = EgoBrainDataset(
+            data_dir=root, subjects=['P0001', 'P0002'], in_dim=40, n_windows=2,
+            window_s=1.0, stride_s=1.0, clip_s=CLIP_S, fs_out=FS,
+            erp_latency_s=0.5, vision_encoder=ENC, frame_size=SZ,
+            use_frame_grid=True, use_grid_embeddings=True, frame_grid_s=0.2,
+            max_channels=32, temporal_jitter=False,
+            video_subjects=['P0001'])          # P0002 blacklisted
+        a, b = ds[0], ds[N_CLIPS]              # P0001 clip0, P0002 clip0
+        assert a['subject'] == 'P0001' and b['subject'] == 'P0002'
+        assert a['pixel_values'].shape == b['pixel_values'].shape  # <- the bug
+        assert bool(a['has_image'].any()) and not bool(b['has_image'].any())
+        assert 'frame_grid' in a and 'frame_grid' not in b
+        batch = collate_egobrain([a, b])       # must not raise
+        assert batch['frame_grid'].shape[0] == 2
+        # blacklisted row is zero-filled by collate
+        assert torch.count_nonzero(batch['frame_grid'][1]) == 0
+        assert torch.count_nonzero(batch['frame_grid'][0]) > 0
+
+
 def test_grid_incompatible_with_embeddings():
     with tempfile.TemporaryDirectory() as root:
         _make_eeg_cache(root, 'P0001')
@@ -444,23 +511,26 @@ def test_legacy_path_unchanged_when_grid_off():
 # Time-keyed grid HAND labels (datasets/egobrain_extract_hand_labels_grid.py)
 # --------------------------------------------------------------------------
 
-def _make_grid_hand_cache(root, sub, grid_s=0.2, hand_ref_s=1.0, n_slots=80,
-                          fs=FS):
-    """Time-keyed grid hand cache: slot k holds left_intensity=k,
-    right_intensity=k+1000 so the fetched slot is recoverable per column, plus
-    an all-True has_video. Written under the real default_grid_out_dir slug."""
-    d = default_grid_out_dir(root, 'wilor', grid_s, hand_ref_s, fs)
+def _make_grid_hand_cache(root, sub, grid_s=0.2, n_slots=80, fs=FS,
+                          format_version=2):
+    """Time-keyed grid hand cache (format 2 = RAW single-pair forward speed):
+    slot k holds left_intensity=k, right_intensity=k+1000 so the fetched slot is
+    recoverable per column, plus an all-True has_video. Written under the real
+    default_grid_out_dir slug."""
+    d = default_grid_out_dir(root, 'wilor', grid_s, fs)
     os.makedirs(d, exist_ok=True)
     li = np.arange(n_slots, dtype=np.float32)
     ri = np.arange(n_slots, dtype=np.float32) + 1000.0
     with h5py.File(os.path.join(d, f'{sub}.h5'), 'w') as h:
         h.create_dataset('left_intensity', data=li)
         h.create_dataset('right_intensity', data=ri)
-        h.create_dataset('left_det_frac', data=np.ones(n_slots, np.float32))
-        h.create_dataset('right_det_frac', data=np.ones(n_slots, np.float32))
+        h.create_dataset('left_det', data=np.ones(n_slots, bool))
+        h.create_dataset('right_det', data=np.ones(n_slots, bool))
         h.create_dataset('has_video', data=np.ones(n_slots, bool))
         h.attrs['grid_s'] = grid_s
-        h.attrs['hand_ref_s'] = hand_ref_s
+        h.attrs['format_version'] = format_version
+        h.attrs['speed_interval'] = 'forward'
+        h.attrs['smoothing'] = 'none'
     return d
 
 
@@ -508,7 +578,7 @@ def test_grid_hand_labels_nan_and_oob_masked():
 def test_grid_hand_labels_absent_subject_zeros():
     # No grid hand h5 for the subject -> zeros / all-invalid (aux masks it).
     with tempfile.TemporaryDirectory() as root:
-        hg = default_grid_out_dir(root, 'wilor', 0.2, 1.0, FS)
+        hg = default_grid_out_dir(root, 'wilor', 0.2, FS)
         os.makedirs(hg, exist_ok=True)                       # empty dir (isdir True)
         ds = _grid_dataset(root, temporal_jitter=False, hand_grid_dir=hg)
         s = ds[0]
@@ -556,6 +626,15 @@ def test_grid_hand_grid_s_mismatch_raises():
         with pytest.raises(ValueError, match='grid_s'):
             _grid_dataset(root, temporal_jitter=False, hand_grid_dir=hg,
                           frame_grid_s=0.2)                      # dataset wants 0.2
+
+
+def test_legacy_smoothed_v1_hand_cache_rejected():
+    # v1 stored a hand_ref_s WINDOW-AVERAGED speed; the reader expects the raw
+    # single-pair forward speed. Must fail loud, not silently read wrong values.
+    with tempfile.TemporaryDirectory() as root:
+        hg = _make_grid_hand_cache(root, 'P0001', format_version=1)
+        with pytest.raises(ValueError, match='format_version'):
+            _grid_dataset(root, temporal_jitter=False, hand_grid_dir=hg)
 
 
 if __name__ == '__main__':

@@ -179,6 +179,13 @@ class BrainEmbedEEGLayer(nn.Module):
             fmap_cat = torch.cat(fmap_outputs, dim=1)
             fmap_out = fmap_cat.squeeze(-1).permute(0, 2, 1).reshape(batch, T, n_electrodes, self.dim_out)
             fmap_out = fmap_out.permute(0, 2, 1, 3)
+            # Treat all channels as a single region: the computed feature map IS
+            # the output. (Previously this branch fell through to `return output`
+            # — the pre-allocated zeros — so BrainEmbedEEGLayer(x, area_config=None)
+            # silently returned 0. Callers that build a real area_config (CSBrain,
+            # channel_causal, llm_vq, our_model) never hit this branch; only the
+            # coordinate-driven CSBrainAlign passes area_config=None.)
+            output = fmap_out
         else:
             for region_key, region_info in area_config.items():
                 if region_key not in self.region_blocks:

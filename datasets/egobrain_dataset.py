@@ -209,6 +209,7 @@ class EgoBrainDataset(Dataset):
         jitter_seed: Optional[int] = None,
         use_grid_embeddings: bool = False,
         emb_grid_dir: Optional[str] = None,
+        video_subjects: Optional[Sequence[str]] = None,
         ea_matrices: Optional[dict] = None,
         delta_whiten_g0: float = 1.0,
         delta_whiten_cutoff_hz: float = 8.0,
@@ -223,6 +224,19 @@ class EgoBrainDataset(Dataset):
         super().__init__()
         self.data_dir = data_dir
         self.subjects = list(subjects)
+        # Whitelist of subjects allowed to contribute VIDEO (frames/embeddings/
+        # hand-labels/motion). None = every subject that has a cache file.
+        #
+        # Why this exists: has_image is derived purely from per-subject cache
+        # FILE EXISTENCE, so the moment a previously-video-less subject gains a
+        # cache it silently starts contributing to image-alignment, flip-align,
+        # band-align and the world-model frame objective. EgoBrain released
+        # video for P0025-P0040 after the first 24 were cached, so pass the
+        # original 24 here to reproduce pre-release results bit-for-bit while
+        # the new caches sit on disk. Blacklisted subjects keep has_image=False
+        # (EEG-only losses), exactly as before their video existed.
+        self.video_subjects = (None if video_subjects is None
+                               else set(video_subjects))
         self.in_dim = in_dim
         self.n_windows = n_windows
         self.window_samples = int(round(window_s * fs_out))
@@ -316,8 +330,11 @@ class EgoBrainDataset(Dataset):
         # clip-keyed frame cache. When enabled, __getitem__ samples an EEG
         # window at an arbitrary frame_grid_s-snapped offset across the WHOLE
         # continuous recording (no 4 s clip boundary) and looks up the aligned
-        # frame by ABSOLUTE EEG-clock time (slot = round((window_centre + erp)
-        # / frame_grid_s)). erp/window/stride are applied here at lookup, not
+        # frame by ABSOLUTE EEG-clock time. NOTE: the path is START-anchored, so
+        # the slot is round((window_START + erp) / frame_grid_s) (see
+        # _getitem_grid L1096-1103), NOT window_centre; the physical
+        # frame_time - window_centre offset is therefore erp - window_s/2, i.e.
+        # -0.65 s at erp=-0.15, not -0.15 s. erp/window/stride are applied here at lookup, not
         # baked into the cache. Off by default -> the existing clip-keyed path
         # below is used verbatim (so prior results reproduce bit-for-bit).
         self.use_frame_grid = bool(use_frame_grid)
@@ -580,6 +597,12 @@ class EgoBrainDataset(Dataset):
     def _clip_path(self, sub: str, c: int) -> str:
         return os.path.join(self.cache_dir, sub, f'{c}.npy')
 
+    def _video_allowed(self, sub: str) -> bool:
+        """Whether ``sub`` may contribute video (frames / embeddings / hand
+        labels / motion). Gates every per-subject video cache open, so a
+        blacklisted subject behaves exactly as if it had no video at all."""
+        return self.video_subjects is None or sub in self.video_subjects
+
     def _select_and_whiten(self, arr: np.ndarray, sub: str) -> np.ndarray:
         """Channel-select (keep_mask) -> optional EA whitening -> optional
         delta-whitening. Shared verbatim by the clip-keyed (``_load_clip``)
@@ -728,9 +751,13 @@ class EgoBrainDataset(Dataset):
         n_weighted = 0
         ess_fracs = []
         for sub in self.subjects:
-            mot = load_or_compute_motion(
+            # A video-blacklisted subject must sample anchors uniformly, exactly
+            # as it did before it had video — otherwise its motion cache would
+            # still reweight the draw and prior results wouldn't reproduce.
+            mot = (load_or_compute_motion(
                 emb_dir, sub, motion_step, self.motion_resample_metric, space,
                 frames_grid_dir=frames_dir)
+                if self._video_allowed(sub) else None)
             if mot is None:
                 self._anchor_cdf[sub] = None
                 continue
@@ -875,7 +902,8 @@ class EgoBrainDataset(Dataset):
             dtype=torch.float32)
         has_image = torch.zeros(self.n_windows, dtype=torch.bool)
         used_cache = False
-        if self.load_frames and self.use_frames_cache:
+        if (self.load_frames and self.use_frames_cache
+                and self._video_allowed(sub)):
             # Fast path: read pre-decoded uint8 frames from the per-subject
             # HDF5 cache. Frames were stored after HF-equivalent resize +
             # center-crop, so all that's left here is rescale to [0,1]
@@ -893,7 +921,15 @@ class EgoBrainDataset(Dataset):
                 pixel_values = x
                 has_image = torch.from_numpy(np.asarray(ok)).bool()
                 used_cache = True
-        if self.load_frames and not used_cache:
+        # Live GoPro decode fallback. Reachable ONLY when no frame-cache dir is
+        # configured. If a cache dir exists but this subject has no file in it,
+        # that means "no frames for this subject" -- NOT "go decode 4-5 GB MP4s
+        # in a DataLoader worker". This matters now that clips.json carries
+        # chapters for the newly-released P0025-P0040: before the refresh their
+        # chapter list was empty so this branch was a silent no-op, and it must
+        # stay one until their frames are actually extracted.
+        if (self.load_frames and not used_cache and not self.use_frames_cache
+                and self._video_allowed(sub)):
             chapters = self._video_chapters(sub)
             if chapters:
                 # For each window, find which GoPro chapter holds the
@@ -938,7 +974,7 @@ class EgoBrainDataset(Dataset):
         # masks match exactly what was embedded. pixel_values are still returned
         # below (harmless; the model prefers the cached tensors when present).
         frame_emb = None
-        if self.use_emb_cache:
+        if self.use_emb_cache and self._video_allowed(sub):
             emb_path = os.path.join(self.emb_cache_dir, f'{sub}.h5')
             if os.path.exists(emb_path):
                 he = _get_h5_emb_handle(emb_path)
@@ -959,7 +995,7 @@ class EgoBrainDataset(Dataset):
         # intensity, with a per-column valid mask (undetected hand -> NaN -> 0 +
         # invalid, so the regression loss skips it). Zeros + all-invalid when no
         # hand-label cache is configured (then the aux loss masks this row out).
-        if self.use_hand_labels:
+        if self.use_hand_labels and self._video_allowed(sub):
             hand_targets, hand_valid = self._load_hand_labels(sub, c)
         else:
             hand_targets = torch.zeros(self.n_windows, 2, dtype=torch.float32)
@@ -1007,11 +1043,17 @@ class EgoBrainDataset(Dataset):
             tgt, val = tgt[:W], val[:W]
         return torch.from_numpy(tgt).float(), torch.from_numpy(val).bool()
 
+    # Layout the reader understands: raw single-pair forward speed, no temporal
+    # averaging. v1 pre-averaged over a ``hand_ref_s`` window (smoothed) and has
+    # different value semantics, so it is rejected rather than silently read.
+    HAND_GRID_FORMAT_VERSION = 2
+
     def _validate_hand_grid_spacing(self) -> None:
         """Fail loud if the grid hand cache's ``grid_s`` differs from this
-        dataset's ``frame_grid_s``. A mismatch shifts every slot index and
-        silently misaligns the labels against the frames — the exact bug the
-        grid path exists to avoid. Peeks the first built subject's attr."""
+        dataset's ``frame_grid_s`` (a mismatch shifts every slot index and
+        silently misaligns labels against frames — the exact bug the grid path
+        exists to avoid), or if it is the legacy SMOOTHED v1 layout. Peeks the
+        first built subject's attrs."""
         import h5py
         for sub in self.subjects:
             path = os.path.join(self.hand_grid_dir, f'{sub}.h5')
@@ -1019,6 +1061,15 @@ class EgoBrainDataset(Dataset):
                 continue
             with h5py.File(path, 'r') as h:
                 gs = h.attrs.get('grid_s')
+                fv = int(h.attrs.get('format_version', -1))
+            if fv != self.HAND_GRID_FORMAT_VERSION:
+                raise ValueError(
+                    f"[EgoBrain] hand grid cache '{path}' has format_version="
+                    f"{fv}, expected {self.HAND_GRID_FORMAT_VERSION}. v1 stored a "
+                    f"hand_ref_s WINDOW-AVERAGED (smoothed) speed; the current "
+                    f"reader expects the RAW single-pair forward speed. Rebuild "
+                    f"with datasets/egobrain_extract_hand_labels_grid.py — its "
+                    f"default out_dir now ends in '_raw_fs{self.fs_out}'.")
             if gs is None:
                 raise ValueError(
                     f"[EgoBrain] hand grid cache '{path}' has no grid_s attr; "
@@ -1112,13 +1163,19 @@ class EgoBrainDataset(Dataset):
             # zeros, pinned + copied H2D, never read). Keep a 1x1 placeholder so
             # pixel_values_future's window axis + the image_encoder_inputs gate
             # survive; the model reads frame_grid_future / frame_cls instead.
+            #
+            # NOTE: the placeholder shape is decided by the MODE, not by
+            # _video_allowed(sub) — a batch mixing allowed and blacklisted
+            # subjects must still stack, so only the embedding READ is gated.
             pixel_values = torch.zeros(self.n_windows, 3, 1, 1, dtype=torch.float32)
-            frame_emb = self._read_grid_embeddings(sub, frame_slots, has_image)
+            if self._video_allowed(sub):
+                frame_emb = self._read_grid_embeddings(sub, frame_slots, has_image)
         else:
             pixel_values = torch.zeros(
                 self.n_windows, 3, self.frame_size, self.frame_size,
                 dtype=torch.float32)
-            if self.load_frames and self.use_frame_grid:
+            if (self.load_frames and self.use_frame_grid
+                    and self._video_allowed(sub)):
                 # Frames from the time-keyed frame grid (live encode downstream).
                 gpath = os.path.join(self.frame_grid_dir, f'{sub}.h5')
                 if os.path.exists(gpath):
@@ -1143,7 +1200,7 @@ class EgoBrainDataset(Dataset):
         # in __init__). Absent grid cache -> zeros / all-invalid (aux masks it).
         hand_targets = torch.zeros(self.n_windows, 2, dtype=torch.float32)
         hand_valid = torch.zeros(self.n_windows, 2, dtype=torch.bool)
-        if self.use_hand_grid:
+        if self.use_hand_grid and self._video_allowed(sub):
             hg = self._read_grid_hand_labels(sub, frame_slots)
             if hg is not None:
                 hand_targets, hand_valid = hg

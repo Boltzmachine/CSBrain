@@ -33,6 +33,34 @@ def _normalize_ch_name(name):
     return name
 
 
+def _eeg_region_of(name):
+    """Map a 10-20 channel name to a coarse brain-region id (frontal/central/
+    parietal/occipital/temporal), used to region-GROUP channels before the
+    BrainEmbedEEGLayer spatial conv (the analogue of CSBrain's ``sorted_indices``).
+
+    Region ids follow the pretrain topology convention (frontal=0, parietal=1,
+    temporal=2, occipital=3, central=4). Padded channels sort last (999);
+    unrecognised names sort just before the pads (998). The exact region label
+    only sets conv ADJACENCY grouping, so an approximate prefix map is fine.
+    """
+    n = _normalize_ch_name(str(name))
+    if n in ('', 'PAD'):
+        return 999
+    # Order matters: check the two-letter prefixes (PO/FT/TP/CP/FC/AF/FP) before
+    # their one-letter parents so e.g. CP* lands in parietal, not central.
+    if n.startswith(('O', 'IZ', 'PO')):
+        return 3                                    # occipital
+    if n.startswith(('T', 'FT', 'TP')) or n in ('P7', 'P8', 'P9', 'P10'):
+        return 2                                    # temporal
+    if n.startswith(('P', 'CP')):
+        return 1                                    # parietal
+    if n.startswith(('C', 'FC')):
+        return 4                                    # central
+    if n.startswith(('F', 'AF', 'FP')):
+        return 0                                    # frontal
+    return 998                                      # unknown -> before pads
+
+
 def _get_homologous_name(norm_name):
     """Return the contralateral homologue of a normalized channel name.
 
@@ -822,9 +850,25 @@ class CSBrainAlign(nn.Module):
                  flip_n_col_bands=2, flip_motion_ref=0.0, flip_motion_min=0.0,
                  frame_averaging=False, frame_avg_flip_prob=0.5,
                  frame_avg_align_weight=1.0, frame_avg_recon_weight=1.0,
-                 aux_hand_pred=False, aux_hand_weight=0.1, aux_hand_dim=2):
+                 aux_hand_pred=False, aux_hand_weight=0.1, aux_hand_dim=2,
+                 use_brain_embed=False):
         super().__init__()
         self.d_model = d_model
+        # CSBrain spatial-mixing residual (models/CSBrain.py). When True, each
+        # encoder layer adds ``BrainEmbedEEGLayer(patch_emb) + patch_emb`` — a
+        # circular spatial conv across EEG channels — after the TemEmbed residual,
+        # and channels are region-GROUPED beforehand (the analogue of CSBrain's
+        # ``x = x[:, sorted_indices]``). CSBrain uses a fixed montage so the sort
+        # is a construction-time permutation; here (EgoBrain, variable per-subject
+        # channels) the region order is derived PER SAMPLE from ``ch_names``.
+        # Since ``self.area_config`` is None (coordinate-driven attention is
+        # permutation-equivariant over channels), BrainEmbedEEGLayer is the only
+        # channel-order-dependent op, so grouping it locally is equivalent to
+        # sorting ``x`` globally — but leaves the coord PE / masks / reconstruction
+        # target in the original channel order. Off by default (byte-identical).
+        self.use_brain_embed = use_brain_embed
+        # Per-sample region-sort permutations, cached by (ch_names tuple, C).
+        self._region_perm_cache = {}
         # Auxiliary objective: decode continuous per-hand movement intensity
         # (EgoBrain annotations) from the window's global rep. See
         # _hand_pred_losses + utils.util.hand_regression_loss.
@@ -871,6 +915,17 @@ class CSBrainAlign(nn.Module):
 
         # --- Source projector (operates on raw timeseries, before patch embedding) ---
         if self.project_to_source:
+            # SourceProjector.inverse() is applied to the d_model-wide TOKENS
+            # (see the reconstruction branch below) while the projector itself is
+            # built at raw-sample width in_dim. That conflation is only sound when
+            # the two coincide; fail loudly rather than in an opaque matmul.
+            if d_model != in_dim:
+                raise ValueError(
+                    f"project_to_source=True requires d_model == in_dim (got "
+                    f"d_model={d_model}, in_dim={in_dim}): SourceProjector is built "
+                    f"at raw-sample width in_dim but its inverse() consumes d_model-wide "
+                    f"tokens. Either set d_model == in_dim or disable project_to_source."
+                )
             self.source_projector = SourceProjector(
                 in_dim=in_dim,
                 num_sources=num_sources,
@@ -935,11 +990,14 @@ class CSBrainAlign(nn.Module):
 
         self.TemEmbed_kernel_sizes = TemEmbed_kernel_sizes
         kernel_sizes = self.TemEmbed_kernel_sizes
-        self.TemEmbedEEGLayer = TemEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim, kernel_sizes=kernel_sizes, stride=1, causal=causal)
+        # Both of these run as residuals on the d_model-wide token grid (see the
+        # encoder loops below), not on raw patches — so they are sized by d_model,
+        # not in_dim/out_dim. Identical whenever in_dim == out_dim == d_model.
+        self.TemEmbedEEGLayer = TemEmbedEEGLayer(dim_in=d_model, dim_out=d_model, kernel_sizes=kernel_sizes, stride=1, causal=causal)
 
         self.brain_regions = brain_regions
         self.area_config = None #generate_area_config(sorted(brain_regions))
-        self.BrainEmbedEEGLayer = BrainEmbedEEGLayer(dim_in=in_dim, dim_out=out_dim)
+        self.BrainEmbedEEGLayer = BrainEmbedEEGLayer(dim_in=d_model, dim_out=d_model)
         self.sorted_indices = sorted_indices
 
         # Frozen pretrained vision encoder. Behavior dispatches on
@@ -1498,6 +1556,11 @@ class CSBrainAlign(nn.Module):
         attention at the configured subset of layers."""
         for layer_idx in range(self.encoder.num_layers):
             h = self.TemEmbedEEGLayer(h) + h
+            if self.use_brain_embed:
+                # Bands are folded into the batch (B*K rows), so the per-sample
+                # ch_names sort can't be applied here — run BrainEmbed over the
+                # native channel order (all-channels circular conv).
+                h = self._brain_embed(h, None)
             h = self.encoder.layers[layer_idx](
                 h, self.area_config,
                 inter_window_attn_mask=iw_mask,
@@ -1986,14 +2049,20 @@ class CSBrainAlign(nn.Module):
                     [torch.ones_like(vlm[:, :1], dtype=torch.bool), vlm], dim=1)
         return patch_emb, vcm, vlm
 
-    def _frame_run_layers(self, patch_emb, layer_indices, vcm_g, vlm_g):
+    def _frame_run_layers(self, patch_emb, layer_indices, vcm_g, vlm_g,
+                          ch_names=None):
         """Run the given encoder layers (with the TemEmbed residual) on
         ``patch_emb`` (already has global rows). ``vcm_g``/``vlm_g`` are the
-        global-expanded masks from :meth:`_frame_add_context`."""
+        global-expanded masks from :meth:`_frame_add_context`. Frame averaging
+        over {I, P} produces (anti-)invariants for ANY base network T, so the
+        optional CSBrain BrainEmbed residual (``use_brain_embed``) may be added
+        inside T without disturbing the invariance/equivariance split."""
         inter_window = ~vlm_g if vlm_g is not None else None
         inter_region = ~vcm_g if vcm_g is not None else None
         for layer_idx in layer_indices:
             patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
+            if self.use_brain_embed:
+                patch_emb = self._brain_embed(patch_emb, ch_names)
             patch_emb = self.encoder.layers[layer_idx](
                 patch_emb, self.area_config,
                 inter_window_attn_mask=inter_window,
@@ -2065,8 +2134,8 @@ class CSBrainAlign(nn.Module):
         #    presented lateral half vs the opposite (hard-negative) one.
         emb_z, vcm_g, vlm_g = self._frame_add_context(z, ch_coords, vcm, vlm)
         emb_Pz, _, _ = self._frame_add_context(Pz, ch_coords, vcm, vlm)
-        a = self._frame_run_layers(emb_z, self._frame_backbone_layers, vcm_g, vlm_g)
-        b = self._frame_run_layers(emb_Pz, self._frame_backbone_layers, vcm_g, vlm_g)
+        a = self._frame_run_layers(emb_z, self._frame_backbone_layers, vcm_g, vlm_g, ch_names)
+        b = self._frame_run_layers(emb_Pz, self._frame_backbone_layers, vcm_g, vlm_g, ch_names)
         off = 1 if self.add_global else 0
         Pa = self._swap_channels(a, perm, channel_offset=off)
         Pb = self._swap_channels(b, perm, channel_offset=off)
@@ -2104,7 +2173,7 @@ class CSBrainAlign(nn.Module):
         # num_layers-1) applied ONCE to the frame-averaged backbone output h,
         # then proj_out. These layers are a decoder, not part of the equivariant
         # wrap.
-        dec = self._frame_run_layers(h, self._frame_recon_layers, vcm_g, vlm_g)
+        dec = self._frame_run_layers(h, self._frame_recon_layers, vcm_g, vlm_g, ch_names)
         out = self.proj_out(dec)
         if self.add_global:
             out = out[:, 1:, 1:, :]                             # (B, C, N, out_dim)
@@ -2244,6 +2313,19 @@ class CSBrainAlign(nn.Module):
             if weight is not None:
                 info['diag_flip_motion_weight'] = weight.mean().detach()
 
+        # Finetune / no-recon-target early exit. At finetune model_for_physio
+        # replaces proj_out with Identity, so ``out`` is d_model-wide (not
+        # out_dim-wide); the reconstruction branch below re-embeds ``out`` through
+        # the in_dim-wide patch_embedding, which only reshapes cleanly when
+        # d_model == in_dim — it crashes for d_model != in_dim checkpoints (e.g.
+        # wm-d80: d_model 80, in_dim 40). rep / global_rep / patch_tokens are
+        # already in ``info`` and the classifier uses only info['rep'], so skip
+        # the recon + pretraining-only diagnostics here. Gated identically to the
+        # alignment / flip-align branches above ('image_encoder_inputs' is present
+        # at pretraining, absent at finetune) so pretraining is unchanged.
+        if 'image_encoder_inputs' not in batch:
+            return out, info
+
         # Reconstruction, split by orientation under PER-SAMPLE flip. ``out``
         # reconstructs each row in its presented orientation: a flipped row
         # presents P(z) — which has no ground-truth flipped raw timeseries — so
@@ -2326,6 +2408,79 @@ class CSBrainAlign(nn.Module):
             'diag_hand_mae': mae,
             'diag_hand_valid_frac': batch['hand_valid'].float().mean().detach(),
         }
+
+    @staticmethod
+    def _region_order(names, C):
+        """Region-grouping order for one channel list: sort ``range(C)`` by
+        ``(region_id, original_index)`` (padded/unknown -> end). Returns a list."""
+        regions = [_eeg_region_of(names[j]) if j < len(names) else 999
+                   for j in range(C)]
+        return sorted(range(C), key=lambda j: (regions[j], j))
+
+    def _region_sort_perm(self, ch_names, C, device):
+        """Per-sample permutation that region-GROUPS the ``C`` real channels
+        (the analogue of CSBrain's ``x = x[:, sorted_indices]``, derived from
+        ``ch_names`` so it generalises to any montage). Sort key is
+        ``(region_id, original_index)`` so same-region channels become adjacent;
+        padded/unknown channels sort to the end.
+
+        Fast path (the common case — EgoBrain's fixed 32-ch montage, so EVERY row
+        is identical): the order is computed ONCE per montage, cached as a device
+        tensor, and returned as a ``(B, C)`` broadcast VIEW (``expand``, no copy).
+        This is what keeps the per-layer call effectively free — no per-row Python
+        loop, no per-call allocation. The per-row fallback runs only when a batch
+        actually mixes montages (not the case for a pure-EgoBrain run).
+        """
+        B = len(ch_names)
+        first = ch_names[0]
+        uniform = all(n is first or list(n) == list(first) for n in ch_names)
+        if uniform:
+            key = ('u', tuple(first), C, device.type, device.index)
+            order = self._region_perm_cache.get(key)
+            if order is None:
+                order = torch.tensor(self._region_order(first, C),
+                                     dtype=torch.long, device=device)
+                self._region_perm_cache[key] = order
+            return order.unsqueeze(0).expand(B, C)
+        # Mixed-montage fallback: one order per distinct row (cached as a list).
+        rows = []
+        for names in ch_names:
+            key = ('r', tuple(names), C)
+            order = self._region_perm_cache.get(key)
+            if order is None:
+                order = self._region_order(names, C)
+                self._region_perm_cache[key] = order
+            rows.append(order)
+        return torch.tensor(rows, dtype=torch.long, device=device)
+
+    def _brain_embed(self, patch_emb, ch_names=None):
+        """CSBrain BrainEmbedEEGLayer spatial-mixing residual (models/CSBrain.py:
+        ``patch_emb = BrainEmbedEEGLayer(patch_emb, area_config) + patch_emb``).
+
+        A circular conv across channels is applied to the REAL channel rows
+        (excluding the global-channel row at index 0 when ``add_global``). When
+        ``ch_names`` is given, the real channels are region-grouped first (sorted)
+        and un-sorted afterwards, so the conv sees region-local adjacency exactly
+        as CSBrain's ``sorted_indices`` intends; the residual lands back on each
+        channel's original position. ``area_config`` is None here, so the conv
+        treats all real channels as one region (region_0 block).
+        """
+        off = 1 if self.add_global else 0
+        real = patch_emb[:, off:]                                # (B, C, T, d)
+        C = real.size(1)
+        if ch_names is not None and C > 1:
+            perm = self._region_sort_perm(ch_names, C, real.device)   # (B, C)
+            gidx = perm[:, :, None, None].expand(-1, -1, real.size(2), real.size(3))
+            real_sorted = torch.gather(real, 1, gidx)
+            be = self.BrainEmbedEEGLayer(real_sorted, None)      # (B, C, T, d)
+            inv = torch.argsort(perm, dim=1)
+            be = torch.gather(be, 1, inv[:, :, None, None].expand_as(be))
+        else:
+            be = self.BrainEmbedEEGLayer(real, None)
+        real = real + be
+        if off:
+            return torch.cat([patch_emb[:, :off], real], dim=1)
+        return real
 
     def forward(self, batch, mask=None, encoder_only=False, band_idx=None):
         """Encode ``batch`` and (unless ``encoder_only``) compute losses.
@@ -2491,7 +2646,8 @@ class CSBrainAlign(nn.Module):
             moe_z_loss_running = patch_emb.new_zeros(())
             for layer_idx in range(self.encoder.num_layers):
                 patch_emb = self.TemEmbedEEGLayer(patch_emb) + patch_emb
-                # patch_emb = self.BrainEmbedEEGLayer(patch_emb, self.area_config) + patch_emb
+                if self.use_brain_embed:
+                    patch_emb = self._brain_embed(patch_emb, batch.get('ch_names'))
                 patch_emb = self.encoder.layers[layer_idx](
                     patch_emb, self.area_config,
                     inter_window_attn_mask=~batch['valid_length_mask'] if 'valid_length_mask' in batch else None,
@@ -2874,8 +3030,14 @@ class PatchEmbedding(nn.Module):
             )
         self.mask_encoding = nn.Parameter(torch.zeros(in_dim), requires_grad=False)
 
+        # The first conv is a per-patch Linear(patch_size -> d_model): its kernel
+        # spans the whole patch (width in_dim), so the spatial axis collapses to 1
+        # and the reshape below folds the output channels into the token axis.
+        # The kernel width is therefore in_dim (the raw sample count), NOT d_model
+        # — writing it as d_model happened to work only because the two were equal,
+        # and pinned d_model to the patch size.
         self.proj_in = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=d_model, kernel_size=(1, d_model), stride=(1, 1), padding=(0, 0)),
+            nn.Conv2d(in_channels=1, out_channels=d_model, kernel_size=(1, in_dim), stride=(1, 1), padding=(0, 0)),
             nn.GroupNorm(5, d_model),
             nn.GELU(),
 
@@ -2889,8 +3051,10 @@ class PatchEmbedding(nn.Module):
         )
 
         if self.spectral_mode == 'static':
+            # Fed the rFFT magnitude of the raw patch, which has in_dim // 2 + 1
+            # bins (see forward) — the in_features follow in_dim, not d_model.
             self.spectral_proj = nn.Sequential(
-                nn.Linear(d_model // 2 + 1, d_model),
+                nn.Linear(in_dim // 2 + 1, d_model),
                 nn.Dropout(0.1),
             )
         else:

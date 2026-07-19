@@ -144,3 +144,26 @@ class Evaluator:
         r2 = r2_score(truths, preds)
         rmse = mean_squared_error(truths, preds) ** 0.5
         return corrcoef, r2, rmse
+
+    def get_metrics_for_regression_dict(self, model):
+        """Dict-batch multi-output regression metrics (Forenzo cursor velocity).
+
+        Mirrors get_metrics_for_regression but consumes the standard dict batch
+        ({'x','y','ch_coords','ch_names'}) that the CSBrain models expect, and
+        handles a 2D target: correlation is averaged over output dims, r2/rmse
+        use sklearn's uniform-average multioutput."""
+        model.eval()
+        truths, preds = [], []
+        for batch in tqdm(self.data_loader, mininterval=1):
+            batch = to_device(batch, "cuda")
+            y = batch['y']
+            pred = model(batch)
+            truths.append(y.detach().cpu().numpy().reshape(-1, y.shape[-1]))
+            preds.append(pred.detach().cpu().numpy().reshape(-1, pred.shape[-1]))
+        truths = np.concatenate(truths, 0)
+        preds = np.concatenate(preds, 0)
+        corr = float(np.mean([np.corrcoef(truths[:, d], preds[:, d])[0, 1]
+                              for d in range(truths.shape[1])]))
+        r2 = float(r2_score(truths, preds))
+        rmse = float(mean_squared_error(truths, preds) ** 0.5)
+        return corr, r2, rmse

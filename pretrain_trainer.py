@@ -140,7 +140,18 @@ class Trainer(object):
             getattr(self.params, 'teacher_temp_warmup_epochs', 30)
             * self.data_length
         )
-        lr_warmup_iters = getattr(self.params, 'lr_warmup_iters', 0)
+        # LR warmup length: a fraction of the whole run (--lr_warmup_frac)
+        # auto-scales with dataset size / epochs and takes precedence; otherwise
+        # fall back to an explicit iteration count (--lr_warmup_iters).
+        lr_warmup_frac = getattr(self.params, 'lr_warmup_frac', 0.0)
+        if lr_warmup_frac and lr_warmup_frac > 0:
+            lr_warmup_iters = int(round(lr_warmup_frac * total_iters))
+            print(f'[LR warmup] {lr_warmup_frac:.3f} of {total_iters} steps '
+                  f'-> {lr_warmup_iters} warmup iters')
+        else:
+            lr_warmup_iters = getattr(self.params, 'lr_warmup_iters', 0)
+            if lr_warmup_iters > 0:
+                print(f'[LR warmup] {lr_warmup_iters} warmup iters')
         base_lrs = self._base_lrs
 
         for epoch in range(self.params.epochs):
@@ -563,7 +574,10 @@ class Trainer(object):
                 wandb.log({
                     **logs,
                     "epoch": epoch + 1,
-                    "lr": self.optimizer_scheduler.get_last_lr()[0]
+                    # Log the LR actually applied to the optimiser: during warmup
+                    # the scheduler hasn't stepped, so its get_last_lr() still
+                    # reports the base LR rather than the ramped value written above.
+                    "lr": self.optimizer.param_groups[0]['lr']
                 })
             mean_loss = np.mean(losses)
             learning_rate = self.optimizer.state_dict()['param_groups'][0]['lr']

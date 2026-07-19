@@ -64,14 +64,18 @@
 # overshoots past MI and HURTS. See project_me_mi_pretrain_manipulation.
 #
 # --aux_hand_pred (hand-movement decoding auxiliary; EgoBrain rows only): regress
-# the CONTINUOUS per-window left/right hand-movement intensity (the WiLoR
-# annotations in data/EgoBrain/cache_hand_labels_*; see
-# datasets/egobrain_hand_labels.py) off each window's global rep with a small MLP
-# head + masked SmoothL1 (per-column valid; undetected hand skipped). The
-# --egobrain_hand_labels_dir slug (w1.0s1.0_e0.5_nw2_k7_c4.0_fs200) MUST match the
-# egobrain window knobs above, or the (clip,window) keys misalign. On
-# frame-averaging flip steps the left/right targets swap (mirrored scene). Watch
-# hand_pred_loss / diag_hand_mae / diag_hand_valid_frac in wandb. Off without the flag.
+# the CONTINUOUS left/right hand-movement speed (the WiLoR annotations in
+# data/EgoBrain/cache_hand_labels_grid_*) off each window's global rep with a
+# small MLP head + masked SmoothL1 (per-column valid; undetected hand skipped).
+# Under --egobrain_use_frame_grid (this run) pass --egobrain_hand_grid_dir: a
+# TIME-KEYED cache whose slot k is the RAW hand speed over the forward 0.2 s pair
+# at frame slot k, read at each window's anchor frame (no smoothing; grid_s must
+# equal --egobrain_frame_grid_s, validated on load). The legacy clip-keyed
+# --egobrain_hand_labels_dir (w1.0s1.0_e0.5_nw2_k7_c4.0_fs200) only works on the
+# non-grid path and is REJECTED here — it is (clip,window)-keyed, so under the
+# grid it would silently train on nothing. On frame-averaging flip steps the
+# left/right targets swap (mirrored scene). Watch hand_pred_loss / diag_hand_mae /
+# diag_hand_valid_frac in wandb. Off without the flag.
 #
 # --use_cached_embeddings: load PRE-COMPUTED frozen DINOv2 embeddings of the
 # EgoBrain frames (cls/cls_flip + patch grid/grid_flip, both orientations) from
@@ -101,6 +105,17 @@
 #   --egobrain_motion_resample_cap_pct 99   --egobrain_motion_resample_floor_mix 0.1
 # Per-subject motion scores cache lazily under the embedding cache _motioncache/;
 # prebuild all subjects with `python -m scripts.build_egobrain_motion_cache`.
+#
+# --egobrain_video_subjects (BACKWARD COMPAT): EgoBrain later released GoPro video
+# for P0025-P0040, which were originally EEG-only. has_image is derived purely from
+# per-subject cache-FILE EXISTENCE, so once their frame/embedding caches are built
+# `--egobrain_subjects all` silently pulls them into the image-alignment, flip-align,
+# band-align and world-model frame objectives (and motion-weighted anchor sampling).
+# To REPRODUCE pre-release results bit-for-bit while those caches sit on disk, add:
+#     --egobrain_video_subjects legacy24
+# which restricts video to P0001-P0024; the new subjects then fall back to EEG-only
+# losses + uniform anchor draws, exactly as before their video existed. Accepts
+# `all` (default = every subject with a cache), `legacy24`, or a subject list.
 #
 # --wm_frame_motion_alpha (--wm_objective frame only): per-PATCH motion weighting
 # on the dense frame-prediction loss — the SPATIAL analog of motion_resample
@@ -245,18 +260,22 @@ python pretrain_main.py \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
     --vision_encoder facebook/dinov2-base \
-    --wm_frame_clean_cond \
-    --run_name wm-dino-dense-clean-gradneg \
+    --use_brain_embed \
+    --run_name wm-brainembed \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \
     --egobrain_motion_resample_alpha 1.0 \
     --wm_frame_motion_alpha 0 \
-    --wm_frame_contrast_weight 0.1 \
-    --wm_frame_contrast_n_neg 4 \
+    --wm_frame_contrast_weight 0.3 \
+    --wm_frame_contrast_n_neg 3 \
     --wm_frame_contrast_temp 0.1 \
     --wm_frame_contrast_grad_neg \
     --wm_frame_contrast_mode infonce
+    # Linear LR warmup over the first 5% of total steps (epochs * iters/epoch),
+    # ramping each param group 0 -> base LR, then the cosine schedule takes over.
+    # Auto-scales with epoch count / dataset size; set 0 to disable. Overrides
+    # --lr_warmup_iters when > 0.
     # Per-patch motion weighting of the dense frame-pred loss (kills the copy
     # shortcut so the predictor uses the EEG). Move the trailing `\` up onto the
     # motion_resample_alpha line above and uncomment to enable:
@@ -270,6 +289,15 @@ python pretrain_main.py \
     # --wm_frame_contrast_n_neg 4 \
     # --wm_frame_contrast_temp 0.1 \
     # --wm_frame_contrast_mode infonce \
+    # CSBrain spatial-mixing residual (models/CSBrain.py): add
+    # BrainEmbedEEGLayer(patch_emb)+patch_emb — a circular conv across EEG
+    # channels — after the TemEmbed residual in every backbone layer. Channels
+    # are region-GROUPED first (per-sample from ch_names, the EgoBrain analogue of
+    # CSBrain's fixed x=x[:,sorted_indices]); area_config is None so this is the
+    # only channel-order-dependent op, so grouping it locally leaves the coord PE /
+    # masks / reconstruction target in native channel order. Add a trailing `\` to
+    # the last active flag above (--wm_frame_contrast_mode infonce) and uncomment:
+    # --use_brain_embed \
     # GradNorm adaptive loss balancing (learns the per-term weights online;
     # supersedes the static loss weights for balanced terms). Uncomment:
     # --gradnorm \
@@ -278,8 +306,10 @@ python pretrain_main.py \
     # --aux_hand_pred \
     # --aux_hand_weight 0.1 \
     # This run uses --egobrain_use_frame_grid, so the hand aux needs the
-    # TIME-KEYED grid cache (build once: sbatch --array=1-24
+    # TIME-KEYED grid cache (build once: sbatch --array=1-40
     # sh/egobrain_hand_labels_grid.sh; grid_s MUST match --egobrain_frame_grid_s
-    # above). The legacy clip-keyed --egobrain_hand_labels_dir is REJECTED under
-    # the frame grid (it would silently train on nothing).
-    # --egobrain_hand_grid_dir data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_r1.0_fs200 \
+    # above). Targets are the RAW per-slot hand speed over the forward 0.2 s pair
+    # at the window's anchor frame (no smoothing). The legacy clip-keyed
+    # --egobrain_hand_labels_dir is REJECTED under the frame grid (it would
+    # silently train on nothing), as is the superseded smoothed *_r1.0_* cache.
+    # --egobrain_hand_grid_dir data/EgoBrain/cache_hand_labels_grid_wilor_g0.2_raw_fs200 \

@@ -100,14 +100,30 @@ class Model(nn.Module):
                         delattr(self.backbone, attr)
 
             missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
+            # Pretraining-only heads that hang off the encoder but aren't part of
+            # the finetune backbone — tolerate (drop) them, fail loudly on
+            # anything else. Mirrors model_for_physio's allowlist so frame-
+            # averaging / bilateralization / hand-aux checkpoints load cleanly.
+            _pretrain_only = ('equiv_projector', 'lateralization_split',
+                              'flip_align_proj', 'frame_split',
+                              'frame_flip_align_proj', 'hand_pred_head')
             unexpected_keys = [k for k in unexpected_keys
-                               if "equiv_projector" not in k]
+                               if not any(t in k for t in _pretrain_only)]
             if unexpected_keys:
                 raise ValueError(f"UNEXPECTED KEYS: {unexpected_keys}")
             if missing_keys:
                 raise ValueError(f"MISSING KEYS: {missing_keys}")
 
         self.backbone.proj_out = nn.Identity()
+
+        # Equivariant frame-averaging backbone: it auto-samples a random per-step
+        # ``flip`` in train() mode, which would corrupt finetune (the presented
+        # orientation would flip without a label remap). Pin the probability to 0
+        # so the finetune forward is always the canonical frame-averaged pass.
+        # frame_rep_mode='both' = full token (the standard readout).
+        if getattr(self.backbone, 'frame_averaging', False):
+            self.backbone.frame_avg_flip_prob = 0.0
+            self.backbone.frame_rep_mode = getattr(param, 'frame_rep_mode', 'both')
 
         if getattr(param, 'linear_probe', False):
             self.classifier = nn.LazyLinear(param.num_of_classes)

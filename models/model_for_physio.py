@@ -481,6 +481,15 @@ class Model(nn.Module):
             return self._forward_frame_flip_tta(batch)
         return self._forward_core(batch)
 
+    def _classify(self, out):
+        """Optional LayerNorm on the flattened rep before the classifier
+        (--pre_cls_layernorm). Non-affine (no learnable params, so no optimizer
+        wiring needed) — a LayerNorm's affine before a Linear is redundant with
+        the Linear anyway. Off by default -> plain classifier."""
+        if getattr(self.param, 'pre_cls_layernorm', False):
+            out = torch.nn.functional.layer_norm(out, (out.shape[-1],))
+        return self.classifier(out)
+
     def _forward_core(self, batch):
         x = batch.pop('x')
         x = x.reshape(x.size(0), x.size(1), -1, self.param.in_dim)
@@ -580,7 +589,7 @@ class Model(nn.Module):
                         raise ValueError("Expected backbone to return a tuple with a dictionary containing 'rep' key.")
                     feats_s = feats_s[1]["rep"]
                     out_s = feats_s.contiguous().view(bz, -1)
-                    logits_s = self.classifier(out_s)
+                    logits_s = self._classify(out_s)
                     logits_sum = logits_s if logits_sum is None else logits_sum + logits_s
                 return logits_sum / n_starts
         elif getattr(self.param, 'segment_forward', False) and seq_len > self.param.seq_len:
@@ -618,5 +627,5 @@ class Model(nn.Module):
             feats = feats[1]["rep"]
 
         out = feats.contiguous().view(bz, -1)
-        out = self.classifier(out)
+        out = self._classify(out)
         return out

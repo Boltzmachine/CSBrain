@@ -8,10 +8,10 @@ import os
 
 from datasets import faced_dataset, seedv_dataset, physio_dataset, shu_dataset, isruc_dataset, chb_dataset, \
     speech_dataset, mumtaz_dataset, seedvig_dataset, stress_dataset, tuev_dataset, tuab_dataset, bciciv2a_dataset, tusl_dataset
-from datasets import tusl_dataset, siena_dataset, hmc_dataset
+from datasets import tusl_dataset, siena_dataset, hmc_dataset, finemi_dataset, weibo2014_dataset, jeong2020_dataset, kaya5f_dataset, forenzo_dataset, forenzo_reg_dataset
 from finetune_trainer import Trainer
 from models import model_for_seedv,model_for_bciciv2a, model_for_tuab, model_for_tuev,model_for_faced,model_for_chb,model_for_speech,model_for_tusl,model_for_shu,model_for_seedvig,model_for_physio,model_for_isruc
-from models import model_for_siena, model_for_hmc,model_for_stress,model_for_mumtaz
+from models import model_for_siena, model_for_hmc,model_for_stress,model_for_mumtaz, model_for_finemi, model_for_weibo2014, model_for_jeong2020, model_for_kaya5f, model_for_forenzo
 from utils.util import load_pretrain_checkpoint, apply_arch_params
 import wandb
 
@@ -107,6 +107,10 @@ def main():
                              'the flipped logits remapped left<->right (--flip_label_map). '
                              'Symmetrizes the prediction over the reflection group. Needs no '
                              'split; no-op on a non-frame-averaging checkpoint.')
+    parser.add_argument('--pre_cls_layernorm', action='store_true', default=False,
+                        help='apply a (non-affine) LayerNorm to the flattened '
+                             'representation right before the classifier head '
+                             '(PhysioNet-MI). Normalizes the rep scale; off by default.')
     parser.add_argument('--temporal_jitter', type=int, default=0,
                         help='temporal-jitter augmentation (training only): randomly '
                              'shift the cropped seg_len window by ±N raw SAMPLES '
@@ -319,6 +323,42 @@ def main():
         model = model_for_bciciv2a.Model(params)
         t = Trainer(params, data_loader, model)
         results = t.train_for_multiclass()
+    elif params.downstream_dataset == 'FineMI':
+        load_dataset = finemi_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_finemi.Model(params)
+        t = Trainer(params, data_loader, model)
+        results = t.train_for_multiclass()
+    elif params.downstream_dataset == 'Weibo2014':
+        load_dataset = weibo2014_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_weibo2014.Model(params)
+        t = Trainer(params, data_loader, model)
+        results = t.train_for_multiclass()
+    elif params.downstream_dataset == 'Jeong2020':
+        load_dataset = jeong2020_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_jeong2020.Model(params)
+        t = Trainer(params, data_loader, model)
+        results = t.train_for_multiclass()
+    elif params.downstream_dataset == 'Kaya5F':
+        load_dataset = kaya5f_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_kaya5f.Model(params)
+        t = Trainer(params, data_loader, model)
+        results = t.train_for_multiclass()
+    elif params.downstream_dataset == 'Forenzo2024':
+        load_dataset = forenzo_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_forenzo.Model(params)
+        t = Trainer(params, data_loader, model)
+        results = t.train_for_multiclass()
+    elif params.downstream_dataset == 'Forenzo2024Reg':
+        load_dataset = forenzo_reg_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_forenzo.Model(params)
+        t = Trainer(params, data_loader, model)
+        results = t.train_for_regression_dict()
     elif params.downstream_dataset == 'siena': 
         load_dataset = siena_dataset.LoadDataset(params) 
         data_loader = load_dataset.get_data_loader()

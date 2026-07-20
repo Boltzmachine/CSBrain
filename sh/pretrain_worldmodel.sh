@@ -260,18 +260,19 @@ python pretrain_main.py \
     --wm_objective frame \
     --wm_frame_eeg_cond tokens \
     --vision_encoder facebook/dinov2-base \
-    --use_brain_embed \
-    --run_name wm-brainembed \
+    --run_name wm-hand \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \
     --egobrain_motion_resample_alpha 1.0 \
     --wm_frame_motion_alpha 0 \
-    --wm_frame_contrast_weight 0.3 \
+    --wm_frame_contrast_weight 0.0 \
     --wm_frame_contrast_n_neg 3 \
     --wm_frame_contrast_temp 0.1 \
     --wm_frame_contrast_grad_neg \
-    --wm_frame_contrast_mode infonce
+    --wm_frame_contrast_mode infonce \
+    --aux_hand_pred \
+    --aux_hand_weight 0.5
     # Linear LR warmup over the first 5% of total steps (epochs * iters/epoch),
     # ramping each param group 0 -> base LR, then the cosine schedule takes over.
     # Auto-scales with epoch count / dataset size; set 0 to disable. Overrides

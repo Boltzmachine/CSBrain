@@ -463,6 +463,11 @@ ARCH_PARAM_FIELDS = (
     # carried for config consistency.
     'frame_averaging', 'frame_avg_flip_prob', 'frame_avg_recon_weight',
     'flip_split_hidden', 'flip_n_col_bands', 'flip_align_weight',
+    # CSBrain BrainEmbedEEGLayer spatial-mixing residual: gates whether the
+    # (always-built) BrainEmbedEEGLayer is APPLIED in the encoder forward. A
+    # checkpoint trained with it True runs in a different architecture without
+    # it, so finetuning must restore the flag (only affects ckpts that set it).
+    'use_brain_embed',
 )
 
 

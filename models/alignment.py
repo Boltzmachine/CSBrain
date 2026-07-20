@@ -2313,6 +2313,16 @@ class CSBrainAlign(nn.Module):
             if weight is not None:
                 info['diag_flip_motion_weight'] = weight.mean().detach()
 
+        # Auxiliary hand-movement regression (per-row flip -> swap L/R targets
+        # only on the mirrored rows). ``flip`` is the full (B,) mask. Computed
+        # BEFORE the finetune early-exit below so it runs on BOTH the standard
+        # and frame-averaging paths and never silently depends on the presence
+        # of image_encoder_inputs (finetune / no-video batches supply none;
+        # _hand_pred_losses no-ops there via its aux_hand_pred / hand_targets
+        # guards). global_rep / flip are unchanged from here to the old call
+        # site, so this is numerically identical for pretraining.
+        info.update(self._hand_pred_losses(global_rep, batch, flip=flip))
+
         # Finetune / no-recon-target early exit. At finetune model_for_physio
         # replaces proj_out with Identity, so ``out`` is d_model-wide (not
         # out_dim-wide); the reconstruction branch below re-embeds ``out`` through
@@ -2320,10 +2330,14 @@ class CSBrainAlign(nn.Module):
         # d_model == in_dim — it crashes for d_model != in_dim checkpoints (e.g.
         # wm-d80: d_model 80, in_dim 40). rep / global_rep / patch_tokens are
         # already in ``info`` and the classifier uses only info['rep'], so skip
-        # the recon + pretraining-only diagnostics here. Gated identically to the
-        # alignment / flip-align branches above ('image_encoder_inputs' is present
-        # at pretraining, absent at finetune) so pretraining is unchanged.
-        if 'image_encoder_inputs' not in batch:
+        # the recon + pretraining-only diagnostics here. Guard on the ACTUAL
+        # finetune signal (proj_out replaced by Identity) — NOT on the presence
+        # of 'image_encoder_inputs', which is a leaky proxy: pretraining paths
+        # legitimately lack it (the frame_clean_cond masked/recon view strips it
+        # via _RECON_ONLY_STRIP; unit tests omit it) yet MUST still emit
+        # frame_recon_loss / skip_external_recon / flip_row. proj_out is Identity
+        # only at finetune, so pretraining is unchanged and finetune still skips.
+        if isinstance(self.proj_out, nn.Identity):
             return out, info
 
         # Reconstruction, split by orientation under PER-SAMPLE flip. ``out``
@@ -2384,9 +2398,6 @@ class CSBrainAlign(nn.Module):
             info['diag_frame_bi_half_norm'] = (
                 inv[..., :half].norm(dim=-1).mean().detach())
 
-        # Auxiliary hand-movement regression (per-row flip -> swap L/R targets
-        # only on the mirrored rows). ``flip`` is the full (B,) mask.
-        info.update(self._hand_pred_losses(global_rep, batch, flip=flip))
         return out, info
 
     def _hand_pred_losses(self, global_rep, batch, flip=False):

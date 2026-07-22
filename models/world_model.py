@@ -318,6 +318,7 @@ class WorldModelWrapper(nn.Module):
         frame_contrast_margin: float = 0.1,
         frame_contrast_detach_neg: bool = True,
         frame_contrast_batched: bool = False,
+        frame_contrast_excl_samples: int = 0,
     ):
         super().__init__()
         assert objective in ('eeg', 'frame'), (
@@ -409,6 +410,10 @@ class WorldModelWrapper(nn.Module):
         # attention memory ~K x — this flag exists to test whether the GPU has the
         # capacity for it. Default off = the memory-safe loop.
         self.frame_contrast_batched = bool(frame_contrast_batched)
+        # Temporal exclusion (window-0 start samples) between a subject-block row
+        # and its in-batch negatives; 0 = no exclusion (block gating off or the
+        # caller supplies no ``anchor``). See ``_same_flip_neg_indices``.
+        self.frame_contrast_excl_samples = int(frame_contrast_excl_samples)
         # ``'eeg'`` (default): predict the next EEG window's latent from the
         # current EEG latent (the original world-model objective). ``'frame'``:
         # predict the next video frame's per-patch embedding from the current
@@ -829,9 +834,13 @@ class WorldModelWrapper(nn.Module):
         return d_flat.reshape(K, Bv).t()                          # (Bv, K)
 
     @staticmethod
-    def _same_flip_neg_indices(flip_valid: torch.Tensor, K: int):
+    def _same_flip_neg_indices(flip_valid: torch.Tensor, K: int,
+                               block_id: Optional[torch.Tensor] = None,
+                               anchor: Optional[torch.Tensor] = None,
+                               excl_samples: int = 0):
         """Per-row negative row indices drawn ONLY from rows sharing the anchor's
-        frame-averaging flip state.
+        frame-averaging flip state (and, when subject-block loading is on, its
+        block + a temporal exclusion zone).
 
         Under frame averaging the anchor + target grids AND the positive EEG for
         row ``i`` are all presented in row ``i``'s orientation ``flip_i``. A
@@ -842,30 +851,55 @@ class WorldModelWrapper(nn.Module):
         pass an all-equal tensor when frame averaging is off (any row is then a
         valid negative).
 
+        ``block_id`` (``(Bv,)`` int, optional): when given, negatives must ALSO
+        come from the row's own subject-block, so every negative shares the
+        anchor's subject + scene and the only thing that differs is the future
+        motion — the hard negative that closes the subject/scene-identity
+        shortcut the cross-clip in-batch negatives leak. The eligibility group
+        becomes ``(flip, block)`` jointly.
+
+        ``anchor`` (``(Bv,)`` int window-0 start sample) + ``excl_samples`` > 0:
+        a candidate whose anchor is within ``excl_samples`` of the row's anchor
+        is masked out (``neg_valid`` False) — it would share EEG samples with the
+        positive (a near-duplicate false negative). Almost never fires under
+        temporal jitter (anchors are spread across the subject) but guards
+        overlaps and the no-jitter path.
+
         Returns ``(neg_idx, neg_valid)`` both ``(Bv, K)``. ``neg_idx[i, m]`` is the
         row supplying the slot-``m`` negative EEG for row ``i``; ``neg_valid[i, m]``
-        is False when row ``i``'s flip group has too few members to fill slot ``m``
-        (fewer than ``m + 2`` rows) — the caller masks those slots out of the loss
-        and the diagnostics. A row in a singleton flip group gets no valid negative.
-        The realised per-row negative count therefore varies with the group sizes,
-        which is why the caller must never assume a fixed ``K`` per row.
+        is False when row ``i``'s eligibility group has too few members to fill
+        slot ``m`` OR the candidate is inside the exclusion zone — the caller masks
+        those slots out of the loss and the diagnostics. A row whose group is a
+        singleton gets no valid negative. The realised per-row negative count
+        therefore varies with the group sizes, which is why the caller must never
+        assume a fixed ``K`` per row.
         """
         Bv = flip_valid.numel()
         device = flip_valid.device
         neg_idx = torch.zeros(Bv, K, dtype=torch.long, device=device)
         neg_valid = torch.zeros(Bv, K, dtype=torch.bool, device=device)
         ar = torch.arange(Bv, device=device)
-        for g in (False, True):
-            members = ar[flip_valid == g]                  # rows in this flip group
+        # Eligibility key = flip, jointly with block when block gating is on. Rows
+        # sharing a key are each other's negative candidates. With block_id=None
+        # this reduces to the two (False/True) flip groups exactly as before.
+        key = flip_valid.to(torch.long)
+        if block_id is not None:
+            key = block_id.to(torch.long) * 2 + key
+        for g in torch.unique(key):
+            members = ar[key == g]                         # rows in this group
             n_g = int(members.numel())
             if n_g < 2:
-                continue                                   # no same-flip partner
+                continue                                   # no same-group partner
             r = torch.arange(n_g, device=device)
             # Slot m (1-indexed) -> the member m positions ahead cyclically; valid
             # only while m <= n_g - 1 (m == n_g would alias the positive itself).
             for m in range(1, min(K, n_g - 1) + 1):
-                neg_idx[members, m - 1] = members[(r + m) % n_g]
-                neg_valid[members, m - 1] = True
+                cand = members[(r + m) % n_g]
+                neg_idx[members, m - 1] = cand
+                ok = torch.ones(n_g, dtype=torch.bool, device=device)
+                if anchor is not None and excl_samples > 0:
+                    ok = (anchor[members] - anchor[cand]).abs() >= excl_samples
+                neg_valid[members, m - 1] = ok
         return neg_idx, neg_valid
 
     def _add_frame_contrast(self, info: dict, per_step_pos: torch.Tensor,
@@ -874,7 +908,9 @@ class WorldModelWrapper(nn.Module):
                             eeg_kpm: Optional[torch.Tensor],
                             w_motion: Optional[torch.Tensor],
                             tgt_valid: torch.Tensor, scale: float,
-                            flip_valid: Optional[torch.Tensor] = None) -> None:
+                            flip_valid: Optional[torch.Tensor] = None,
+                            block_id: Optional[torch.Tensor] = None,
+                            anchor: Optional[torch.Tensor] = None) -> None:
         """Negative-EEG contrastive term for the dense frame objective.
 
         For each row ``i`` (anchor grid ``s_anchor[i]``, target grids ``s_tgt[i]``,
@@ -894,10 +930,15 @@ class WorldModelWrapper(nn.Module):
         Negatives are restricted to rows sharing the anchor's frame-averaging flip
         (``flip_valid``) so the predictor cannot discriminate on ORIENTATION
         bookkeeping instead of motion; with frame averaging off, ``flip_valid`` is
-        all-equal and any other row is a valid negative. The per-row realised
-        negative count varies (a small flip group yields fewer than ``K``); invalid
-        slots are masked out of the loss and diagnostics, and a row with no valid
-        negative is dropped from the reduction.
+        all-equal and any other row is a valid negative. When ``block_id`` is
+        given (subject-block loading), negatives are ADDITIONALLY restricted to
+        the row's own block — same subject + scene — so the discrimination can no
+        longer ride on subject/scene identity, only on the future motion; and
+        ``anchor`` + ``self.frame_contrast_excl_samples`` mask any candidate too
+        close in time to be a genuine negative. The per-row realised negative
+        count varies (a small group yields fewer than ``K``); invalid slots are
+        masked out of the loss and diagnostics, and a row with no valid negative
+        is dropped from the reduction.
 
         Writes ``info['frame_contrast_loss']`` and ``diag_frame_contrast_*``.
         Negatives are detached from the EEG-encoder graph iff
@@ -910,7 +951,9 @@ class WorldModelWrapper(nn.Module):
             return
         if flip_valid is None:
             flip_valid = torch.zeros(Bv, dtype=torch.bool, device=s_anchor.device)
-        neg_idx, neg_valid = self._same_flip_neg_indices(flip_valid, K)  # (Bv, K)
+        neg_idx, neg_valid = self._same_flip_neg_indices(
+            flip_valid, K, block_id=block_id, anchor=anchor,
+            excl_samples=self.frame_contrast_excl_samples)             # (Bv, K)
 
         row_denom = tgt_valid.sum(dim=1).clamp(min=1.0)            # (Bv,)
         # A row is usable only if it has >= 1 valid target step AND >= 1 same-flip
@@ -1104,9 +1147,23 @@ class WorldModelWrapper(nn.Module):
         # ``per_step`` so ``d_pos`` costs no forward.
         if self.frame_contrast_weight > 0 and scale > 0 and s_anchor.size(0) >= 2:
             flip_valid = flip[valid] if flip is not None else None
+            # Subject-block gating (optional): restrict negatives to the row's own
+            # block (same subject/scene) + a temporal exclusion zone. ``block_id``
+            # / ``anchor_sample`` are per-row full-batch fields (present only when
+            # SubjectBlockBatchSampler is active), so index them by cb_idx then the
+            # ``valid`` anchor mask exactly like ``flip``. Absent -> plain in-batch
+            # same-flip negatives (byte-identical to before).
+            block_id = anchor = None
+            blk = batch.get('block_id')
+            if blk is not None:
+                block_id = blk.index_select(0, cb_idx)[valid].to(s_anchor.device)
+                anc = batch.get('anchor_sample')
+                if anc is not None and self.frame_contrast_excl_samples > 0:
+                    anchor = anc.index_select(0, cb_idx)[valid].to(s_anchor.device)
             self._add_frame_contrast(
                 info, per_step, s_anchor, s_tgt, eeg_emb, eeg_kpm,
-                w_motion, tgt_valid, scale, flip_valid)
+                w_motion, tgt_valid, scale, flip_valid,
+                block_id=block_id, anchor=anchor)
 
         # Diagnostics. The dominant failure is the predictor IGNORING the EEG and
         # copying the anchor frame (short-horizon frames are ~static in DINOv2/

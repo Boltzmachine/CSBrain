@@ -1013,6 +1013,12 @@ class EgoBrainDataset(Dataset):
             'session_id': sub,
             'subject': sub,
             'local_clip_idx': c,
+            # Absolute window-0 START sample (fs_out granularity), so the
+            # subject-block frame-contrast can enforce a temporal exclusion zone
+            # between a row and its in-batch negatives. In the legacy clip path
+            # window 0 starts at the clip boundary, so ``c * clip_samples`` is
+            # the window-0 start; the grid path stores the jittered ``eeg_start``.
+            'anchor_sample': int(c * self.clip_samples),
         }
         if frame_emb is not None:
             out.update(frame_emb)
@@ -1300,7 +1306,7 @@ class EgoBrainDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-def collate_egobrain(batch, frame_objective=False):
+def collate_egobrain(batch, frame_objective=False, subject_block=0):
     """Stack EgoBrain samples into a world-model batch.
 
     ``frame_objective`` (set by the WorldModel ``--wm_objective frame`` run):
@@ -1308,6 +1314,15 @@ def collate_egobrain(batch, frame_objective=False):
     EEG windows, so ``timeseries_future`` is trimmed to window 0 — its presence
     still triggers ``cinebrain_idx``/``cb_idx`` in the wrapper, but the unused
     windows 1..W-1 are not stacked or copied to the GPU.
+
+    ``subject_block`` > 0 marks that the batch was laid down by
+    ``SubjectBlockBatchSampler`` as contiguous runs of ``subject_block``
+    same-subject rows. We tag each row with ``block_id = position //
+    subject_block`` so the frame-contrast term can restrict its in-batch
+    negatives to the row's own block (same subject / scene). ``block_id`` is
+    carried PER ROW (not derived positionally in the model) so it survives
+    DataParallel's dim-0 scatter — a block split across replicas simply yields
+    its negatives independently on each side, never a cross-subject negative.
     """
     B = len(batch)
     # EgoBrain subjects can have slightly different kept-channel counts
@@ -1352,7 +1367,17 @@ def collate_egobrain(batch, frame_objective=False):
         'hand_valid': torch.stack([b['hand_valid'][0] for b in batch]),
         'source': [b['source'] for b in batch],
         'session_id': [b.get('session_id', 'unknown') for b in batch],
+        # Absolute window-0 start sample per row (fs_out granularity) for the
+        # subject-block frame-contrast temporal-exclusion mask. Defaults to 0 for
+        # any item that predates the field (then Δanchor collapses to 0 and the
+        # exclusion is inert), so old caches keep collating.
+        'anchor_sample': torch.tensor(
+            [int(b.get('anchor_sample', 0)) for b in batch], dtype=torch.long),
     }
+    # Per-row block id (same subject within a block); emitted only when the
+    # block sampler is active so the default (shuffled) path is byte-identical.
+    if subject_block and subject_block > 0:
+        out['block_id'] = torch.arange(B, dtype=torch.long) // int(subject_block)
 
     # Cached vision-encoder embeddings (when EgoBrainDataset.use_emb_cache): the
     # model reads these instead of running the frozen encoder. Window-0 tensors
@@ -1388,6 +1413,81 @@ def collate_egobrain(batch, frame_objective=False):
             out['frame_cls'] = torch.stack([t[0] for t in cls])          # (B,d)
             out['frame_cls_flip'] = torch.stack([t[0] for t in cls_f])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Subject-block batch sampler
+# ---------------------------------------------------------------------------
+
+
+class SubjectBlockBatchSampler(torch.utils.data.Sampler):
+    """Batch sampler that lays each batch down as ``batch_size // block_size``
+    contiguous BLOCKS, every block being ``block_size`` clips drawn from ONE
+    subject. Two payoffs over the plain ``RandomSampler``:
+
+      1. *Nontrivial in-batch negatives* — same-subject rows share subject +
+         scene, so the frame-contrast term (paired with ``block_id`` from
+         ``collate_egobrain`` and same-block gating in the world model) gets
+         hard negatives that force the predictor to read motor content instead
+         of subject/scene identity. Reuses the batch's own encodings, so this
+         costs no extra encoder forwards.
+      2. *I/O locality* — a block's ``block_size`` reads all hit the same
+         per-subject HDF5 file (frames / embeddings), keeping its handle + the
+         OS page / HDF5 chunk cache warm instead of thrashing across subjects.
+
+    Sampling matches the ``RandomSampler(replacement=True)`` it replaces: each
+    block's subject is drawn uniformly with replacement, and clips within a
+    block are drawn WITHOUT replacement when the subject has enough (so the
+    ``block_size`` anchors are distinct clips; under ``temporal_jitter`` each
+    still re-rolls a fresh anchor per ``__getitem__``), falling back to WITH
+    replacement for a subject with fewer than ``block_size`` clips. ``__iter__``
+    re-seeds from ``seed + epoch`` so every epoch sees fresh blocks while a
+    fixed ``seed`` keeps tests deterministic.
+    """
+
+    def __init__(self, items, batch_size: int, block_size: int,
+                 num_batches: int, seed: int = 0):
+        if block_size < 1:
+            raise ValueError(f"block_size must be >= 1, got {block_size}")
+        if batch_size % block_size != 0:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by block_size "
+                f"({block_size}) so every block is whole within a batch")
+        from collections import defaultdict
+        by_sub: dict = defaultdict(list)
+        for gi, it in enumerate(items):
+            by_sub[it[0]].append(gi)          # it == (subject, clip_idx)
+        self.subjects = list(by_sub.keys())
+        self.pools = [torch.tensor(by_sub[s], dtype=torch.long)
+                      for s in self.subjects]
+        self.block_size = int(block_size)
+        self.n_blocks = batch_size // block_size
+        self.batch_size = int(batch_size)
+        self.num_batches = int(num_batches)
+        self.seed = int(seed)
+        self._epoch = 0
+
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self._epoch)
+        self._epoch += 1
+        n_sub = len(self.subjects)
+        for _ in range(self.num_batches):
+            batch: list = []
+            sub_ids = torch.randint(0, n_sub, (self.n_blocks,), generator=g)
+            for si in sub_ids.tolist():
+                pool = self.pools[si]
+                n = int(pool.numel())
+                if n >= self.block_size:
+                    sel = pool[torch.randperm(n, generator=g)[:self.block_size]]
+                else:                          # subject too small -> with replacement
+                    sel = pool[torch.randint(0, n, (self.block_size,),
+                                             generator=g)]
+                batch.extend(sel.tolist())
+            yield batch
 
 
 # ---------------------------------------------------------------------------

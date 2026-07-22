@@ -974,6 +974,84 @@ class TestFrameContrast(unittest.TestCase):
         self.assertFalse(val[3].any())
         self.assertTrue(val[:3].any(dim=1).all())
 
+    def test_neg_indices_backcompat_none(self):
+        # block_id=None + anchor=None must reproduce the pure same-flip result.
+        W = WorldModelWrapper
+        flip = torch.tensor([False, True, False, True, False, True])
+        idx0, val0 = W._same_flip_neg_indices(flip, K=3)
+        idx1, val1 = W._same_flip_neg_indices(flip, K=3, block_id=None,
+                                              anchor=None, excl_samples=0)
+        self.assertTrue(torch.equal(idx0, idx1))
+        self.assertTrue(torch.equal(val0, val1))
+
+    def test_neg_indices_block_gating(self):
+        # Two blocks of 4 (all same flip): every valid negative shares the block,
+        # and a same-flip block of 4 yields exactly 3 valid negatives per row.
+        W = WorldModelWrapper
+        flip = torch.zeros(8, dtype=torch.bool)
+        block = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        idx, val = W._same_flip_neg_indices(flip, K=3, block_id=block)
+        for i in range(8):
+            for m in range(3):
+                if val[i, m]:
+                    self.assertEqual(block[idx[i, m]].item(), block[i].item())
+        self.assertTrue((val.sum(dim=1) == 3).all())
+
+    def test_neg_indices_block_and_flip_jointly(self):
+        # One block split 2/2 by flip -> each row has exactly one same-(flip,block)
+        # partner; negatives must match BOTH keys.
+        W = WorldModelWrapper
+        flip = torch.tensor([False, True, False, True])
+        block = torch.zeros(4, dtype=torch.long)
+        idx, val = W._same_flip_neg_indices(flip, K=3, block_id=block)
+        for i in range(4):
+            for m in range(3):
+                if val[i, m]:
+                    self.assertEqual(flip[idx[i, m]].item(), flip[i].item())
+                    self.assertEqual(block[idx[i, m]].item(), block[i].item())
+        self.assertTrue((val.sum(dim=1) == 1).all())
+
+    def test_neg_indices_temporal_exclusion(self):
+        # A candidate within excl_samples of the anchor is masked out.
+        W = WorldModelWrapper
+        flip = torch.zeros(4, dtype=torch.bool)
+        block = torch.zeros(4, dtype=torch.long)
+        anchor = torch.tensor([0, 10, 5000, 9000], dtype=torch.long)
+        idx, val = W._same_flip_neg_indices(
+            flip, K=3, block_id=block, anchor=anchor, excl_samples=100)
+        for i in range(4):
+            for m in range(3):
+                if val[i, m]:
+                    self.assertGreaterEqual(
+                        abs(int(anchor[i]) - int(anchor[idx[i, m]])), 100)
+        # Rows 0 and 1 are 10 samples apart -> each loses that one candidate.
+        self.assertLessEqual(int(val[0].sum()), 2)
+        self.assertLessEqual(int(val[1].sum()), 2)
+
+    def test_block_gating_confines_negatives_in_loss(self):
+        # End-to-end through _add_frame_contrast: 2 blocks of 3, negatives never
+        # cross a block, so the realised per-row negative count is 2 (block-1).
+        Bv, H, P, d = 6, 2, 3, 4
+        w, *_ = self._wrapper(weight=1.0, mode='infonce', n_neg=5)
+        w.predictor = self._CopyPred(H)
+        w.frame_contrast_excl_samples = 0
+        torch.manual_seed(7)
+        s_anchor = torch.randn(Bv, P, d)
+        s_tgt = torch.randn(Bv, H, P, d)
+        eeg_emb = torch.randn(Bv, d)
+        tgt_valid = torch.ones(Bv, H)
+        copy = s_anchor.unsqueeze(1).expand(-1, H, -1, -1)
+        err = torch.nn.functional.l1_loss(copy, s_tgt, reduction='none').mean(-1)
+        per_step_pos = WorldModelWrapper._reduce_over_patches(err, None)
+        info = {}
+        w._add_frame_contrast(
+            info, per_step_pos, s_anchor, s_tgt, eeg_emb, None, None, tgt_valid,
+            scale=1.0, flip_valid=torch.zeros(Bv, dtype=torch.bool),
+            block_id=torch.tensor([0, 0, 0, 1, 1, 1]))
+        self.assertIn('frame_contrast_loss', info)
+        self.assertAlmostEqual(
+            float(info['diag_frame_contrast_n_neg']), 2.0, places=5)
+
     class _CopyPred(torch.nn.Module):
         """Predictor stub that IGNORES the EEG and copies the anchor grid across
         all H horizon steps — the copy-the-anchor failure mode the term targets."""
@@ -1068,6 +1146,70 @@ class TestFrameContrast(unittest.TestCase):
                              batch['diag_frame_contrast_acc'].item())
             self.assertEqual(loop['diag_frame_contrast_n_neg'].item(),
                              batch['diag_frame_contrast_n_neg'].item())
+
+
+class TestSubjectBlockBatchSampler(unittest.TestCase):
+    """``datasets.egobrain_dataset.SubjectBlockBatchSampler`` — batches laid down
+    as contiguous same-subject blocks for in-batch same-block negatives + I/O
+    locality."""
+
+    def _sampler(self, **kw):
+        from datasets.egobrain_dataset import SubjectBlockBatchSampler
+        return SubjectBlockBatchSampler(**kw)
+
+    def _items(self):
+        # A: 10 clips, B: 6, C: 3 (C is smaller than block_size on purpose).
+        return ([('A', c) for c in range(10)]
+                + [('B', c) for c in range(6)]
+                + [('C', c) for c in range(3)])
+
+    def test_block_structure(self):
+        items = self._items()
+        s = self._sampler(items=items, batch_size=12, block_size=4,
+                          num_batches=5, seed=0)
+        self.assertEqual(len(s), 5)
+        batches = list(s)
+        self.assertEqual(len(batches), 5)
+        for b in batches:
+            self.assertEqual(len(b), 12)
+            for bl in range(3):                         # 3 blocks of 4
+                block = b[bl * 4:(bl + 1) * 4]
+                subs = {items[i][0] for i in block}
+                self.assertEqual(len(subs), 1, 'each block must be one subject')
+
+    def test_distinct_clips_when_subject_large_enough(self):
+        # A block from a subject with >= block_size clips draws DISTINCT clips.
+        s = self._sampler(items=[('A', c) for c in range(10)],
+                          batch_size=4, block_size=4, num_batches=20, seed=1)
+        for b in list(s):
+            self.assertEqual(len(set(b)), 4)
+
+    def test_small_subject_falls_back_to_replacement(self):
+        # C has 3 clips < block_size=4 -> the block still fills (with replacement)
+        # and stays a single subject.
+        s = self._sampler(items=[('C', c) for c in range(3)],
+                          batch_size=4, block_size=4, num_batches=5, seed=2)
+        for b in list(s):
+            self.assertEqual(len(b), 4)
+
+    def test_divisibility_guard(self):
+        with self.assertRaises(ValueError):
+            self._sampler(items=[('A', 0)], batch_size=10, block_size=4,
+                          num_batches=1)
+
+    def test_epoch_reseed_varies(self):
+        items = [('A', c) for c in range(10)] + [('B', c) for c in range(10)]
+        s = self._sampler(items=items, batch_size=8, block_size=4,
+                          num_batches=3, seed=0)
+        self.assertNotEqual(list(s), list(s), 'consecutive epochs should differ')
+
+    def test_fixed_seed_reproducible(self):
+        items = self._items()
+        a = list(self._sampler(items=items, batch_size=8, block_size=4,
+                               num_batches=3, seed=0))
+        b = list(self._sampler(items=items, batch_size=8, block_size=4,
+                               num_batches=3, seed=0))
+        self.assertEqual(a, b, 'same seed -> same first epoch')
 
 
 if __name__ == '__main__':

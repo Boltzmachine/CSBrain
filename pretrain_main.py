@@ -342,6 +342,14 @@ def main():
                              "loop. Numerically identical (up to dropout RNG); fewer/larger kernels but "
                              "~n_neg x peak attention memory. Off (default) = the memory-safe loop; turn "
                              "ON to test whether the GPU has the capacity for the single-forward path.")
+    parser.add_argument('--wm_frame_contrast_excl_s', type=float, default=-1.0,
+                        help="For --wm_frame_contrast_weight>0 WITH --egobrain_subject_block>0: temporal "
+                             "exclusion (seconds) between a subject-block row and its in-batch negatives. A "
+                             "candidate whose window-0 start is within this of the anchor is masked out of "
+                             "the contrast (it would share EEG samples with the positive = a near-duplicate "
+                             "false negative). -1 (default) = auto = --egobrain_window_s, forbidding literal "
+                             "EEG overlap; under temporal jitter it almost never fires. Ignored without "
+                             "subject-block loading (there are no same-subject in-batch negatives to mask).")
     parser.add_argument('--latent_pred_weight', type=float, default=1.0)
     parser.add_argument('--cls_pred_weight', type=float, default=0.1)
     parser.add_argument('--pred_ramp_epochs', type=int, default=2, help='linearly ramp latent-prediction weight 0→1 over this many epochs')
@@ -406,6 +414,16 @@ def main():
                         help='with --egobrain_use_frame_grid, disable random anchor '
                              'jitter (use the deterministic clip-aligned offset). Off by '
                              'default = random offset augmentation each epoch.')
+    parser.add_argument('--egobrain_subject_block', type=int, default=0,
+                        help='lay each batch down as batch_size//N contiguous BLOCKS of N '
+                             'same-subject clips (SubjectBlockBatchSampler) instead of a '
+                             'plain shuffle. >0 enables (1) same-block negatives for the '
+                             '--wm_frame_contrast term — same subject/scene, so the '
+                             'predictor must read motor content not identity — and (2) '
+                             'per-subject HDF5 read locality. batch_size must be divisible '
+                             'by N (and by N*num_dp_gpus under DataParallel so blocks stay '
+                             'whole per replica). 0 (default) = shuffled RandomSampler, '
+                             'byte-identical to prior runs.')
     parser.add_argument('--egobrain_use_grid_embeddings', action='store_true', default=False,
                         help='with --egobrain_use_frame_grid, read PRE-COMPUTED frozen '
                              'DINOv2 embeddings (cls/grid + flips) from the time-keyed '
@@ -522,6 +540,16 @@ def main():
 
     if os.environ.get('DEBUG', '0') == '1':
         params.batch_size = 4
+
+    # Resolve the subject-block frame-contrast temporal exclusion (seconds ->
+    # fs_out=200 samples, matching EgoBrain's cached anchor_sample granularity).
+    # Only meaningful with --egobrain_subject_block>0; auto (-1) defaults to the
+    # EEG window span so negatives never share window-0 samples with the anchor.
+    _excl_s = params.wm_frame_contrast_excl_s
+    if _excl_s < 0:
+        _excl_s = params.egobrain_window_s
+    params.wm_frame_contrast_excl_samples = (
+        int(round(_excl_s * 200)) if params.egobrain_subject_block > 0 else 0)
 
     # --- Euclidean Alignment sidecars (per-subject whitening matrices) ---
     # When --use_euclidean_alignment is on, load whichever sidecars the
@@ -947,25 +975,52 @@ def main():
         print('EgoBrain clips:', len(pretrained_dataset))
         num_workers = 10 if os.environ.get('DEBUG', '0') == '0' else 0
         n_samples_per_epoch = 1109545
-        sampler = torch.utils.data.RandomSampler(
-            pretrained_dataset,
-            replacement=True,
-            num_samples=n_samples_per_epoch,
+        collate_fn = functools.partial(
+            collate_egobrain,
+            frame_objective=(getattr(params, 'model', None) == 'WorldModel'
+                             and getattr(params, 'wm_objective', 'eeg') == 'frame'),
+            subject_block=params.egobrain_subject_block,
         )
-        data_loader = DataLoader(
-            pretrained_dataset,
-            batch_size=params.batch_size,
-            num_workers=num_workers,
-            sampler=sampler,
-            collate_fn=functools.partial(
-                collate_egobrain,
-                frame_objective=(getattr(params, 'model', None) == 'WorldModel'
-                                 and getattr(params, 'wm_objective', 'eeg') == 'frame'),
-            ),
-            pin_memory=True,
-            drop_last=True,
-            prefetch_factor=4,
-        )
+        if params.egobrain_subject_block > 0:
+            # Subject-block loading: each batch = batch_size//N blocks of N
+            # same-subject clips. batch_sampler is mutually exclusive with
+            # batch_size / sampler / drop_last, so pass it alone. num_batches
+            # matches the RandomSampler epoch length it replaces.
+            from datasets.egobrain_dataset import SubjectBlockBatchSampler
+            batch_sampler = SubjectBlockBatchSampler(
+                pretrained_dataset._items,
+                batch_size=params.batch_size,
+                block_size=params.egobrain_subject_block,
+                num_batches=n_samples_per_epoch // params.batch_size,
+                seed=params.seed,
+            )
+            print(f'[EgoBrain] subject-block loading ON: block={params.egobrain_subject_block} '
+                  f'blocks/batch={params.batch_size // params.egobrain_subject_block} '
+                  f'excl_samples={params.wm_frame_contrast_excl_samples}')
+            data_loader = DataLoader(
+                pretrained_dataset,
+                num_workers=num_workers,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_fn,
+                pin_memory=True,
+                prefetch_factor=4,
+            )
+        else:
+            sampler = torch.utils.data.RandomSampler(
+                pretrained_dataset,
+                replacement=True,
+                num_samples=n_samples_per_epoch,
+            )
+            data_loader = DataLoader(
+                pretrained_dataset,
+                batch_size=params.batch_size,
+                num_workers=num_workers,
+                sampler=sampler,
+                collate_fn=collate_fn,
+                pin_memory=True,
+                drop_last=True,
+                prefetch_factor=4,
+            )
 
     elif params.dataset_dir == 'cinebrain':
         from datasets.cinebrain_dataset import CineBrainDataset, collate_cinebrain

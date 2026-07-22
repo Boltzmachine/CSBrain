@@ -206,6 +206,18 @@ class Trainer(object):
                     f1_best = f1
                     cm_best = cm
                     self.best_model_states = copy.deepcopy(self.model.state_dict())
+
+        # LAST-epoch test metrics. The model here still holds the final-epoch
+        # weights (LR fully annealed, NO val-based selection). Captured BEFORE
+        # loading best_model_states and reported ALONGSIDE the best-val metrics:
+        # val-acc selection on the small MI val set can lock onto under-trained
+        # epochs, which inflates seed variance and can depress the mean (see the
+        # 2026-07-21 last-vs-best analysis in outputs/eval_tables.md).
+        with torch.no_grad():
+            last_acc, last_kappa, last_f1, _ = self.test_eval.get_metrics_for_multiclass(self.model)
+        print("Test Evaluation (last epoch {}): acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
+            self.params.epochs, last_acc, last_kappa, last_f1))
+
         self.model.load_state_dict(self.best_model_states)
         with torch.no_grad():
             print("***************************Test************************")
@@ -230,6 +242,7 @@ class Trainer(object):
             return {
                 'val_kappa': kappa_best, 'val_acc': acc_best, 'val_f1': f1_best,
                 'test_kappa': kappa, 'test_acc': acc, 'test_f1': f1,
+                'test_kappa_last': last_kappa, 'test_acc_last': last_acc, 'test_f1_last': last_f1,
                 'model_path': model_path,
             }
 

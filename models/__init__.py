@@ -270,6 +270,8 @@ def get_model(params, brain_regions, sorted_indices):
                 params, 'wm_frame_contrast_detach_neg', True),
             frame_contrast_batched=getattr(
                 params, 'wm_frame_contrast_batched', False),
+            frame_contrast_excl_samples=getattr(
+                params, 'wm_frame_contrast_excl_samples', 0),
         )
         return model
     elif params.model == 'ActionWorldModel':

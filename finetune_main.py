@@ -381,12 +381,17 @@ def main():
             if write_header:
                 writer.writerow(['base_model_ckpt', 'finetuned_model_ckpt',
                                  'val_kappa', 'val_acc', 'val_f1',
-                                 'test_kappa', 'test_acc', 'test_f1'])
+                                 'test_kappa', 'test_acc', 'test_f1',
+                                 'test_kappa_last', 'test_acc_last', 'test_f1_last'])
+            # test_*      = best-VAL-epoch model (early-stopped selection)
+            # test_*_last = final-epoch model (LR fully annealed, no val selection);
+            #               more stable across seeds — see finetune_trainer notes.
             writer.writerow([
                 os.path.join(os.path.basename(os.path.dirname(params.foundation_dir)), os.path.basename(params.foundation_dir)),
                 os.path.basename(results['model_path']),
                 results['val_kappa'], results['val_acc'], results['val_f1'],
                 results['test_kappa'], results['test_acc'], results['test_f1'],
+                results.get('test_kappa_last'), results.get('test_acc_last'), results.get('test_f1_last'),
             ])
         print(f"Results appended to {csv_path}")
 

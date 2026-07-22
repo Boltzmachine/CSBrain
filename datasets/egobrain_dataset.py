@@ -207,6 +207,7 @@ class EgoBrainDataset(Dataset):
         frame_grid_s: float = 0.2,
         temporal_jitter: bool = True,
         jitter_seed: Optional[int] = None,
+        local_jitter: bool = False,
         use_grid_embeddings: bool = False,
         emb_grid_dir: Optional[str] = None,
         video_subjects: Optional[Sequence[str]] = None,
@@ -343,6 +344,17 @@ class EgoBrainDataset(Dataset):
         self.erp_samples = int(round(erp_latency_s * fs_out))
         self.temporal_jitter = bool(temporal_jitter)
         self.jitter_seed = jitter_seed
+        # Clip-LOCAL jitter (for windowed proximity blocks): under temporal
+        # jitter, draw the anchor within the item's own clip instead of across
+        # the whole subject, so the sampler's contiguous-clip block maps to a
+        # TIGHT time window (hard negatives). See SubjectBlockBatchSampler +
+        # ``--egobrain_block_window_s``. Motion bias, when on, then applies at the
+        # WINDOW-placement level (the sampler) rather than per-anchor.
+        self.local_jitter = bool(local_jitter)
+        # Per-subject per-CLIP motion weight (n_clips,), populated by
+        # _init_motion_resample; consumed by the sampler for motion-biased window
+        # placement so proximity blocks still land on dynamic regions.
+        self._clip_motion_w: dict = {}
         self._anchor_rng = None
         self.frame_grid_dir = frame_grid_dir
         # Optional time-keyed DINOv2 embedding cache (datasets/
@@ -685,9 +697,27 @@ class EgoBrainDataset(Dataset):
         uniformly, or (when ``motion_resample`` is on and this subject has a
         sampling CDF) biased toward visually dynamic anchors; otherwise the
         deterministic ``k`` puts window-0's start at ~clip ``c`` (reproducible
-        eval — never reweighted)."""
+        eval — never reweighted).
+
+        ``local_jitter`` (windowed proximity blocks): under temporal jitter, draw
+        the anchor WITHIN clip ``c`` only — window-0 start jitters over ``[c*clip,
+        c*clip + (clip - span)]`` — so the sampler's contiguous-clip block collapses
+        to a tight time window and its in-batch negatives are seconds-to-minutes
+        (not ~30 min) from the anchor. Motion bias then lives at the window level
+        (the sampler picks which contiguous run), so it is bypassed HERE."""
         k_min, k_max = self._anchor_k_bounds(sub)
         if self.temporal_jitter:
+            if self.local_jitter:
+                # Clip-local draw: base slot at clip c, jittered by up to the
+                # number of whole grid slots that still fit the item span inside
+                # the clip. span == clip -> no room -> deterministic clip anchor.
+                k_c = int(round((c * self.clip_samples + self.erp_samples)
+                                / self.grid_samples))
+                span = ((self.n_windows - 1) * self.stride_samples
+                        + self.window_samples)
+                local = max(0, (self.clip_samples - span) // self.grid_samples)
+                k = k_c + int(self._get_anchor_rng().integers(0, local + 1))
+                return min(max(k, k_min), k_max)
             if self.motion_resample:
                 ent = self._anchor_cdf.get(sub)
                 if ent is not None:
@@ -766,6 +796,22 @@ class EgoBrainDataset(Dataset):
             am = np.asarray(mot, dtype=np.float32)
             w = build_anchor_weights(am, self.motion_resample_alpha,
                                      self.motion_resample_cap_pct)
+            # Per-CLIP motion weight for motion-biased WINDOW placement in the
+            # proximity-block sampler: average the per-anchor-slot motion over the
+            # anchor slots whose window-0 start falls inside clip c. Keeps windowed
+            # blocks on dynamic regions even though the per-anchor draw is now
+            # clip-local uniform (local_jitter). Cheap: O(n_clips) per subject.
+            n_clips = self._subject_meta[sub]['n_clips']
+            clip_w = np.zeros(n_clips, dtype=np.float64)
+            for cc in range(n_clips):
+                lo = int((cc * self.clip_samples + self.erp_samples)
+                         // self.grid_samples)
+                hi = int(((cc + 1) * self.clip_samples + self.erp_samples)
+                         // self.grid_samples)
+                lo = max(0, min(lo, am.shape[0]))
+                hi = max(lo + 1, min(hi, am.shape[0]))
+                clip_w[cc] = float(am[lo:hi].mean()) if hi > lo else 0.0
+            self._clip_motion_w[sub] = clip_w
             k_min, k_max = self._anchor_k_bounds(sub)
             k_max = min(k_max, w.shape[0] - 1)           # never index past motion
             cdf = build_anchor_cdf(w, k_min, k_max, self.motion_resample_floor_mix)
@@ -1443,10 +1489,22 @@ class SubjectBlockBatchSampler(torch.utils.data.Sampler):
     replacement for a subject with fewer than ``block_size`` clips. ``__iter__``
     re-seeds from ``seed + epoch`` so every epoch sees fresh blocks while a
     fixed ``seed`` keeps tests deterministic.
+
+    ``window_clips`` > 0 (temporal-proximity / HARD negatives): confine each
+    block's ``block_size`` clips to a random CONTIGUOUS run of ``window_clips``
+    clips instead of the whole subject. Paired with the dataset's clip-local
+    jitter (``--egobrain_block_window_s`` sets both), the block collapses to a
+    time window of ~``window_clips * clip_s``, so in-batch negatives are
+    seconds-to-minutes from the anchor — same coarse state, different motor
+    content — instead of ~30 min apart. ``clip_weights`` (per-subject per-clip
+    motion, from the dataset) biases WHICH contiguous run is picked toward
+    dynamic regions, so proximity blocks keep the motion focus ``motion_resample``
+    provides; omit it (or None) for uniform window placement.
     """
 
     def __init__(self, items, batch_size: int, block_size: int,
-                 num_batches: int, seed: int = 0):
+                 num_batches: int, seed: int = 0, window_clips: int = 0,
+                 clip_weights: Optional[dict] = None):
         if block_size < 1:
             raise ValueError(f"block_size must be >= 1, got {block_size}")
         if batch_size % block_size != 0:
@@ -1458,6 +1516,8 @@ class SubjectBlockBatchSampler(torch.utils.data.Sampler):
         for gi, it in enumerate(items):
             by_sub[it[0]].append(gi)          # it == (subject, clip_idx)
         self.subjects = list(by_sub.keys())
+        # pools[si] is in clip order (items are built subject-major, clip 0..n),
+        # so a contiguous slice pool[c0:c0+M] == clips c0..c0+M-1 == a time window.
         self.pools = [torch.tensor(by_sub[s], dtype=torch.long)
                       for s in self.subjects]
         self.block_size = int(block_size)
@@ -1465,10 +1525,46 @@ class SubjectBlockBatchSampler(torch.utils.data.Sampler):
         self.batch_size = int(batch_size)
         self.num_batches = int(num_batches)
         self.seed = int(seed)
+        self.window_clips = int(window_clips)
         self._epoch = 0
+        # Per-subject window-start CDF: None -> the whole pool is the "run"
+        # (no windowing, or subject smaller than the window); else a length
+        # (n - window_clips + 1) CDF over contiguous window starts, uniform or
+        # motion-biased (sliding-window sum of clip_weights).
+        self._win_cdf: list = []
+        for si, s in enumerate(self.subjects):
+            n = int(self.pools[si].numel())
+            if self.window_clips <= 0 or n <= self.window_clips:
+                self._win_cdf.append(None)
+                continue
+            M = self.window_clips
+            n_starts = n - M + 1
+            ws = None
+            cw = clip_weights.get(s) if clip_weights is not None else None
+            if cw is not None and np.asarray(cw).shape[0] >= n:
+                cw = np.asarray(cw, dtype=np.float64)[:n]
+                csum = np.concatenate([[0.0], np.cumsum(cw)])
+                ws = csum[M:M + n_starts] - csum[0:n_starts]    # window motion sum
+                if not (ws.sum() > 0):
+                    ws = None
+            if ws is None:
+                ws = np.ones(n_starts, dtype=np.float64)
+            self._win_cdf.append(
+                torch.tensor(np.cumsum(ws / ws.sum()), dtype=torch.float64))
 
     def __len__(self):
         return self.num_batches
+
+    def _draw_run(self, si: int, g: torch.Generator) -> torch.Tensor:
+        """Contiguous clip run (a time window) for a block from subject ``si``."""
+        pool = self.pools[si]
+        cdf = self._win_cdf[si]
+        if cdf is None:
+            return pool
+        u = torch.rand(1, generator=g).item()
+        c0 = int(torch.searchsorted(cdf, torch.tensor(u, dtype=torch.float64)))
+        c0 = min(c0, int(pool.numel()) - self.window_clips)
+        return pool[c0:c0 + self.window_clips]
 
     def __iter__(self):
         g = torch.Generator()
@@ -1479,13 +1575,13 @@ class SubjectBlockBatchSampler(torch.utils.data.Sampler):
             batch: list = []
             sub_ids = torch.randint(0, n_sub, (self.n_blocks,), generator=g)
             for si in sub_ids.tolist():
-                pool = self.pools[si]
-                n = int(pool.numel())
-                if n >= self.block_size:
-                    sel = pool[torch.randperm(n, generator=g)[:self.block_size]]
-                else:                          # subject too small -> with replacement
-                    sel = pool[torch.randint(0, n, (self.block_size,),
-                                             generator=g)]
+                run = self._draw_run(si, g)
+                nr = int(run.numel())
+                if nr >= self.block_size:
+                    sel = run[torch.randperm(nr, generator=g)[:self.block_size]]
+                else:                          # window/subject smaller than block
+                    sel = run[torch.randint(0, nr, (self.block_size,),
+                                            generator=g)]
                 batch.extend(sel.tolist())
             yield batch
 

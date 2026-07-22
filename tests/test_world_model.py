@@ -1211,6 +1211,44 @@ class TestSubjectBlockBatchSampler(unittest.TestCase):
                                num_batches=3, seed=0))
         self.assertEqual(a, b, 'same seed -> same first epoch')
 
+    # --- temporal-proximity window (hard negatives) --------------------------
+
+    def test_windowed_block_is_contiguous_run(self):
+        # 100 clips, window=10 -> a block's 8 clips lie within a 10-clip window.
+        items = [('A', c) for c in range(100)]
+        s = self._sampler(items=items, batch_size=8, block_size=8,
+                          num_batches=50, seed=0, window_clips=10)
+        for b in list(s):
+            self.assertEqual(len(b), 8)
+            self.assertLessEqual(max(b) - min(b), 9)   # gi==clip for one subject
+
+    def test_motion_biased_window_favors_high_motion(self):
+        import numpy as np
+        items = [('A', c) for c in range(100)]
+        w = np.full(100, 0.01)
+        w[80:90] = 10.0                                # sharp motion peak
+        s = self._sampler(items=items, batch_size=8, block_size=8,
+                          num_batches=200, seed=0, window_clips=10,
+                          clip_weights={'A': w})
+        picks = [c for b in list(s) for c in b]
+        frac_peak = np.mean([80 <= c < 90 for c in picks])
+        self.assertGreater(frac_peak, 0.5)             # uniform would be ~0.10
+
+    def test_uniform_window_when_no_weights(self):
+        import numpy as np
+        items = [('A', c) for c in range(100)]
+        s = self._sampler(items=items, batch_size=8, block_size=8,
+                          num_batches=400, seed=0, window_clips=10)
+        picks = np.array([c for b in list(s) for c in b])
+        # windows placed uniformly -> starts roughly cover [0, 90]; not concentrated.
+        self.assertGreater(picks.max() - picks.min(), 60)
+
+    def test_window_larger_than_subject_uses_whole_pool(self):
+        s = self._sampler(items=[('A', c) for c in range(5)], batch_size=4,
+                          block_size=4, num_batches=10, seed=0, window_clips=20)
+        for b in list(s):
+            self.assertEqual(len(b), 4)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

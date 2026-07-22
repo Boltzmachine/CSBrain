@@ -101,6 +101,36 @@ class TestEgoBrainDataset(unittest.TestCase):
         self.assertEqual(sample['has_image'].dtype, torch.bool)
         self.assertFalse(sample['has_image'].any())
 
+    def test_local_jitter_confines_anchor_to_clip(self):
+        # For windowed proximity blocks, local_jitter must keep clip c's anchor
+        # within clip c (narrow), where global jitter spans the whole recording.
+        import numpy as np
+        from datasets.egobrain_dataset import EgoBrainDataset
+        cache = os.path.join(self.tmpdir, 'cache_lj')
+        _make_fake_cache(cache, sub='P0001', n_clips=20)
+        common = dict(data_dir=self.tmpdir, subjects=('P0001',), cache_dir=cache,
+                      in_dim=40, n_windows=2, window_s=1.0, stride_s=1.0,
+                      clip_s=4.0, load_frames=False, max_channels=32, jitter_seed=0)
+        dl = EgoBrainDataset(**common, local_jitter=True)
+        dg = EgoBrainDataset(**common, local_jitter=False)     # global jitter
+        grid, erp, clip = dl.grid_samples, dl.erp_samples, dl.clip_samples
+        span = (dl.n_windows - 1) * dl.stride_samples + dl.window_samples
+        room = clip - span
+
+        def starts(ds, c, n=400):
+            ds._anchor_rng = np.random.default_rng(1)
+            ks = np.array([ds._sample_base_slot('P0001', c) for _ in range(n)])
+            return ks * grid - erp                             # window-0 START
+
+        for c in (5, 10, 15):
+            s = starts(dl, c)
+            self.assertGreaterEqual(int(s.min()), c * clip - grid)
+            self.assertLessEqual(int(s.max()), c * clip + room + grid)
+            self.assertLessEqual(int(s.max() - s.min()), room + grid)  # narrow
+        # Global jitter for the SAME clip spans many clips (wide).
+        g = starts(dg, 10)
+        self.assertGreater(int(g.max() - g.min()), 3 * clip)
+
     def test_collate_keys(self):
         from datasets.egobrain_dataset import collate_egobrain
         ds = self._make_ds(n_windows=2, in_dim=40)

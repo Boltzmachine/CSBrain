@@ -424,6 +424,18 @@ def main():
                              'by N (and by N*num_dp_gpus under DataParallel so blocks stay '
                              'whole per replica). 0 (default) = shuffled RandomSampler, '
                              'byte-identical to prior runs.')
+    parser.add_argument('--egobrain_block_window_s', type=float, default=0.0,
+                        help='with --egobrain_subject_block>0: confine each block to a random '
+                             'CONTIGUOUS time window of ~this many seconds (HARD negatives) '
+                             'instead of drawing block-mates uniformly across the ~90min '
+                             'recording (~30min apart = easy). Switches the anchor draw to '
+                             'clip-local jitter so contiguous clips map to a tight window; '
+                             'block-mates then sit ~window_s/3 apart on average. When '
+                             '--egobrain_motion_resample is also on, the window PLACEMENT is '
+                             'motion-biased so proximity blocks still land on dynamic regions. '
+                             '0 (default) = whole-recording blocks. Tighten the exclusion '
+                             '(--wm_frame_contrast_excl_s) as the window shrinks toward the '
+                             'movement autocorrelation (~1-2s) to avoid false negatives.')
     parser.add_argument('--egobrain_use_grid_embeddings', action='store_true', default=False,
                         help='with --egobrain_use_frame_grid, read PRE-COMPUTED frozen '
                              'DINOv2 embeddings (cls/grid + flips) from the time-keyed '
@@ -550,6 +562,12 @@ def main():
         _excl_s = params.egobrain_window_s
     params.wm_frame_contrast_excl_samples = (
         int(round(_excl_s * 200)) if params.egobrain_subject_block > 0 else 0)
+    # The temporal-proximity window rides on the subject-block sampler (it only
+    # controls WHICH clips land in a block); it is meaningless without it.
+    if params.egobrain_block_window_s > 0 and params.egobrain_subject_block <= 0:
+        parser.error('--egobrain_block_window_s requires --egobrain_subject_block>0 '
+                     '(the window confines the block sampler; there is no block to '
+                     'confine otherwise).')
 
     # --- Euclidean Alignment sidecars (per-subject whitening matrices) ---
     # When --use_euclidean_alignment is on, load whichever sidecars the
@@ -958,6 +976,7 @@ def main():
             frame_grid_dir=params.egobrain_frame_grid_dir,
             frame_grid_s=params.egobrain_frame_grid_s,
             temporal_jitter=not params.egobrain_no_temporal_jitter,
+            local_jitter=params.egobrain_block_window_s > 0,
             use_grid_embeddings=params.egobrain_use_grid_embeddings,
             emb_grid_dir=params.egobrain_emb_grid_dir,
             video_subjects=_resolve_video_subjects(params.egobrain_video_subjects),
@@ -987,16 +1006,32 @@ def main():
             # batch_size / sampler / drop_last, so pass it alone. num_batches
             # matches the RandomSampler epoch length it replaces.
             from datasets.egobrain_dataset import SubjectBlockBatchSampler
+            # Temporal-proximity window (hard negatives): confine each block to a
+            # contiguous run of ~block_window_s worth of clips, motion-biased so
+            # windows still land on dynamic regions (reuses the per-clip motion
+            # weights the dataset computed for motion_resample).
+            window_clips = (
+                max(1, int(math.ceil(params.egobrain_block_window_s
+                                     / params.egobrain_clip_s)))
+                if params.egobrain_block_window_s > 0 else 0)
             batch_sampler = SubjectBlockBatchSampler(
                 pretrained_dataset._items,
                 batch_size=params.batch_size,
                 block_size=params.egobrain_subject_block,
                 num_batches=n_samples_per_epoch // params.batch_size,
                 seed=params.seed,
+                window_clips=window_clips,
+                clip_weights=(pretrained_dataset._clip_motion_w
+                              if window_clips > 0 else None),
             )
-            print(f'[EgoBrain] subject-block loading ON: block={params.egobrain_subject_block} '
+            _win_msg = (
+                f'window_clips={window_clips} '
+                f'(~{window_clips * params.egobrain_clip_s:.0f}s proximity window)'
+                if window_clips > 0 else 'whole-recording blocks')
+            print(f'[EgoBrain] subject-block loading ON: '
+                  f'block={params.egobrain_subject_block} '
                   f'blocks/batch={params.batch_size // params.egobrain_subject_block} '
-                  f'excl_samples={params.wm_frame_contrast_excl_samples}')
+                  f'excl_samples={params.wm_frame_contrast_excl_samples} {_win_msg}')
             data_loader = DataLoader(
                 pretrained_dataset,
                 num_workers=num_workers,

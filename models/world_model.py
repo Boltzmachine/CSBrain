@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.util import generate_mask
+from models.lewm_modules import SIGReg
 
 
 # Dataset-level mean per-patch L1 motion between the window-0 anchor grid and each
@@ -282,6 +283,182 @@ class FramePredictor(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Frame predictor with AdaLN-zero EEG conditioning (wm_predictor='frame_adaln')
+# ---------------------------------------------------------------------------
+
+class FrameAdaLNPredictor(nn.Module):
+    """Dense multi-frame predictor with LeWM-style AdaLN-zero EEG conditioning.
+
+    Same OBJECTIVE and I/O contract as :class:`FramePredictor` — predict the next
+    ``H = max_horizon`` per-patch frame grids from the anchor (current) frame grid,
+    ``(B, H, P, frame_dim)`` — so it drops straight into ``_frame_prediction_step``
+    (dense, from-the-current-frame, NOT autoregressive). The difference is HOW the
+    EEG is injected:
+
+      * FramePredictor : the EEG tokens are CONCATENATED with anchor + learned
+        query tokens and everything attends to everything (query-transformer style).
+      * this predictor : the EEG is a CONDITIONING signal that modulates each
+        transformer block via AdaLN-zero (shift / scale / gate), exactly like
+        LeWorldModel's ``ConditionalBlock`` (there the action does this). The EEG
+        token set is reduced to one vector per sample (masked mean over the valid
+        tokens, or the global rep) and combined with a per-horizon-step embedding,
+        so step tau's patch tokens get EEG-derived modulation specific to that step.
+
+    The frame tokens are the anchor grid replicated over the H steps (+ spatial and
+    step position embeddings) and attention is BIDIRECTIONAL (every query patch may
+    attend to every other). AdaLN-zero init => at start the blocks are the identity
+    and, with the anchor residual, the prediction copies the anchor; the EEG-driven
+    modulation then has to supply the motion (mirrors FramePredictor's residual).
+    """
+
+    def __init__(
+        self,
+        frame_dim: int,
+        eeg_dim: int,
+        predictor_d_model: int = 512,
+        n_layers: int = 4,
+        n_heads: int = 8,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        max_horizon: int = 5,
+        max_patches: int = 1024,
+        pred_residual: bool = True,
+    ):
+        super().__init__()
+        from models.lewm_modules import ConditionalBlock
+        D = predictor_d_model
+        self.frame_dim = frame_dim
+        self.eeg_dim = eeg_dim
+        self.predictor_d_model = D
+        self.max_horizon = int(max_horizon)
+        self.pred_residual = bool(pred_residual)
+
+        self.in_proj_frame = nn.Linear(frame_dim, D)
+        self.eeg_proj = nn.Linear(eeg_dim, D)                # EEG summary -> cond
+
+        # Spatial (patch) + step (horizon) position embeddings for the frame
+        # tokens, and a per-step conditioning offset added to the EEG cond vector.
+        self.spatial_pos = nn.Parameter(torch.zeros(1, max_patches, D))
+        nn.init.trunc_normal_(self.spatial_pos, std=0.02)
+        self.step_pos = nn.Parameter(torch.zeros(1, self.max_horizon, 1, D))
+        nn.init.trunc_normal_(self.step_pos, std=0.02)
+        self.step_cond = nn.Parameter(torch.zeros(1, self.max_horizon, D))
+        nn.init.trunc_normal_(self.step_cond, std=0.02)
+
+        dim_head = max(1, D // n_heads)
+        self.blocks = nn.ModuleList([
+            ConditionalBlock(D, heads=n_heads, dim_head=dim_head,
+                             mlp_dim=dim_feedforward, dropout=dropout, causal=False)
+            for _ in range(n_layers)
+        ])
+        self.norm = nn.LayerNorm(D)
+        self.out_proj = nn.Linear(D, frame_dim)
+
+    def forward(
+        self,
+        s_anchor: torch.Tensor,    # (B, P, frame_dim) — window-0 anchor grid
+        eeg_emb: torch.Tensor,     # (B, eeg_dim) global OR (B, M, eeg_dim) tokens
+        eeg_key_padding_mask: Optional[torch.Tensor] = None,  # (B, M) True=ignore
+    ) -> torch.Tensor:
+        """Return the dense grid stack ``(B, H, P, frame_dim)``."""
+        B, P, _ = s_anchor.shape
+        assert P <= self.spatial_pos.size(1), (
+            f"FrameAdaLNPredictor received {P} patches, larger than "
+            f"max_patches={self.spatial_pos.size(1)}")
+        H, D = self.max_horizon, self.predictor_d_model
+
+        # EEG -> single conditioning vector (masked mean over valid tokens, or the
+        # global vector), then a per-step conditioning cond[:, tau] = eeg + step_cond.
+        if eeg_emb.dim() == 3:
+            if eeg_key_padding_mask is not None:
+                v = (~eeg_key_padding_mask).to(eeg_emb.dtype).unsqueeze(-1)  # (B,M,1)
+                eeg_vec = (eeg_emb * v).sum(1) / v.sum(1).clamp(min=1.0)
+            else:
+                eeg_vec = eeg_emb.mean(1)
+        else:
+            eeg_vec = eeg_emb
+        eeg_c = self.eeg_proj(eeg_vec)                        # (B, D)
+        cond = eeg_c.unsqueeze(1) + self.step_cond           # (B, H, D)
+        cond = cond.unsqueeze(2).expand(B, H, P, D).reshape(B, H * P, D)
+
+        # Frame tokens: anchor replicated over H steps + spatial + step pos.
+        anchor = self.in_proj_frame(s_anchor)                # (B, P, D)
+        x = anchor.unsqueeze(1).expand(B, H, P, D)
+        x = x + self.spatial_pos[:, :P].unsqueeze(1) + self.step_pos  # (B,H,P,D)
+        x = x.reshape(B, H * P, D)
+
+        for blk in self.blocks:
+            x = blk(x, cond)                                  # AdaLN-zero EEG cond
+        x = self.norm(x)
+        out = self.out_proj(x).reshape(B, H, P, self.frame_dim)
+        if self.pred_residual:
+            out = out + s_anchor.unsqueeze(1)                 # copy-the-anchor prior
+        return out
+
+
+# ---------------------------------------------------------------------------
+# LeWM autoregressive world-model head (wm_predictor='ar')
+# ---------------------------------------------------------------------------
+
+class ARWorldModel(nn.Module):
+    """LeWorldModel (LeWM) autoregressive head — the faithful port.
+
+    Bundles the LeWM building blocks (see models/lewm_modules.py) for the
+    causal next-embedding objective:
+
+      * ``projector``      — frame CLS (trainable-ViT hidden) -> embed_dim (BN-MLP)
+      * ``action_encoder`` — per-window EEG global rep -> action embedding
+      * ``predictor``      — causal AR transformer, AdaLN-zero conditioned on the
+                             action (LeWM ``ARPredictor``)
+      * ``pred_proj``      — predictor output -> embed_dim (BN-MLP)
+
+    The EEG plays LeWM's *action* role: window ``t``'s EEG conditions the
+    prediction of frame ``t+1`` from frame ``t``, so the AR prediction loss
+    trains the EEG foundation model jointly with the world model. The wrapper
+    drives these in ``WorldModelWrapper._ar_prediction_step``.
+    """
+
+    def __init__(self, frame_dim, eeg_dim, embed_dim=192, act_dim=None,
+                 history=3, num_preds=1, depth=6, heads=16, mlp_dim=2048,
+                 dim_head=64, dropout=0.1, proj_hidden=2048):
+        super().__init__()
+        from models.lewm_modules import ARPredictor, Embedder, MLP
+        act_dim = int(act_dim) if act_dim else int(embed_dim)
+        self.embed_dim = int(embed_dim)
+        self.history = int(history)
+        self.num_preds = int(num_preds)
+        # LeWM projectors use BatchNorm1d (config/train/model/lewm.yaml).
+        self.projector = MLP(frame_dim, proj_hidden, embed_dim,
+                             norm_fn=nn.BatchNorm1d)
+        self.pred_proj = MLP(embed_dim, proj_hidden, embed_dim,
+                             norm_fn=nn.BatchNorm1d)
+        self.action_encoder = Embedder(
+            input_dim=eeg_dim, smoothed_dim=eeg_dim, emb_dim=act_dim)
+        self.predictor = ARPredictor(
+            num_frames=history, depth=depth, heads=heads, mlp_dim=mlp_dim,
+            input_dim=embed_dim, hidden_dim=embed_dim, output_dim=embed_dim,
+            dim_head=dim_head, dropout=dropout)
+        # Uniform interface: AR consumes T = history + num_preds frame windows;
+        # expose max_horizon so the wrapper's W>=max_horizon+1 style checks hold.
+        self.max_horizon = self.history + self.num_preds - 1
+
+    def project_frames(self, cls):
+        """(B, T, frame_dim) -> (B, T, embed_dim)."""
+        B, T, d = cls.shape
+        return self.projector(cls.reshape(B * T, d)).reshape(B, T, self.embed_dim)
+
+    def encode_action(self, eeg_global):
+        """(B, T, eeg_dim) -> (B, T, act_dim)."""
+        return self.action_encoder(eeg_global)
+
+    def predict(self, ctx_emb, ctx_act):
+        """(B, H, embed), (B, H, act) -> (B, H, embed)."""
+        pred = self.predictor(ctx_emb, ctx_act)
+        B, H, d = pred.shape
+        return self.pred_proj(pred.reshape(B * H, d)).reshape(B, H, self.embed_dim)
+
+
+# ---------------------------------------------------------------------------
 # Wrapper
 # ---------------------------------------------------------------------------
 
@@ -319,10 +496,17 @@ class WorldModelWrapper(nn.Module):
         frame_contrast_detach_neg: bool = True,
         frame_contrast_batched: bool = False,
         frame_contrast_excl_samples: int = 0,
+        scratch_vit: bool = False,
+        sigreg_weight: float = 0.0,
+        sigreg_knots: int = 17,
+        sigreg_num_proj: int = 1024,
+        wm_predictor: str = 'frame',
     ):
         super().__init__()
         assert objective in ('eeg', 'frame'), (
             f"objective must be 'eeg' or 'frame', got {objective!r}")
+        assert wm_predictor in ('frame', 'ar', 'frame_adaln'), (
+            f"wm_predictor must be 'frame', 'frame_adaln' or 'ar', got {wm_predictor!r}")
         assert frame_eeg_cond in ('global', 'tokens'), (
             f"frame_eeg_cond must be 'global' or 'tokens', got {frame_eeg_cond!r}")
         assert frame_motion_alpha >= 0.0, (
@@ -422,6 +606,24 @@ class WorldModelWrapper(nn.Module):
         # reconstruction + image alignment + aux terms are untouched either way.
         self.objective = objective
         self.encoder = encoder
+        # ---- LeWM from-scratch world model (scratch_vit) ----
+        # ``scratch_vit`` == the encoder owns a TRAINABLE from-scratch ViT
+        # (CSBrainAlign.vision_trainable). On this path the frame-prediction
+        # target is the ViT's OWN online embedding (no stop-grad, no EMA — see
+        # _frame_prediction_step / _ar_prediction_step), and collapse is held
+        # off SOLELY by SIGReg, the single LeWM regularizer. ``wm_predictor``
+        # selects the predictor: 'frame' reuses the dense EEG-conditioned
+        # FramePredictor; 'ar' uses the LeWM causal ARWorldModel head.
+        self.scratch_vit = bool(scratch_vit)
+        self.wm_predictor = wm_predictor
+        self.sigreg_weight = float(sigreg_weight)
+        # Build SIGReg ONLY on the scratch path. It is never used off it (the
+        # SIGReg loss terms are gated on the encoder's vision_trainable / the AR
+        # predictor), and gating construction here keeps the frozen path's
+        # state_dict + parameters byte-identical even though --wm_sigreg_weight
+        # defaults to 0.09 (so a scratch run is collapse-safe by default).
+        self.sigreg = (SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
+                       if (sigreg_weight > 0 and self.scratch_vit) else None)
         # Multiplier on the bilateralization flipped-prediction terms (predict
         # the flipped-future EEG latent from the flipped-current). Only active
         # when the encoder has the learned x_bi/x_lat split (lateralization_flip)
@@ -1036,6 +1238,11 @@ class WorldModelWrapper(nn.Module):
         pv_f = batch.get('pixel_values_future')   # (M, W, 3, H, W) raw frames or None
         if has_f is None or (gfut is None and pv_f is None):
             return out, info
+        if getattr(self.encoder, 'vision_trainable', False):
+            # The trainable ViT must run LIVE on raw pixels; cached grids would
+            # bypass it (zero gradient). Guard against a mis-set data path.
+            assert gfut is None, (
+                "scratch_vit needs raw pixels; disable --egobrain_use_grid_embeddings")
 
         # Frame-window count W comes from whichever frame source is present. With
         # cached grid embeddings the raw pixel stack is a 1x1 placeholder
@@ -1100,16 +1307,29 @@ class WorldModelWrapper(nn.Module):
                 # and the prediction targets share one orientation per row.
                 fv = flip[valid].view(-1, 1, 1, 1, 1)          # (Bv,1,1,1,1) bool
                 pv = torch.where(fv, torch.flip(pv, dims=[-1]), pv)
-            # Frozen vision-encoder grids for anchor (0) + targets (1..H).
-            # Detached: the encoder has no trainable parameters here, so
-            # gradients flow only through eeg_emb + the predictor.
-            with torch.no_grad():
-                grids = []
-                for w in range(H + 1):
-                    g = self.encoder._image_patch_grid(pv[:, w])   # (Bv, s, s, d)
-                    grids.append(g.reshape(g.size(0), -1, g.size(-1)))  # (Bv,P,d)
-            s_anchor = grids[0]
-            s_tgt = torch.stack(grids[1:H + 1], dim=1).detach()    # (Bv, H, P, d)
+            if getattr(self.encoder, 'vision_trainable', False):
+                # LeWM from-scratch ViT: encode anchor (0) + targets (1..H) WITH
+                # gradient and do NOT detach the target — the prediction target
+                # is the ONLINE ViT's own future grid (faithful LeWM: no
+                # stop-grad, no EMA). Collapse is held off by SIGReg (added
+                # after the loss below), not by a frozen target.
+                d_img = self.encoder.image_feature_dim
+                grids = [self.encoder._scratch_patch_grid(pv[:, w]).reshape(
+                             pv.size(0), -1, d_img)                # (Bv, P, d)
+                         for w in range(H + 1)]
+                s_anchor = grids[0]
+                s_tgt = torch.stack(grids[1:H + 1], dim=1)         # (Bv,H,P,d) online
+            else:
+                # Frozen vision-encoder grids for anchor (0) + targets (1..H).
+                # Detached: the encoder has no trainable parameters here, so
+                # gradients flow only through eeg_emb + the predictor.
+                with torch.no_grad():
+                    grids = []
+                    for w in range(H + 1):
+                        g = self.encoder._image_patch_grid(pv[:, w])   # (Bv, s, s, d)
+                        grids.append(g.reshape(g.size(0), -1, g.size(-1)))  # (Bv,P,d)
+                s_anchor = grids[0]
+                s_tgt = torch.stack(grids[1:H + 1], dim=1).detach()    # (Bv, H, P, d)
 
         # Per-(row, step) target validity: future frame exists at that step.
         tgt_valid = has_f[valid][:, 1:H + 1].to(s_tgt.dtype)   # (Bv, H)
@@ -1135,6 +1355,24 @@ class WorldModelWrapper(nn.Module):
         # Reuse ``latent_pred_weight`` as the predictor's loss weight (the
         # objective is a swap-in, not an addition), ramped the same way.
         info['frame_pred_loss'] = (self.latent_pred_weight * scale, pred_loss)
+
+        # SIGReg — LeWM's sole collapse guard on the trainable-ViT path. Since
+        # the target grids are the ONLINE ViT's own (non-detached) embeddings,
+        # a constant collapse would trivially minimise the L1; SIGReg pushes the
+        # grid-embedding batch toward an isotropic Gaussian so that solution is
+        # penalised. Fed as (N, Bv, d) with N=(H+1)*P (the batch axis Bv is the
+        # distribution SIGReg tests). Only on the scratch path.
+        if (self.sigreg is not None and self.sigreg_weight > 0
+                and getattr(self.encoder, 'vision_trainable', False)):
+            all_emb = torch.cat([s_anchor.unsqueeze(1), s_tgt], dim=1)  # (Bv,H+1,P,d)
+            Bvv, Hp1, Pp, dd = all_emb.shape
+            sig_in = all_emb.permute(1, 2, 0, 3).reshape(Hp1 * Pp, Bvv, dd)
+            info['sigreg_loss'] = (self.sigreg_weight, self.sigreg(sig_in))
+            with torch.no_grad():
+                # Direct collapse monitor: batch-wise std of the ViT grid
+                # embeddings -> 0 iff they collapse to a constant. Complements
+                # sigreg_loss (which SIGReg is meant to keep small WITHOUT collapse).
+                info['diag_frame_emb_std'] = all_emb.detach().float().std(dim=0).mean()
 
         # Negative-EEG contrastive term: penalise the predictor for reproducing the
         # true future from OTHER rows' EEG on the same anchor, so the copy shortcut
@@ -1207,6 +1445,127 @@ class WorldModelWrapper(nn.Module):
             info['diag_frame_l1_step1'] = step_l1[0]
             info['diag_frame_l1_stepH'] = step_l1[-1]
 
+        return out, info
+
+    def _encode_windows_global(self, batch, cb_idx, valid, n_win):
+        """Per-window EEG global rep for the first ``n_win`` future windows,
+        restricted to the (cb -> valid) rows. Encodes with the ONLINE encoder
+        (gradient flows) so the AR 'action' trains the EEG foundation model.
+        Returns (Bv, n_win, d_model).
+
+        Windows are folded into the batch dim (Bv*n_win rows) for a single
+        encoder forward; per-sample fields (ch_coords / masks / ch_names) are
+        repeat-interleaved so row order matches the folded timeseries.
+        """
+        ts = batch['timeseries_future'][valid][:, :n_win] / 100.0   # (Bv,n,C,N,d)
+        Bv, n, C, N, d = ts.shape
+        sub = {
+            'timeseries': ts.reshape(Bv * n, C, N, d),
+            'ch_coords': batch['ch_coords'][cb_idx][valid].repeat_interleave(n, dim=0),
+        }
+        for k in ('valid_channel_mask', 'valid_length_mask'):
+            if k in batch:
+                sub[k] = batch[k][cb_idx][valid].repeat_interleave(n, dim=0)
+        if 'ch_names' in batch:
+            names = [batch['ch_names'][i] for i in cb_idx.tolist()]
+            names = [nm for nm, v in zip(names, valid.tolist()) if v]
+            sub['ch_names'] = [nm for nm in names for _ in range(n)]
+        _, finfo = self.encoder(sub, encoder_only=True)
+        return finfo['global_rep'].reshape(Bv, n, -1)               # (Bv,n,d_model)
+
+    def _ar_prediction_step(self, out, info: dict, batch: dict,
+                            cb_idx: torch.Tensor,
+                            cond_info: Optional[dict] = None):
+        """LeWM autoregressive frame-prediction (``wm_predictor='ar'``).
+
+        Encodes the first ``T = history + num_preds`` frames' CLS with the
+        trainable ViT (``e``) and the first ``history`` EEG windows' global rep
+        (the per-step 'action'), then predicts each next-frame embedding
+        autoregressively conditioned on the EEG. The target is the ONLINE ViT's
+        own shifted embedding (no stop-grad, no EMA — faithful LeWM); SIGReg on
+        ``e`` is the sole collapse guard.
+        """
+        pv_f = batch.get('pixel_values_future')   # (M, W, 3, Hh, Ww)
+        has_f = batch.get('has_image_future')     # (M, W)
+        ts_f = batch.get('timeseries_future')     # (M, W, C, N, d)
+        if pv_f is None or has_f is None or ts_f is None:
+            return out, info
+        assert 'frame_grid_future' not in batch, (
+            "AR world model needs raw pixels; disable --egobrain_use_grid_embeddings")
+        ar = self.predictor
+        W = pv_f.size(1)
+        T = ar.history + ar.num_preds
+        assert W >= T, (
+            f"AR world model needs W>={T} frame windows "
+            f"(history={ar.history}+num_preds={ar.num_preds}), got W={W}")
+        # The AR 'action' needs per-window EEG, but the frame-objective collate
+        # trims timeseries_future to window 0 (egobrain_dataset.py: ts_all[:, :1]).
+        # Fail loudly rather than silently broadcasting window-0 EEG across every
+        # step: the AR path needs the collate to keep >= history EEG windows.
+        assert ts_f.size(1) >= ar.history, (
+            f"--wm_predictor ar needs >= history={ar.history} EEG windows in "
+            f"timeseries_future, but it has {ts_f.size(1)} (the frame-objective "
+            f"collate trims timeseries_future to window 0). Keep the full EEG-window "
+            f"stack in the collate before using the AR predictor.")
+
+        # Rows whose first T frames ALL exist (the AR chain needs a contiguous
+        # span; missing frames at clip edges / blacklisted subjects are dropped).
+        valid = has_f[:, :T].all(dim=1)                    # (M,)
+        Bv = int(valid.sum().item())
+        if Bv == 0:
+            return out, info
+
+        pv = pv_f[valid][:, :T]                            # (Bv, T, 3, Hh, Ww)
+        Hh, Ww = pv.shape[-2], pv.shape[-1]
+        # Frame CLS via the trainable ViT (grad ON, NOT detached — the target is
+        # the online embedding).
+        cls = self.encoder._scratch_cls(
+            pv.reshape(Bv * T, 3, Hh, Ww))[:, 0]           # (Bv*T, d_vit)
+        cls = cls.reshape(Bv, T, -1)
+        e = ar.project_frames(cls)                         # (Bv, T, embed)
+
+        # Per-window EEG global rep as the 'action' (grad ON: trains the EEG FM).
+        eeg_g = self._encode_windows_global(batch, cb_idx, valid, ar.history)
+        act = ar.encode_action(eeg_g)                      # (Bv, history, act)
+
+        ctx_emb = e[:, :ar.history]                        # (Bv, history, embed)
+        tgt = e[:, ar.num_preds:ar.num_preds + ar.history]  # online, NO detach
+        pred = ar.predict(ctx_emb, act)                    # (Bv, history, embed)
+
+        pred_loss = (pred - tgt).pow(2).mean()
+        scale = self._pred_weight_scale()
+        info['ar_pred_loss'] = (self.latent_pred_weight * scale, pred_loss)
+
+        if self.sigreg is not None and self.sigreg_weight > 0:
+            # SIGReg over the T frame embeddings; (T, Bv, embed) — Bv is the
+            # distribution axis SIGReg tests toward isotropic Gaussian.
+            info['sigreg_loss'] = (self.sigreg_weight,
+                                   self.sigreg(e.transpose(0, 1)))
+            with torch.no_grad():
+                # Direct collapse monitor (batch-wise std -> 0 iff collapsed).
+                info['diag_ar_emb_std'] = e.detach().float().std(dim=0).mean()
+
+        with torch.no_grad():
+            info['diag_ar_n_rows'] = torch.tensor(float(Bv), device=e.device)
+            info['diag_ar_emb_norm'] = e.flatten(end_dim=-2).norm(dim=-1).mean()
+            info['diag_ar_pred_norm'] = pred.flatten(end_dim=-2).norm(dim=-1).mean()
+            a = F.normalize(pred.flatten(end_dim=-2), dim=-1)
+            b = F.normalize(tgt.flatten(end_dim=-2), dim=-1)
+            info['diag_ar_pred_cos'] = (a * b).sum(-1).mean()
+            # Does the EEG 'action' help vs a zero action? >0 == EEG is used.
+            # Run the predictor in EVAL for this extra forward: pred_proj has a
+            # BatchNorm1d whose running stats update even under no_grad in train
+            # mode, so logging this diagnostic would otherwise mutate the model
+            # with the artificial zero-action distribution.
+            was_training = ar.training
+            ar.eval()
+            try:
+                pred_zero = ar.predict(ctx_emb, torch.zeros_like(act))
+            finally:
+                if was_training:
+                    ar.train()
+            info['diag_ar_eeg_gap'] = (pred_zero - tgt).pow(2).mean() - pred_loss
+            info['diag_pred_ramp_scale'] = torch.tensor(scale, device=e.device)
         return out, info
 
     def training_step(self, batch: dict, mask: Optional[torch.Tensor] = None):
@@ -1311,6 +1670,12 @@ class WorldModelWrapper(nn.Module):
             # to the cb rows (the frame stack's row order) so each frame is
             # mirrored iff its own EEG row was presented mirrored.
             flip_cb = flip.index_select(0, cb_idx) if flip is not None else None
+            if self.wm_predictor == 'ar':
+                # LeWM causal AR head (scratch ViT). Canonical orientation only
+                # (frame-averaging is not combined with the AR path), so flip is
+                # ignored here.
+                return self._ar_prediction_step(
+                    out, info, batch, cb_idx, cond_info=clean_cond_info)
             return self._frame_prediction_step(
                 out, info, batch, cb_idx, flip_cb, cond_info=clean_cond_info)
 

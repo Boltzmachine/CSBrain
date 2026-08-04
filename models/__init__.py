@@ -153,11 +153,24 @@ def get_model(params, brain_regions, sorted_indices):
             aux_hand_pred=getattr(params, 'aux_hand_pred', False),
             aux_hand_weight=getattr(params, 'aux_hand_weight', 0.1),
             use_brain_embed=getattr(params, 'use_brain_embed', False),
+            # From-scratch trainable ViT (LeWM). When a wm_scratch_vit checkpoint
+            # is finetuned via --model Align, the alignment target dim is the
+            # scratch ViT's hidden_size (e.g. 192 for 'tiny'), NOT DINOv2's 768,
+            # so contrastive_proj/alignment heads must be rebuilt at that dim to
+            # load the pretrained weights. Mirror the WorldModel branch. Defaults
+            # (scratch_vit=False) leave standard DINOv2 runs untouched.
+            scratch_vit=getattr(params, 'wm_scratch_vit', False),
+            scratch_vit_size=getattr(params, 'scratch_vit_size', 'tiny'),
+            scratch_vit_embed_dim=getattr(params, 'scratch_vit_embed_dim', None),
+            scratch_vit_patch=getattr(params, 'scratch_vit_patch', 16),
+            scratch_vit_depth=getattr(params, 'scratch_vit_depth', None),
+            scratch_vit_heads=getattr(params, 'scratch_vit_heads', None),
             **_spectral_band_kwargs(params),
         )
     elif params.model == 'WorldModel':
         from .alignment import CSBrainAlign
-        from .world_model import LatentPredictor, FramePredictor, WorldModelWrapper
+        from .world_model import (LatentPredictor, FramePredictor, WorldModelWrapper,
+                                   ARWorldModel, FrameAdaLNPredictor)
         _mbp = getattr(params, 'mamba_band_periods', None)
         if isinstance(_mbp, str) and _mbp:
             _mbp = eval(_mbp)
@@ -212,19 +225,57 @@ def get_model(params, brain_regions, sorted_indices):
             aux_hand_pred=getattr(params, 'aux_hand_pred', False),
             aux_hand_weight=getattr(params, 'aux_hand_weight', 0.1),
             use_brain_embed=getattr(params, 'use_brain_embed', False),
+            scratch_vit=getattr(params, 'wm_scratch_vit', False),
+            scratch_vit_size=getattr(params, 'scratch_vit_size', 'tiny'),
+            scratch_vit_embed_dim=getattr(params, 'scratch_vit_embed_dim', None),
+            scratch_vit_patch=getattr(params, 'scratch_vit_patch', 16),
+            scratch_vit_depth=getattr(params, 'scratch_vit_depth', None),
+            scratch_vit_heads=getattr(params, 'scratch_vit_heads', None),
             **_spectral_band_kwargs(params),
         )
         max_horizon = getattr(params, 'max_horizon', 1)
         wm_objective = getattr(params, 'wm_objective', 'eeg')
+        wm_predictor = getattr(params, 'wm_predictor', 'frame')
+        scratch_vit = getattr(params, 'wm_scratch_vit', False)
         # ``max_horizon == 0`` short-circuits the world-model components:
         # the wrapper reduces to plain CSBrainAlign (masked recon + image
         # alignment) so no predictor parameters enter the optimiser.
         if max_horizon <= 0:
             predictor = None
+        elif wm_objective == 'frame' and wm_predictor == 'ar':
+            # LeWM causal AR world model (scratch ViT): autoregressively predict
+            # the next frame's embedding conditioned on the per-window EEG
+            # ('action'). frame_dim = ViT hidden size; eeg_dim = EEG global width.
+            predictor = ARWorldModel(
+                frame_dim=encoder.image_feature_dim,
+                eeg_dim=params.d_model,
+                embed_dim=encoder.image_feature_dim,
+                history=getattr(params, 'wm_ar_history', 3),
+                num_preds=getattr(params, 'wm_ar_num_preds', 1),
+                depth=getattr(params, 'wm_ar_depth', 6),
+                heads=getattr(params, 'wm_ar_heads', 16),
+                dropout=getattr(params, 'dropout', 0.1),
+            )
+        elif wm_objective == 'frame' and wm_predictor == 'frame_adaln':
+            # Dense multi-frame predictor (from the current frame, like
+            # FramePredictor) but with EEG injected via AdaLN-zero conditioning
+            # (LeWM ConditionalBlock) instead of concatenated query/EEG tokens.
+            # Same I/O contract, so it reuses _frame_prediction_step. Uses the
+            # same predictor_* dims as FramePredictor.
+            predictor = FrameAdaLNPredictor(
+                frame_dim=encoder.image_feature_dim,
+                eeg_dim=params.d_model,
+                predictor_d_model=getattr(params, 'predictor_d_model', 512),
+                n_layers=getattr(params, 'predictor_n_layers', 4),
+                n_heads=getattr(params, 'predictor_n_heads', 8),
+                dim_feedforward=getattr(params, 'predictor_dim_feedforward', 1024),
+                dropout=getattr(params, 'dropout', 0.1),
+                max_horizon=max(max_horizon, 1),
+            )
         elif wm_objective == 'frame':
             # Cross-modal objective: predict the next frame's per-patch
             # embedding from the current frame's per-patch embedding conditioned
-            # on the current EEG embedding. ``frame_dim`` is the frozen vision
+            # on the current EEG embedding. ``frame_dim`` is the vision
             # encoder's hidden size; ``eeg_dim`` is the EEG global rep width.
             predictor = FramePredictor(
                 frame_dim=encoder.image_feature_dim,
@@ -272,6 +323,11 @@ def get_model(params, brain_regions, sorted_indices):
                 params, 'wm_frame_contrast_batched', False),
             frame_contrast_excl_samples=getattr(
                 params, 'wm_frame_contrast_excl_samples', 0),
+            scratch_vit=scratch_vit,
+            sigreg_weight=getattr(params, 'wm_sigreg_weight', 0.0),
+            sigreg_knots=getattr(params, 'wm_sigreg_knots', 17),
+            sigreg_num_proj=getattr(params, 'wm_sigreg_num_proj', 1024),
+            wm_predictor=wm_predictor,
         )
         return model
     elif params.model == 'ActionWorldModel':

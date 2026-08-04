@@ -62,10 +62,35 @@ class Trainer(object):
                 muon_lr=getattr(self.params, 'muon_lr', 0.02),
             )
         else:
-            trainable_params = [p for p in self.model.parameters()
-                                if p.requires_grad]
-            self.optimizer = torch.optim.AdamW(trainable_params, lr=self.params.lr,
-                                               weight_decay=self.params.weight_decay)
+            vision_lr = getattr(self.params, 'vision_lr', 0.0)
+            wm = self.model.module if hasattr(self.model, 'module') else self.model
+            has_scratch = getattr(
+                getattr(wm, 'encoder', None), 'vision_trainable', False)
+            if vision_lr and vision_lr > 0 and has_scratch:
+                # Separate LR group for the from-scratch ViT (--vision_lr).
+                vit_ids = {id(p) for p in
+                           wm.encoder.pretrained_image_encoder.parameters()}
+                vit_params = [p for p in self.model.parameters()
+                              if p.requires_grad and id(p) in vit_ids]
+                other_params = [p for p in self.model.parameters()
+                                if p.requires_grad and id(p) not in vit_ids]
+                self.optimizer = torch.optim.AdamW(
+                    [{'params': other_params, 'lr': self.params.lr},
+                     {'params': vit_params, 'lr': vision_lr}],
+                    lr=self.params.lr, weight_decay=self.params.weight_decay)
+            else:
+                trainable_params = [p for p in self.model.parameters()
+                                    if p.requires_grad]
+                self.optimizer = torch.optim.AdamW(trainable_params, lr=self.params.lr,
+                                                   weight_decay=self.params.weight_decay)
+        # bf16 autocast for the trainable ViT forward ONLY (the heavy part), applied
+        # inside CSBrainAlign._scratch_image_forward. We do NOT autocast the whole
+        # forward: the EEG encoder's FFT-based spectral ops (torch.fft.rfft) don't
+        # support bf16. bf16 needs no GradScaler.
+        self.amp = bool(getattr(self.params, 'amp', False)) and torch.cuda.is_available()
+        _wm = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(_wm, 'encoder') and hasattr(_wm.encoder, 'vision_amp'):
+            _wm.encoder.vision_amp = self.amp
         # Cache initial LRs so the linear warmup below scales each
         # param group proportionally rather than slamming them to a
         # single value (Muon + AdamW have different base LRs).

@@ -264,6 +264,60 @@ def main():
                         help="For --wm_objective frame: which EEG representation conditions the frame "
                              "predictor. 'global' (default): the window-level global rep (one vector). "
                              "'tokens': all EEG per-patch tokens (C*N tokens). Ignored for the eeg objective.")
+    # ---- LeWM from-scratch, jointly-trained world model (plans/mighty-dazzling-lovelace.md) ----
+    parser.add_argument('--wm_scratch_vit', action='store_true', default=False,
+                        help="Train the video world model FROM SCRATCH (LeWorldModel) instead of using a "
+                             "frozen pretrained DINOv2/V-JEPA. Replaces the vision encoder with a "
+                             "randomly-initialized TRAINABLE ViT (models/scratch_vit.py) EVERYWHERE — "
+                             "EEG<->frame alignment and the world-model frame prediction both run it live "
+                             "and it receives gradient. The prediction target is the ViT's OWN online "
+                             "embedding (no stop-grad, no EMA); collapse is held off SOLELY by SIGReg "
+                             "(--wm_sigreg_weight). REQUIRES --egobrain_use_frame_grid and is INCOMPATIBLE "
+                             "with --egobrain_use_grid_embeddings / --use_cached_embeddings (raw pixels "
+                             "must flow every step). --wm_objective must be 'frame'.")
+    parser.add_argument('--wm_predictor', type=str, default='frame',
+                        choices=['frame', 'frame_adaln', 'ar'],
+                        help="For --wm_scratch_vit: which predictor. 'frame' (default): dense "
+                             "EEG-conditioned FramePredictor, query-transformer style (keeps "
+                             "motion-weight / neg-EEG contrastive / flip / subject-block machinery). "
+                             "'frame_adaln': SAME dense multi-frame-from-current-frame objective + all "
+                             "that machinery, but the EEG is injected by AdaLN-zero conditioning (LeWM "
+                             "ConditionalBlock) instead of concatenated tokens. 'ar': LeWM causal "
+                             "ARPredictor over frame-CLS embeddings, conditioned per-step on the EEG.")
+    parser.add_argument('--wm_sigreg_weight', type=float, default=0.09,
+                        help="LeWM SIGReg regularizer weight (the single tunable loss weight). 0 disables "
+                             "SIGReg (unsafe with a trainable ViT — collapse risk). Default 0.09 (LeWM).")
+    parser.add_argument('--wm_sigreg_knots', type=int, default=17,
+                        help="SIGReg Epps-Pulley quadrature knots (LeWM default 17).")
+    parser.add_argument('--wm_sigreg_num_proj', type=int, default=1024,
+                        help="SIGReg random 1-D projections per step (LeWM default 1024).")
+    parser.add_argument('--scratch_vit_size', type=str, default='tiny',
+                        choices=['tiny', 'small', 'base'],
+                        help="From-scratch ViT preset (tiny=192d/12L/3H ~5.5M, LeWM default).")
+    parser.add_argument('--scratch_vit_embed_dim', type=int, default=None,
+                        help="Override the from-scratch ViT hidden size (must divide heads).")
+    parser.add_argument('--scratch_vit_patch', type=int, default=16,
+                        help="From-scratch ViT patch size (16 -> 14x14=196 patch grid at 224).")
+    parser.add_argument('--scratch_vit_depth', type=int, default=None,
+                        help="Override the from-scratch ViT depth (default: preset).")
+    parser.add_argument('--scratch_vit_heads', type=int, default=None,
+                        help="Override the from-scratch ViT attention heads (default: preset).")
+    parser.add_argument('--wm_ar_history', type=int, default=3,
+                        help="--wm_predictor ar: AR context length (LeWM history_size, default 3).")
+    parser.add_argument('--wm_ar_num_preds', type=int, default=1,
+                        help="--wm_predictor ar: prediction offset (LeWM num_preds, default 1).")
+    parser.add_argument('--wm_ar_depth', type=int, default=6,
+                        help="--wm_predictor ar: AR transformer depth (LeWM default 6).")
+    parser.add_argument('--wm_ar_heads', type=int, default=16,
+                        help="--wm_predictor ar: AR transformer heads (LeWM default 16).")
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help="bf16 autocast for the trainable ViT forward ONLY (recommended with "
+                             "--wm_scratch_vit — the live ViT over ~6 frames/step is heavy in fp32). "
+                             "Scoped to the ViT (output cast back to fp32) so the EEG encoder's FFT "
+                             "spectral ops stay fp32. No GradScaler needed for bf16.")
+    parser.add_argument('--vision_lr', type=float, default=0.0,
+                        help="Separate learning rate for the trainable ViT param group (--wm_scratch_vit). "
+                             "0 (default) = use the single --lr for all params.")
     parser.add_argument('--wm_frame_motion_alpha', type=float, default=0.0,
                         help="For --wm_objective frame: per-patch motion weighting exponent on the dense "
                              "frame-prediction loss. 0 (default) = legacy UNIFORM mean over patches. >0 "
@@ -568,6 +622,21 @@ def main():
         parser.error('--egobrain_block_window_s requires --egobrain_subject_block>0 '
                      '(the window confines the block sampler; there is no block to '
                      'confine otherwise).')
+
+    # --- LeWM from-scratch world model guardrails ---
+    # A trainable from-scratch ViT must run LIVE on raw pixels every step, so the
+    # data path has to serve real 224² frames (not cached DINOv2 embeddings) and
+    # the objective must be the frame predictor.
+    if getattr(params, 'wm_scratch_vit', False):
+        if params.wm_objective != 'frame':
+            parser.error("--wm_scratch_vit requires --wm_objective frame.")
+        if not params.egobrain_use_frame_grid:
+            parser.error("--wm_scratch_vit requires --egobrain_use_frame_grid (the "
+                         "trainable ViT reads raw 224² frames from the grid cache).")
+        if params.egobrain_use_grid_embeddings or params.use_cached_embeddings:
+            parser.error("--wm_scratch_vit is incompatible with cached embeddings "
+                         "(--egobrain_use_grid_embeddings / --use_cached_embeddings): the "
+                         "trainable ViT must run live on raw pixels every step.")
 
     # --- Euclidean Alignment sidecars (per-subject whitening matrices) ---
     # When --use_euclidean_alignment is on, load whichever sidecars the

@@ -258,17 +258,19 @@ python pretrain_main.py \
     --aux_phase_weight 1.0 \
     --aux_envelope_weight 0.005 \
     --wm_objective frame \
+    --wm_predictor frame_adaln \
+    --wm_ar_depth 3 \
     --wm_frame_eeg_cond tokens \
     --vision_encoder facebook/dinov2-base \
-    --run_name wm-subj-hard \
+    --run_name wm-subj-adaln \
     --egobrain_motion_resample \
     --egobrain_motion_resample_space patch \
     --egobrain_motion_resample_metric cos \
     --egobrain_motion_resample_alpha 1.0 \
     --wm_frame_motion_alpha 0 \
-    --wm_frame_contrast_weight 1.0 \
+    --wm_frame_contrast_weight 0.0 \
     --egobrain_subject_block 8 \
-    --egobrain_block_window_s 10 \
+    --egobrain_block_window_s 0 \
     --wm_frame_contrast_excl_s 1.0  \
     --wm_frame_contrast_n_neg 3 \
     --wm_frame_contrast_temp 0.1 \

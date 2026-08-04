@@ -468,6 +468,13 @@ ARCH_PARAM_FIELDS = (
     # checkpoint trained with it True runs in a different architecture without
     # it, so finetuning must restore the flag (only affects ckpts that set it).
     'use_brain_embed',
+    # From-scratch trainable ViT (LeWM) replaces frozen DINOv2 as the alignment
+    # target. Its hidden_size (e.g. 192 for 'tiny') sets image_feature_dim ->
+    # contrastive_proj / alignment-head weight shapes, so finetune must rebuild
+    # with the same scratch config or the checkpoint load size-mismatches (192
+    # vs DINOv2's 768). Only affects wm_scratch_vit=True checkpoints.
+    'wm_scratch_vit', 'scratch_vit_size', 'scratch_vit_embed_dim',
+    'scratch_vit_patch', 'scratch_vit_depth', 'scratch_vit_heads',
 )
 
 

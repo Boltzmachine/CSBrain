@@ -851,7 +851,10 @@ class CSBrainAlign(nn.Module):
                  frame_averaging=False, frame_avg_flip_prob=0.5,
                  frame_avg_align_weight=1.0, frame_avg_recon_weight=1.0,
                  aux_hand_pred=False, aux_hand_weight=0.1, aux_hand_dim=2,
-                 use_brain_embed=False):
+                 use_brain_embed=False,
+                 scratch_vit=False, scratch_vit_size='tiny',
+                 scratch_vit_embed_dim=None, scratch_vit_patch=16,
+                 scratch_vit_depth=None, scratch_vit_heads=None):
         super().__init__()
         self.d_model = d_model
         # CSBrain spatial-mixing residual (models/CSBrain.py). When True, each
@@ -1000,16 +1003,40 @@ class CSBrainAlign(nn.Module):
         self.BrainEmbedEEGLayer = BrainEmbedEEGLayer(dim_in=d_model, dim_out=d_model)
         self.sorted_indices = sorted_indices
 
-        # Frozen pretrained vision encoder. Behavior dispatches on
-        # config.model_type: V-JEPA 2 has no CLS and takes pixel_values_videos,
-        # while DINOv2-style ViTs emit a CLS token from pixel_values. Only
-        # the attention-pool head (V-JEPA 2 path) is trained.
+        # Vision encoder. Two modes:
+        #  * FROZEN pretrained (default): a HF AutoModel (DINOv2 / V-JEPA 2),
+        #    eval + requires_grad=False, used only as a fixed feature extractor.
+        #    Behavior dispatches on config.model_type: V-JEPA 2 has no CLS and
+        #    takes pixel_values_videos, while DINOv2-style ViTs emit a CLS token.
+        #  * scratch_vit (LeWM): a randomly-initialized, TRAINABLE ViT (see
+        #    models/scratch_vit.py). It replaces DINOv2 EVERYWHERE — the EEG<->frame
+        #    alignment and the world-model frame prediction both run it LIVE and it
+        #    receives gradient. Collapse is held off by SIGReg in the wrapper (no
+        #    frozen target, no EMA), so there is no freeze loop here. It exposes a
+        #    CLS token at index 0 with no register tokens, so encoder_kind='vit'
+        #    routes through the DINOv2/CLS code paths.
         self.vision_encoder_name = vision_encoder
-        self.pretrained_image_encoder = AutoModel.from_pretrained(vision_encoder).eval()
-        for p in self.pretrained_image_encoder.parameters():
-            p.requires_grad = False
-        self.image_feature_dim = int(self.pretrained_image_encoder.config.hidden_size)
-        self.encoder_kind = str(self.pretrained_image_encoder.config.model_type).lower()
+        self.scratch_vit = bool(scratch_vit)
+        # Set True by the trainer under --amp: run ONLY the trainable ViT forward
+        # in bf16 autocast (see _scratch_image_forward). Everything else — the EEG
+        # encoder (FFT spectral ops), predictor, SIGReg, losses — stays fp32.
+        self.vision_amp = False
+        if self.scratch_vit:
+            from models.scratch_vit import build_scratch_vit
+            self.pretrained_image_encoder = build_scratch_vit(
+                size=scratch_vit_size, embed_dim=scratch_vit_embed_dim,
+                depth=scratch_vit_depth, heads=scratch_vit_heads,
+                patch_size=scratch_vit_patch)
+            self.vision_trainable = True
+            self.image_feature_dim = int(self.pretrained_image_encoder.config.hidden_size)
+            self.encoder_kind = 'vit'
+        else:
+            self.pretrained_image_encoder = AutoModel.from_pretrained(vision_encoder).eval()
+            for p in self.pretrained_image_encoder.parameters():
+                p.requires_grad = False
+            self.vision_trainable = False
+            self.image_feature_dim = int(self.pretrained_image_encoder.config.hidden_size)
+            self.encoder_kind = str(self.pretrained_image_encoder.config.model_type).lower()
         # Alignment-rep width. V-JEPA 2 has no CLS token; its CLS substitute is
         # a FIXED column-band mean-pool of the patch grid (see
         # ``_vjepa2_align_rep``): the grid is split into ``flip_n_col_bands``
@@ -1444,6 +1471,13 @@ class CSBrainAlign(nn.Module):
         depths (``alignment_feature_dim = d_img``). ``n_levels=1`` reproduces
         the original single-level behavior byte-for-byte.
         """
+        if getattr(self, 'vision_trainable', False):
+            # From-scratch trainable ViT: gradient-carrying CLS readout so the
+            # EEG<->frame alignment trains the ViT jointly (no frozen target).
+            pixel_values = image_encoder_inputs.get('pixel_values')
+            assert pixel_values is not None, (
+                "scratch ViT expects `pixel_values` in image_encoder_inputs")
+            return self._scratch_cls(pixel_values, n_levels=n_levels)
         if self.encoder_kind == 'vjepa2':
             pixel_values = image_encoder_inputs.get('pixel_values')
             assert pixel_values is not None, (
@@ -1793,6 +1827,50 @@ class CSBrainAlign(nn.Module):
             acc = 0.5 * ((logits.argmax(1) == labels).float().mean()
                          + (logits.argmax(0) == labels).float().mean())
         return loss, acc
+
+    # ------------------------------------------------------------------
+    # Trainable from-scratch ViT (scratch_vit) — gradient-carrying encode.
+    # These are the LIVE, grad-enabled analogues of the frozen methods above
+    # (_dinov2_cls_token is @inference_mode, _image_patch_grid is @no_grad +
+    # forced eval, so they cannot be reused for a trainable encoder). Used only
+    # when self.vision_trainable is True.
+    # ------------------------------------------------------------------
+    def _scratch_image_forward(self, pixel_values):
+        """Live forward of the trainable ViT; returns last_hidden_state
+        (B, 1 + P, d) with the CLS token at index 0. Dropout is disabled in the
+        ViT config so train/eval are numerically identical.
+
+        Under ``self.vision_amp`` (set by the trainer for --amp) ONLY this ViT
+        forward runs in bf16 autocast — the heavy part — and its output is cast
+        back to fp32 at the boundary so the downstream predictor / alignment /
+        SIGReg and the EEG encoder's FFT spectral ops all stay fp32 (bf16 FFT is
+        unsupported). The ViT forward+backward still run in bf16 (the win)."""
+        if getattr(self, 'vision_amp', False) and pixel_values.is_cuda:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                hs = self.pretrained_image_encoder(
+                    pixel_values=pixel_values).last_hidden_state
+            return hs.float()
+        return self.pretrained_image_encoder(pixel_values=pixel_values).last_hidden_state
+
+    def _scratch_cls(self, pixel_values, n_levels=1):
+        """Trainable-ViT CLS token(s) for EEG<->frame alignment. Returns
+        (B, n_levels, d) to match get_image_hidden_states; n_levels>1 replicates
+        the final CLS (single readout)."""
+        cls = self._scratch_image_forward(pixel_values)[:, 0]        # (B, d)
+        if n_levels <= 1:
+            return cls.unsqueeze(1)
+        return cls.unsqueeze(1).expand(-1, n_levels, -1)
+
+    def _scratch_patch_grid(self, pixel_values):
+        """Trainable-ViT patch-token grid reshaped to (B, s, s, d) (gradient
+        flows). CLS at index 0, no register tokens, so the grid is
+        last_hidden_state[:, 1:]. Gradient-carrying analogue of
+        _image_patch_grid for the world-model frame objective."""
+        tok = self._scratch_image_forward(pixel_values)[:, 1:, :]    # (B, P, d)
+        B, P, d = tok.shape
+        s = int(round(math.sqrt(P)))
+        assert s * s == P, f"scratch ViT patch grid is not square (P={P})"
+        return tok.reshape(B, s, s, d)
 
     @torch.no_grad()
     def _image_patch_grid(self, pixel_values=None, grid=None):
